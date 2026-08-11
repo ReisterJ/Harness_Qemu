@@ -15,7 +15,7 @@ import textwrap
 
 from harness.agent_image import (
     BASE_TAG,
-    CLAUDE_CODE_VERSION,
+    OPENCODE_VERSION,
     build,
     ensure_base,
     validate_tag,
@@ -32,7 +32,7 @@ def ensure(app_dir: str, name: str) -> str:
     not the app content, so skipping the build would serve a stale image
     after an app/ edit. An unchanged rebuild is near-instant from the
     layer cache."""
-    tag = f"dnr-{name}-agent:{CLAUDE_CODE_VERSION}"
+    tag = f"dnr-{name}-agent:{OPENCODE_VERSION}"
     validate_tag(tag)
     ensure_base()
     build(

@@ -16,11 +16,13 @@ from tests.test_patch_grade import ALPHA_CRASH, CANARY
 
 
 def _agent_emitting(text: str) -> AgentResult:
+    # opencode event shape: one text event per assistant message
     return AgentResult(
         messages=[
             {
-                "type": "assistant",
-                "message": {"content": [{"type": "text", "text": text}]},
+                "type": "text",
+                "sessionID": "s",
+                "part": {"type": "text", "messageID": "m", "text": text},
             }
         ]
     )

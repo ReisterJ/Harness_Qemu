@@ -1,14 +1,16 @@
 # Copyright 2026 Anthropic PBC
 # SPDX-License-Identifier: Apache-2.0
-"""run_agent error handling: error_max_turns is terminal, other CLI error
-subtypes route through the resume path. No docker — the CLI process is faked
-at asyncio.create_subprocess_exec."""
+"""run_agent with the opencode backend: clean completion returns without
+resume; opencode `error` events route through the resume path (bounded by
+max_resume_attempts). No docker — the opencode process is faked at
+asyncio.create_subprocess_exec."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 
+from harness import docker_ops
 from harness.agent import run_agent
 
 
@@ -25,17 +27,18 @@ class _FakeStdout:
 
 
 class _FakeProc:
-    def __init__(self, msgs: list[dict]):
+    def __init__(self, msgs: list[dict], rc: int = 0):
         self.stdout = _FakeStdout(msgs)
         self.stderr = None
         self.returncode: int | None = None
+        self._rc = rc
 
     def terminate(self) -> None:
         self.returncode = -15
 
     async def wait(self) -> int:
         if self.returncode is None:
-            self.returncode = 0
+            self.returncode = self._rc
         return self.returncode
 
 
@@ -53,51 +56,66 @@ def _fake_cli(monkeypatch, per_attempt_msgs: list[list[dict]]) -> list[list[str]
         return None
 
     monkeypatch.setattr(asyncio, "sleep", no_sleep)
+
+    # No real container: the per-phase agent-file injection must be a no-op.
+    monkeypatch.setattr(docker_ops, "exec_sh", lambda *a, **k: (0, "", ""))
+    monkeypatch.setattr(docker_ops, "write_file", lambda *a, **k: None)
     return spawned
 
 
-_INIT = {"type": "system", "subtype": "init", "session_id": "sess-1"}
+_STEP_START = {"type": "step_start", "sessionID": "ses-1",
+               "part": {"type": "step-start"}}
+_TEXT = {"type": "text", "sessionID": "ses-1",
+         "part": {"type": "text", "messageID": "msg-1", "text": "done"}}
+_STEP_FINISH = {"type": "step_finish", "sessionID": "ses-1",
+                "part": {"type": "step-finish", "messageID": "msg-1", "reason": "stop"}}
 
 
-def test_error_max_turns_is_terminal(monkeypatch):
-    # --max-turns is a hard cap, not a chunk size: resuming would grant a
-    # fresh budget and turn the cap into N × max_resume_attempts
+def test_clean_completion_returns_without_resume(monkeypatch):
+    spawned = _fake_cli(monkeypatch, [[_STEP_START, _TEXT, _STEP_FINISH]])
+    result = asyncio.run(run_agent("go", container="c", max_turns=50, model="m"))
+    assert len(spawned) == 1
+    assert result.error is None
+    assert result.session_id == "ses-1"
+    assert "opencode" in spawned[0]
+    assert "--format" in spawned[0] and "json" in spawned[0]
+    assert "--auto" in spawned[0]
+    # Tag not found → falls back to the last assistant message
+    assert result.find_tagged_message("nothing") == "done"
+
+
+def test_error_event_resumes(monkeypatch):
+    err = {"type": "error", "sessionID": "ses-1",
+           "error": {"name": "UnknownError", "data": {"message": "boom"}}}
     spawned = _fake_cli(
         monkeypatch,
-        [[_INIT, {"type": "result", "subtype": "error_max_turns", "is_error": True}]],
+        [[_STEP_START, err], [_STEP_START, _TEXT, _STEP_FINISH]],
     )
-    result = asyncio.run(
-        run_agent("go", container="c", max_turns=50, model="m", max_resume_attempts=5)
-    )
-    assert result.error and "turn budget exhausted" in result.error
-    assert "--max-turns 50" in " ".join(result.error.split())  # names the cap
-    assert len(spawned) == 1  # no resume, despite a session_id being known
-    assert result.resume_count == 0
-
-
-def test_other_error_subtypes_resume(monkeypatch):
-    err = {
-        "type": "result",
-        "subtype": "error_during_execution",
-        "is_error": True,
-        "result": "boom",
-    }
-    spawned = _fake_cli(monkeypatch, [[_INIT, err], [err]])
     result = asyncio.run(
         run_agent("go", container="c", max_turns=50, model="m", max_resume_attempts=1)
     )
     assert len(spawned) == 2  # first attempt + one resume
-    assert "--resume" in spawned[1] and "sess-1" in spawned[1]
+    assert "--session" in spawned[1] and "ses-1" in spawned[1]
     assert result.resume_count == 1
-    assert result.error and "error_during_execution" in result.error
+    assert result.error is None  # resumed cleanly
 
 
-def test_clean_result_returns_without_resume(monkeypatch):
-    spawned = _fake_cli(
-        monkeypatch,
-        [[_INIT, {"type": "result", "subtype": "success", "is_error": False}]],
+def test_resume_exhausted_preserves_error(monkeypatch):
+    err = {"type": "error", "sessionID": "ses-1",
+           "error": {"name": "UnknownError", "data": {"message": "boom"}}}
+    spawned = _fake_cli(monkeypatch, [[_STEP_START, err], [_STEP_START, err]])
+    result = asyncio.run(
+        run_agent("go", container="c", max_turns=50, model="m", max_resume_attempts=1)
     )
+    assert len(spawned) == 2
+    assert result.resume_count == 1
+    assert result.error and "boom" in result.error
+
+
+def test_find_tagged_message_scans_open_code_events(monkeypatch):
+    tagged = {"type": "text", "sessionID": "ses-1",
+              "part": {"type": "text", "messageID": "msg-2",
+                       "text": "prefix <poc_path>/work/x.syz</poc_path> suffix"}}
+    spawned = _fake_cli(monkeypatch, [[_STEP_START, _TEXT, tagged, _STEP_FINISH]])
     result = asyncio.run(run_agent("go", container="c", max_turns=50, model="m"))
-    assert len(spawned) == 1
-    assert result.error is None
-    assert result.result_message and result.result_message["subtype"] == "success"
+    assert result.find_tagged_message("poc_path") == "prefix <poc_path>/work/x.syz</poc_path> suffix"

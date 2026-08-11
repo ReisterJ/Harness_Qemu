@@ -9,6 +9,9 @@ results/
 build/
 dist/
 
+# Local secrets — keep provider keys out of git
+.env
+
 # Skill checkpoint state (scratch, per-run)
 .threat-model-state/
 .triage-state/

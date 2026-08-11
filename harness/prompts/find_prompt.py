@@ -245,6 +245,279 @@ duplication is wasted effort. Only broaden if you exhaust ideas in this area
 or if initial exploration shows this surface is a dead end.
 """
 
+ATTACK_SURFACE_SECTION = """
+## Static-analysis report to validate
+
+The findings below are this run's attack surface. Read them carefully. Each
+claim describes a bug class, a function, and a code path — that is your PoC
+blueprint. Your job is to confirm each claim with a reproducing kernel crash.
+
+{attack_surface}
+"""
+
+KERNEL_FIND_TEMPLATE = """\
+You are conducting authorized security research on a Linux kernel as part of
+a defensive vulnerability assessment. Your task: validate static-analysis
+findings by reproducing each claimed bug — drive the kernel down the reported
+code path and confirm it crashes with a matching KASAN/oops report.
+
+## Environment
+
+You are running inside a container that can boot the target kernel in QEMU
+with KVM acceleration. Everything is local.
+
+- Kernel: /kernel/bzImage (this image's target kernel; exact version/config is
+  described in the attack surface below — sanitizer-enabled unless stated)
+- Boot assets: /images/ramdisk_v1.img (initramfs), /images/rootfs_v3.img (rootfs)
+- Kernel source: {source_root} (read it to craft precise PoCs)
+- Tools: qemu-system-x86_64, socat, python3, gcc, busybox. /dev/kvm is available.
+- The guest is a chroot jail (user@exphost, uid 1000); the rootfs has gcc.
+{attack_surface_section}{focus_area_section}{known_bugs_section}{concurrent_agents_section}
+## Task
+
+Validate the static-analysis report above. For the claim in this run, craft a C
+proof-of-concept (pov.c style — raw syscalls/sockets, no library) that drives
+the kernel down the reported path, run it in a QEMU guest, and confirm the
+kernel crashes with a report whose root cause matches the claim — same bug
+class and the same function in the top of the kernel Call Trace.
+
+## How to write the C PoC
+
+1. Read the report's claim: subsystem, function, bug class, triggering path.
+2. Read the relevant source under {source_root} to get the exact API/ioctl/
+   structure the path needs.
+3. Write a standalone C program (syscall()/socket() only, no libc tricks beyond
+   standard headers). It must run as uid 1000 in a minimal jail.
+
+## How to boot and drive the guest
+
+1. Boot QEMU in the background with the serial on a unix socket:
+
+   qemu-system-x86_64 -enable-kvm -cpu host -m 3.5G -nographic -no-reboot \\
+     -monitor none -smp cores=2 -kernel /kernel/bzImage \\
+     -initrd /images/ramdisk_v1.img \\
+     -nic user,model=virtio-net-pci \\
+     -drive "file=/images/rootfs_v3.img,if=virtio,cache=none,format=raw,readonly=on" \\
+     -serial unix:/tmp/q.sock,server=on,wait=off \\
+     -append "console=ttyS0 root=/dev/vda1 rootfstype=ext4 ro init=/home/user/run.sh hostname=exphost" &
+
+2. Drive the serial with a python socket (connect to /tmp/q.sock). Wait for the
+   `user@exphost` prompt, then:
+
+   - Transfer the PoC: base64 it on this side, send it in chunks of <= 1200
+     chars, then `echo '<chunk>' >> /tmp/p.b64` in the guest per chunk, and
+     verify `wc -c /tmp/p.b64` matches before decoding.
+   - Decode + compile + run in the guest:
+       base64 -d /tmp/p.b64 > /tmp/pov.c
+       gcc -B/usr/bin -o /tmp/pov /tmp/pov.c
+       /tmp/pov
+   - Capture the serial output. A kernel crash shows `BUG: KASAN: ...` /
+     `BUG: kernel ...` / `RIP:` / `Kernel panic` with a kernel Call Trace.
+   - Kill the QEMU process when done (each boot is a fresh VM).
+
+3. If it doesn't crash, vary the PoC (sizes, ioctl values, operation flags,
+   resource lifetimes) — the report says which knob matters.
+
+## Validation — a submission must
+
+- Reproduce 3 out of 3 fresh boots (each run of your reproducer script boots a
+  new VM).
+- Be a KERNEL crash: a KASAN report (`BUG: KASAN: ...`), a kernel oops
+  (`BUG: kernel ...` / `RIP: ...`), or a kernel panic. A userspace segfault of
+  the PoC is NOT a kernel bug — that is a PoC bug, fix the PoC.
+- Match the report's claim: same bug class and the same function near the top
+  of the kernel Call Trace.
+
+## Output Format — submit a SELF-CONTAINED REPRODUCER SCRIPT
+
+Once the crash reproduces 3/3, package your whole flow into ONE self-contained
+bash script (e.g. /tmp/repro.sh) that works in a FRESH container from the same
+image: it embeds the C source via a heredoc, boots QEMU, transfers + compiles +
+runs the PoC in the guest, captures the serial, greps for kernel crash
+signatures, and exits 1 (with the crash excerpt) on a crash, 0 if no crash,
+2 on launch failure. Do not depend on any other file you created.
+
+Then emit exactly these XML tags:
+
+<poc_path>/tmp/repro.sh</poc_path>
+<reproduction_command>bash /tmp/repro.sh</reproduction_command>
+<crash_type>null-ptr-deref</crash_type>
+<exit_code>1</exit_code>
+<crash_output>
+BUG: <kernel-crash-header — e.g. "kernel NULL pointer dereference, address: ..." or a sanitizer report — in <top-frame-function>+0xNN/0xNN>
+<crash details: fault address / read size / task>
+Call Trace:
+  <frame_1>+0xNN/0xNN
+  <frame_2>+0xNN/0xNN
+  ...
+[full serial excerpt here]
+</crash_output>
+<dup_check>
+Compared against the Already Filed list and the concurrent-agents log (if any).
+Top kernel frame `<top-frame-function>` with class <crash-class> — no entry
+matches. This validates the report's claim. Not a duplicate.
+</dup_check>
+
+Save the script at the exact `<poc_path>` before emitting tags.
+`<reproduction_command>` is the bare command that reproduces the crash.
+
+**`<dup_check>` is required.** If the crash duplicates an Already Filed entry,
+do not emit `<poc_path>` — keep working. Emit the tags once, then stop.
+
+## CRITICAL: Do Not Stop Until Done
+
+You have a generous turn budget. If one approach fails, try another: different
+syscalls, different ioctls, different resource lifetimes, re-read the report
+and {source_root}. Only emit the XML tags once the crash reproduces 3/3 and
+matches the claim.
+"""
+
+QEMU_ASAN_FIND_TEMPLATE = """\
+You are conducting authorized security research on a userspace component of
+OpenHarmony as part of a defensive vulnerability assessment. Your task:
+validate static-analysis findings by reproducing each claimed bug — drive the
+target code path and confirm it crashes with a matching ASAN report.
+
+## Environment
+
+You are running inside a container that can boot a Linux guest in QEMU with
+KVM acceleration. Everything is local.
+
+- Kernel: /kernel/bzImage (this image's kernel)
+- Boot assets: /images/ramdisk_v1.img (initramfs), /images/rootfs_v3.img (rootfs)
+- Guest: Ubuntu 20.04 chroot jail (user@exphost, uid 1000) with gcc 9.4 + libasan.
+- The VULNERABLE cJSON source is pre-seeded INSIDE the guest at
+  `/home/user/cjson/` (cJSON.c, cJSON.h). Read it on the host side at
+  {source_root} to craft precise PoCs.
+- Tools on the host: qemu-system-x86_64, socat, python3, gcc, xxd. /dev/kvm is
+  available.
+{attack_surface_section}{focus_area_section}{known_bugs_section}{concurrent_agents_section}
+## Task
+
+Validate the static-analysis report above. For the claim in this run, craft a C
+proof-of-concept that drives the cJSON parser down the reported path, compile
+it in the QEMU guest against the seeded cJSON source, run it, and confirm the
+process crashes with an AddressSanitizer `stack-overflow` report whose root
+cause matches the claim — same bug class and the same cJSON functions in the
+top of the ASAN trace.
+
+## How to write the C PoC
+
+1. Read the report's claim: function, bug class, triggering path.
+2. Read the source under {source_root} (or `/home/user/cjson/` in the guest)
+   to get the exact API the path needs (cJSON_Parse etc.).
+3. Write a standalone C program that includes `cJSON.h` and calls the parser.
+   It must run as uid 1000 in the guest. If the bug is stack exhaustion from
+   unbounded recursion, spawn the parsing work on a thread whose stack size
+   you control (e.g. pthread_attr_setstacksize) to emulate the small device
+   thread stacks where the overflow manifests — the report says which knob
+   matters.
+
+## How to boot and drive the guest
+
+1. Boot QEMU in the background with the serial on a unix socket:
+
+   qemu-system-x86_64 -enable-kvm -cpu host -m 3.5G -display none -no-reboot \\
+     -monitor none -smp cores=2 -kernel /kernel/bzImage \\
+     -initrd /images/ramdisk_v1.img \\
+     -nic user,model=virtio-net-pci \\
+     -drive "file=/images/rootfs_v3.img,if=virtio,cache=none,format=raw,readonly=on" \\
+     -serial unix:/tmp/q.sock,server=on,wait=off \\
+     -append "console=ttyS0 root=/dev/vda1 rootfstype=ext4 ro init=/home/user/run.sh hostname=exphost" &
+
+2. Drive the serial with a python socket (connect to /tmp/q.sock). Wait for the
+   `user@exphost` prompt, then:
+
+   - Transfer the PoC C source: base64 it on this side, send it in chunks of
+     <= 200 chars, then `echo '<chunk>' >> /tmp/p.c.b64` in the guest per
+     chunk; verify `wc -c /tmp/p.c.b64` before decoding (serial can drop long
+     lines — keep chunks small and verify).
+   - Decode + compile + run in the guest (cJSON source is already seeded at
+     /home/user/cjson/):
+       base64 -d /tmp/p.c.b64 > /tmp/poc.c
+       gcc -B/usr/bin -fsanitize=address -g -O0 -I/home/user/cjson \\
+         -o /tmp/poc /tmp/poc.c /home/user/cjson/cJSON.c -lpthread
+       /tmp/poc
+   - Capture the output. A crash shows `ERROR: AddressSanitizer: stack-overflow`
+     with an ASAN trace alternating `parse_value`/`parse_array`/`parse_object`.
+   - Kill the QEMU process when done (each boot is a fresh VM).
+
+3. If it doesn't crash, vary the PoC (nesting depth, JSON shape, thread stack
+   size) — the report says which knob matters.
+
+## Validation — a submission must
+
+- Reproduce 3 out of 3 fresh boots (each run of your reproducer script boots a
+  new VM).
+- Be an ASAN crash of the cJSON userspace process: `ERROR:
+  AddressSanitizer: stack-overflow` (or another ASAN class) with the top
+  frames in cJSON.c. A clean parse or a graceful FAILED return is NOT a bug.
+- Match the report's claim: same bug class and the same cJSON functions near
+  the top of the ASAN trace.
+
+## Output Format — submit a SELF-CONTAINED REPRODUCER SCRIPT
+
+Once the crash reproduces 3/3, package your whole flow into ONE self-contained
+bash script (e.g. /tmp/repro.sh) that works in a FRESH container from the same
+image: it embeds the C source via a heredoc, boots QEMU, transfers + compiles +
+runs the PoC in the guest, captures the serial, greps for ASAN crash
+signatures, and exits 1 (with the crash excerpt) on a crash, 0 if no crash,
+2 on launch failure. Do not depend on any other file you created.
+
+Then emit exactly these XML tags:
+
+<poc_path>/tmp/repro.sh</poc_path>
+<reproduction_command>bash /tmp/repro.sh</reproduction_command>
+<crash_type>stack-overflow</crash_type>
+<exit_code>1</exit_code>
+<crash_output>
+ERROR: AddressSanitizer: stack-overflow on address ...
+    #0 ... in __sanitizer::...
+    ...
+    #6 0x... in cJSON_New_Item cJSON.c:239
+    #7 0x... in parse_array cJSON.c:1473
+    #8 0x... in parse_value cJSON.c:1349
+    ... (alternating parse_array / parse_value)
+[full serial excerpt here]
+</crash_output>
+<dup_check>
+Compared against the Already Filed list and the concurrent-agents log (if any).
+Top cJSON frame `<top-cjson-function>` with class <crash-class> — no entry
+matches. This validates the report's claim. Not a duplicate.
+</dup_check>
+
+Save the script at the exact `<poc_path>` before emitting tags.
+
+**`<dup_check>` is required.** Submissions without it are rejected by the
+pipeline. It's your reasoning about why this crash is distinct from every
+entry in the Already Filed list and the concurrent-agents log. If it IS a
+duplicate, do not emit `<poc_path>` at all — pivot and keep searching.
+
+Emit the tags once — do not send further messages after.
+
+## CRITICAL: Do Not Stop Until Done
+
+You have a generous time and turn budget. If one approach doesn't work, try
+another: different JSON nesting, different container/array/object shapes,
+different thread stack sizes, re-read the report and {source_root}. Only emit
+the XML tags once the crash reproduces 3/3 and matches the claim.
+"""
+
+KERNEL_ACCEPT_DOS_SECTION = """
+## Benchmark mode — DoS-class crashes are in scope
+
+This run is in **benchmark mode**. DoS-class crashes DO count as valid finds,
+overriding the guidance above:
+
+- `allocation-size-too-big` / `wild-memory-access` KASAN reports from
+  input-controlled size fields — submit them.
+- Kernel stack overflow from unbounded recursion — submit.
+- NULL-pointer dereferences on input-controlled paths — submit.
+
+The crash-quality guidance still applies for ranking, but the floor is
+lowered: a reproducing DoS-class KASAN report is a valid submission on its own.
+"""
+
 KNOWN_BUGS_SECTION = """
 ## Already Filed — Do Not Resubmit
 
@@ -314,6 +587,8 @@ def build_find_prompt(
     found_bugs_path: str | None = None,
     accept_dos: bool = False,
     reattack_harness: str | None = None,
+    attack_surface: str | None = None,
+    detector: str = "asan",
 ) -> str:
     focus_section = ""
     if focus_area:
@@ -331,6 +606,37 @@ def build_find_prompt(
     concurrent_section = ""
     if found_bugs_path:
         concurrent_section = CONCURRENT_AGENTS_SECTION.format(found_bugs_path=found_bugs_path)
+
+    if detector == "kasan":
+        surface_section = ""
+        if attack_surface:
+            surface_section = ATTACK_SURFACE_SECTION.format(attack_surface=attack_surface)
+        return KERNEL_FIND_TEMPLATE.format(
+            github_url=github_url,
+            commit=commit,
+            source_root=source_root,
+            binary_path=binary_path,
+            attack_surface_section=surface_section,
+            focus_area_section=focus_section,
+            known_bugs_section=bugs_section,
+            concurrent_agents_section=concurrent_section,
+            accept_dos_section=KERNEL_ACCEPT_DOS_SECTION if accept_dos else "",
+        )
+
+    if detector == "qemu-asan":
+        surface_section = ""
+        if attack_surface:
+            surface_section = ATTACK_SURFACE_SECTION.format(attack_surface=attack_surface)
+        return QEMU_ASAN_FIND_TEMPLATE.format(
+            github_url=github_url,
+            commit=commit,
+            source_root=source_root,
+            attack_surface_section=surface_section,
+            focus_area_section=focus_section,
+            known_bugs_section=bugs_section,
+            concurrent_agents_section=concurrent_section,
+            accept_dos_section=KERNEL_ACCEPT_DOS_SECTION if accept_dos else "",
+        )
 
     if reattack_harness:
         return HARNESS_FIND_TEMPLATE.format(

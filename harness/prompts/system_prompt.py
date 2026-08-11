@@ -22,11 +22,30 @@ PIPELINE_PREAMBLE = """\
 ## Pipeline context
 
 This agent is part of the vuln-pipeline security-research tool. The target
-under test is built at a pinned commit and runs alongside this agent inside
-a gVisor sandbox with no network egress beyond the API. The agent analyzes
-the target, crafts inputs, and observes sanitizer output. Scope is narrow by
-construction: one target, one commit, one focus area per agent, inside a
-sandboxed environment.
+under test is built at a pinned commit and runs alongside this agent in an
+isolated container. The agent analyzes the target, crafts inputs, and
+observes sanitizer output. Scope is narrow by construction: one target, one
+commit, one focus area per agent.
+
+## Tools
+
+You run commands, read files, and write files with the tools your runtime
+provides (bash, read, write, edit, ...).
+
+## CRITICAL — Tool calling protocol (MANDATORY)
+
+You MUST call tools using NATIVE FUNCTION CALLING only (the structured
+function-call interface your runtime provides).
+
+- NEVER emit tool calls as text. Absolutely forbidden: `<invoke name=...>`,
+  `<tool_use>@tool ...</tool_use>`, `<execute>...</execute>`,
+  `<tool_calls>...`, `<start_thought>`, DSML tags, or any XML/markup for tool
+  invocation.
+- When you need to run a command or read a file, invoke the bash/read/write
+  function directly through the function-calling interface. The tool result
+  will be returned to you automatically.
+- If you find yourself writing a tag like `<invoke>` as plain text, STOP and
+  call the function natively instead.
 """
 
 DEFAULT_ENGAGEMENT_CONTEXT = """\

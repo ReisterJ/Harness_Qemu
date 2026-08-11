@@ -23,9 +23,11 @@ REPO = Path(__file__).resolve().parents[1]
 
 
 def _assistant(text: str) -> dict:
+    # opencode event shape: one text event per assistant message
     return {
-        "type": "assistant",
-        "message": {"content": [{"type": "text", "text": text}]},
+        "type": "text",
+        "sessionID": "s",
+        "part": {"type": "text", "messageID": "m", "text": text},
     }
 
 

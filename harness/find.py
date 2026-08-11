@@ -46,6 +46,8 @@ async def run_find(
     with sandbox.agent_container(
         target.image_tag, container_name, agent_env,
         memory=target.memory_limit, shm_size=target.shm_size, mounts=mounts,
+        network=target.agent_network, devices=target.devices,
+        prebuilt=target.agent_prebuilt,
     ) as container:
         prompt = build_find_prompt(
             github_url=target.github_url,
@@ -57,6 +59,8 @@ async def run_find(
             found_bugs_path="/tmp/found_bugs.jsonl" if found_bugs_path else None,
             accept_dos=accept_dos,
             reattack_harness=target.reattack_harness,
+            attack_surface=target.attack_surface,
+            detector=target.detector,
         )
         t0 = time.time()
         result = await run_agent(
@@ -68,6 +72,7 @@ async def run_find(
             progress_prefix=progress_prefix,
             system_prompt=system_prompt,
             max_resume_attempts=max_resume_attempts,
+            tools=["Read", "Write", "Bash"],
         )
         timings["find"] = time.time() - t0
 

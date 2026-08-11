@@ -34,7 +34,10 @@ async def run_recon(
     failed to emit a parseable <focus_areas> tag.
     """
     container_name = f"recon_{target.name}"
-    with sandbox.agent_container(target.image_tag, container_name, agent_env) as container:
+    with sandbox.agent_container(target.image_tag, container_name, agent_env,
+                                 network=target.agent_network,
+                                 devices=target.devices,
+                                 prebuilt=target.agent_prebuilt) as container:
         prompt = build_recon_prompt(
             github_url=target.github_url,
             commit=target.commit,
@@ -49,6 +52,7 @@ async def run_recon(
             transcript_path=transcript_path,
             progress_prefix=progress_prefix,
             system_prompt=system_prompt,
+            tools=["Read", "Write", "Bash"],
         )
 
         text = result.find_tagged_message("focus_areas")

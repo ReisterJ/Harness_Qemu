@@ -29,6 +29,8 @@ def project_frames(crash_output: str, n: int = 3) -> list[str]:
     up to n frames; empty list if none parsed. If no frame has source info,
     returns [frame #0 as-is] as a fallback so the caller still has *something*.
     """
+    if _looks_like_kernel(crash_output):
+        return _kasan().project_frames(crash_output, n=n)
     frames = _ASAN_FRAME.findall(crash_output)
     if not frames:
         m = _ASSERTION.search(crash_output)
@@ -55,6 +57,8 @@ def project_frames(crash_output: str, n: int = 3) -> list[str]:
 
 def top_frame(crash_output: str) -> str | None:
     """First project-source frame from the crash stack (convenience wrapper)."""
+    if _looks_like_kernel(crash_output):
+        return _kasan().top_frame(crash_output)
     frames = project_frames(crash_output, n=1)
     return frames[0] if frames else None
 
@@ -72,6 +76,8 @@ def crash_reason(crash_output: str) -> dict[str, str | None]:
     Display-only: feeds found_bugs.jsonl excerpts and dedup summary. Not a
     decision input — agents judge semantic duplicates from raw ASAN.
     """
+    if _looks_like_kernel(crash_output):
+        return _kasan().crash_reason(crash_output)
     m = _ASAN_SUMMARY.search(crash_output)
     crash_type = m.group(1) if m else None
     if crash_type in (None, "ABRT") and _ASSERTION.search(crash_output):
@@ -89,6 +95,8 @@ def asan_excerpt(crash_output: str, max_frames: int = 10) -> str:
     ~500 bytes per excerpt — enough for a find- or judge-agent to compare
     signatures semantically without the full 10KB trace.
     """
+    if _looks_like_kernel(crash_output):
+        return _kasan().kasan_excerpt(crash_output, max_frames=max_frames)
     lines = crash_output.splitlines()
     out: list[str] = []
     frame_count = 0
@@ -105,3 +113,20 @@ def asan_excerpt(crash_output: str, max_frames: int = 10) -> str:
         # Non-ASAN crash (e.g. glibc assert). First few non-empty lines.
         out = [l.strip() for l in lines if l.strip()][:3]
     return "\n".join(out)
+
+
+def _kasan():
+    """Lazy import to avoid a module-load cycle (kasan imports only re)."""
+    from . import kasan
+    return kasan
+
+
+def _looks_like_kernel(crash_output: str) -> bool:
+    """Delegate kernel crash reports (KASAN / oops / panic) to kasan.py.
+
+    Kernel and userspace ASAN output are disjoint: KASAN reports carry
+    ``BUG: KASAN`` / ``Kernel panic`` / ``RIP:`` / ``BUG: kernel`` markers
+    that never appear in a userspace ASAN trace, so sniffing is unambiguous
+    and keeps every downstream consumer (dedup, judge, found_bugs) working
+    for both target kinds without threading a detector flag."""
+    return _kasan().looks_like_kernel(crash_output)

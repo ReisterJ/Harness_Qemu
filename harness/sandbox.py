@@ -65,6 +65,7 @@ def agent_container(
     shm_size: str | None = None,
     mounts: list[tuple[str, str]] | None = None,
     network: str | None = None,
+    devices: list[str] | None = None,
     *,
     prebuilt: bool = False,
 ) -> Iterator[str]:
@@ -74,15 +75,21 @@ def agent_container(
     "every agent runs in the sandbox" invariant lives in one place.
 
     ``network`` overrides the sandbox default. Pass ``"none"`` for containers
-    that never run ``claude -p`` (e.g. the T0–T2 patch grader): they only run
+    that never run the agent CLI (e.g. the T0–T2 patch grader): they only run
     target code via ``exec_sh`` and don't need any egress, so don't give them
     any — under ``--dangerously-no-sandbox`` the default falls back to
-    ``bridge``, and a binary fed an attacker-crafted PoC shouldn't get that.
+    ``bridge``. Targets whose agent container must reach the API through a
+    host-loopback proxy (e.g. kernel targets with ``--network host``) pass
+    their configured network here.
+
+    ``devices`` passes host devices through (e.g. ``["/dev/kvm"]``) for
+    targets that boot VMs (Linux kernel targets). Requires the sandbox to be
+    off — runsc doesn't pass devices.
 
     ``prebuilt=True`` treats ``target_tag`` as a ready-to-run agent image
     (already carrying the CLI) instead of a vuln target to layer onto the
     base — used by harnesses that build their own agent image, e.g. the DNR
-    hunt image whose docker context is the target's app/ tree."""
+    hunt image or a kernel target whose Dockerfile installs the CLI itself."""
     img = target_tag if prebuilt else agent_image.ensure(target_tag)
     container = docker_ops.run(
         img,
@@ -93,6 +100,7 @@ def agent_container(
         shm_size=shm_size,
         env=container_env(auth),
         mounts=list(mounts or []),
+        devices=list(devices or []),
     )
     try:
         yield container

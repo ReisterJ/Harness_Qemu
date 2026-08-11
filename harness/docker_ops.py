@@ -12,10 +12,24 @@ import os
 import subprocess
 
 
+def build_network_args() -> list[str]:
+    """`--network` args for docker build, driven by
+    ``VULN_PIPELINE_DOCKER_BUILD_NETWORK`` (default: none = normal bridge).
+
+    Needed on hosts where the build containers can't reach a registry/proxy
+    through the default bridge — e.g. a loopback-only proxy (127.0.0.1:7897)
+    that `docker pull` uses via the daemon but build RUN steps can't reach.
+    ``--network=host`` makes RUN steps use the host network so the loopback
+    proxy works. Pulls still go through the daemon (so pre-pull any FROM
+    bases: `docker pull gcc:14`)."""
+    v = os.environ.get("VULN_PIPELINE_DOCKER_BUILD_NETWORK")
+    return ["--network", v] if v else []
+
+
 def build(dockerfile_dir: str, tag: str) -> str:
     """Build a docker image from a directory containing a Dockerfile."""
     subprocess.run(
-        ["docker", "build", "-t", tag, dockerfile_dir],
+        ["docker", "build", *build_network_args(), "-t", tag, dockerfile_dir],
         check=True,
     )
     return tag
@@ -31,13 +45,16 @@ def run(
     runtime: str | None = None,
     env: dict[str, str] | None = None,
     mounts: list[tuple[str, str]] | None = None,
+    devices: list[str] | None = None,
 ) -> str:
     """Start a container, detached, interactive. Cleans up any existing
     container with the same name first (clean slate).
 
     ``runtime`` selects an OCI runtime (e.g. ``runsc`` for gVisor). The
     active runtime is verified via ``docker inspect`` so a typo or missing
-    registration fails loudly instead of silently falling back to runc."""
+    registration fails loudly instead of silently falling back to runc.
+    ``devices`` passes host devices through (e.g. ``["/dev/kvm"]`` for
+    targets that boot QEMU accelerators)."""
     subprocess.run(["docker", "rm", "-f", name], capture_output=True)
     runtime = runtime or os.environ.get("VULN_PIPELINE_DOCKER_RUNTIME")
     extra: list[str] = []
@@ -45,6 +62,8 @@ def run(
         extra += ["--runtime", runtime]
     if shm_size:
         extra += ["--shm-size", shm_size]
+    for dev in (devices or []):
+        extra += ["--device", dev]
     for k, v in (env or {}).items():
         # Prefer ``-e KEY`` (value read from this process's env) so secrets don't
         # appear in argv / host ps output. Fall back to ``-e KEY=VAL`` for

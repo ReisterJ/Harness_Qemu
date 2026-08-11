@@ -29,6 +29,11 @@ class TargetConfig:
     focus_areas: list[str] = field(default_factory=list)
     known_bugs: list[str] = field(default_factory=list)
     attack_surface: str | None = None
+    detector: str = "asan"            # "asan" (userspace), "kasan" (Linux kernel), or "qemu-asan" (userspace ASAN inside a QEMU guest)
+    devices: list[str] = field(default_factory=list)  # --device passthrough (e.g. /dev/kvm)
+    grade_reference: str | None = None  # grade-only ground truth (official crash signature); never shown to find
+    agent_prebuilt: bool = False      # image already carries the agent CLI (no agent_image.ensure layering)
+    agent_network: str | None = None  # agent container network override (e.g. "host" when bridge can't reach the API)
     build_command: str | None = None  # rebuild in-container after applying a patch (T0)
     test_command: str | None = None   # regression suite for T2; None → T2 skipped
     build_timeout_s: int = 1800
@@ -64,6 +69,11 @@ class TargetConfig:
             focus_areas=cfg.get("focus_areas") or [],
             known_bugs=cfg.get("known_bugs") or [],
             attack_surface=cfg.get("attack_surface"),
+            detector=cfg.get("detector", "asan"),
+            devices=cfg.get("devices") or [],
+            grade_reference=cfg.get("grade_reference"),
+            agent_prebuilt=bool(cfg.get("agent_prebuilt", False)),
+            agent_network=cfg.get("agent_network"),
             build_command=cfg.get("build_command"),
             test_command=cfg.get("test_command"),
             build_timeout_s=cfg.get("build_timeout_s", 1800),

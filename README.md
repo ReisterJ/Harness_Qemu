@@ -83,6 +83,7 @@ claude
 - [**Threat model**](docs/threat-model.md) · Why a threat model cuts false positives, and the `/threat-model` skill
 - [**Detection & response**](docs/detection-response.md) · Hunting an attacker already in the logs; the D&R skills and pipeline
 - [**Customize**](docs/customizing.md) · Port to my stack; which files change and why
+- [**Kernel validation**](docs/kernel-validation.md) · Validate Linux-kernel static-analysis reports via QEMU/KVM + `targets/kernelval` (CVE-2025-40019 record, fixes, reproduction)
 - [**Patching**](docs/patching.md) · Generate and verify fixes for verified crashes
 - [**Other use cases**](docs/other-use-cases.md) · Binary analysis, embedded, bug chains, threat intel
 - [**Troubleshooting**](docs/troubleshooting.md) · Duplicates, rate limits, subagent model pinning

@@ -117,6 +117,7 @@ async def run_patch(
                 transcript_path=tp,
                 progress_prefix=progress_prefix,
                 system_prompt=system_prompt,
+                tools=["Read", "Write", "Bash"],
             )
             timings[f"agent_it{it}"] = time.time() - t0
 

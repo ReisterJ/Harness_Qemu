@@ -62,6 +62,39 @@ from .auth import (  # noqa: F401
 )
 
 
+def _load_dotenv() -> None:
+    """Load KEY=VALUE pairs from a .env file into os.environ (setdefault).
+
+    Looks for the file, in order: ``$VULN_PIPELINE_ENV_FILE``, the repo root
+    (next to this package), then the current working directory. Already-set
+    environment variables win (setdefault), so a manual ``export`` still
+    overrides the file. Lines: blanks and ``#`` comments are skipped, optional
+    surrounding quotes are stripped, no variable expansion. Best-effort — a
+    missing/unreadable file is not an error.
+    """
+    candidates: list[Path] = []
+    if v := os.environ.get("VULN_PIPELINE_ENV_FILE"):
+        candidates.append(Path(v))
+    candidates.append(Path(__file__).resolve().parent.parent / ".env")
+    candidates.append(Path.cwd() / ".env")
+    for p in candidates:
+        if not p.is_file():
+            continue
+        try:
+            for raw in p.read_text().splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, val = line.partition("=")
+                k = k.strip()
+                if not k:
+                    continue
+                os.environ.setdefault(k, val.strip().strip("'\""))
+        except OSError:
+            continue
+        return
+
+
 def resolve_target_dir(target: str) -> Path:
     """Accept either a name (looked up under ./targets/) or a direct path.
 
@@ -808,6 +841,10 @@ async def _run_all(
 # error before any agent ran, 2 = ran to completion but the goal wasn't met
 # (no confirmed crash, nothing to dedup, report/patch not submitted/verified).
 def main() -> int:
+    # Load .env before argparse so VULN_PIPELINE_MODEL / provider keys from
+    # the file are visible as defaults (already-set env wins via setdefault).
+    _load_dotenv()
+
     # Line-buffer stdout so progress prints appear immediately when piped/
     # redirected (Python block-buffers by default when not a TTY).
     sys.stdout.reconfigure(line_buffering=True)

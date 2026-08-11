@@ -62,7 +62,10 @@ async def run_report(
             f"{crash.reproduction_command!r}"
         )
 
-    with sandbox.agent_container(target.image_tag, container_name, agent_env) as container:
+    with sandbox.agent_container(target.image_tag, container_name, agent_env,
+                                 network=target.agent_network,
+                                 devices=target.devices,
+                                 prebuilt=target.agent_prebuilt) as container:
         docker_ops.write_file(container, "/tmp/poc.bin", crash.poc_bytes)
         adapted_cmd = crash.reproduction_command.replace(crash.poc_path, "/tmp/poc.bin")
 
@@ -91,6 +94,7 @@ async def run_report(
             transcript_path=transcript_path,
             progress_prefix=progress_prefix,
             system_prompt=system_prompt,
+            tools=["Read", "Write", "Bash"],
         )
         elapsed = time.time() - t0
 

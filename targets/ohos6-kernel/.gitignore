@@ -1,0 +1,3 @@
+# Build artifacts produced by build_kernel.sh — several GB, don't commit.
+images/
+kernel-src/

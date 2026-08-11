@@ -49,7 +49,10 @@ async def run_grade(
         )
 
     # Fresh agent container from the SAME image — find-agent never touched it.
-    with sandbox.agent_container(target.image_tag, container_name, agent_env) as container:
+    with sandbox.agent_container(target.image_tag, container_name, agent_env,
+                                 network=target.agent_network,
+                                 devices=target.devices,
+                                 prebuilt=target.agent_prebuilt) as container:
         # Only the PoC bytes cross the boundary. Substitute the path: the
         # find-agent saved to some arbitrary path; we write to a fixed one.
         docker_ops.write_file(container, "/tmp/poc.bin", crash.poc_bytes)
@@ -68,6 +71,9 @@ async def run_grade(
             exit_code=crash.exit_code,
             source_root=target.source_root,
             workspace_poc="/tmp/poc.bin",
+            attack_surface=target.attack_surface,
+            grade_reference=target.grade_reference,
+            detector=target.detector,
         )
         t0 = time.time()
         result = await run_agent(
@@ -78,18 +84,22 @@ async def run_grade(
             transcript_path=transcript_path,
             progress_prefix=progress_prefix,
             system_prompt=system_prompt,
+            tools=["Read", "Write", "Bash"],
         )
         elapsed = time.time() - t0
 
         text = result.find_tagged_message("overall")
         criteria: dict[str, bool] = {}
-        for i in range(1, 6):
+        for i in range(1, 7):
             val = parse_xml_tag(text, f"criterion_{i}")
             criteria[f"criterion_{i}"] = val is not None and val.upper().startswith("PASS")
 
         overall = parse_xml_tag(text, "overall")
         score_str = parse_xml_tag(text, "score")
         evidence = parse_xml_tag(text, "evidence") or ""
+        root_cause = parse_xml_tag(text, "root_cause")
+        if root_cause:
+            evidence = (evidence + f"\nroot_cause={root_cause.strip()}").strip()
 
         verdict = GraderVerdict(
             passed=(overall is not None and overall.upper().startswith("PASS")),

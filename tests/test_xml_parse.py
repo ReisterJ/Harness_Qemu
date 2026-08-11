@@ -5,7 +5,7 @@
 The critical case: tags appear in message N-3, a short "Done!"
 summary appears in message N. Naive last-message parsing gets prose, not tags.
 """
-from harness.agent import AgentResult, parse_xml_tag, _blocks_to_text
+from harness.agent import AgentResult, parse_xml_tag, _text_by_message
 
 
 # ── parse_xml_tag ────────────────────────────────────────────────────────────
@@ -47,35 +47,56 @@ def test_parse_tag_with_special_regex_chars():
     assert parse_xml_tag(text, "criterion_1") == "PASS"
 
 
-# ── _blocks_to_text ──────────────────────────────────────────────────────────
+# ── _text_by_message ─────────────────────────────────────────────────────────
 
-def test_blocks_to_text_extracts_textblocks():
-    blocks = [
-        {"type": "text", "text": "hello"},
-        {"type": "tool_use", "id": "x", "name": "Bash", "input": {"command": "ls"}},
-        {"type": "text", "text": "world"},
+def _text_ev(mid: str, text: str) -> dict:
+    return {"type": "text", "sessionID": "s",
+            "part": {"type": "text", "messageID": mid, "text": text}}
+
+
+def _tool_ev(text: str) -> dict:
+    return {"type": "tool", "sessionID": "s",
+            "part": {"type": "tool", "tool": "bash", "state": "completed",
+                     "input": {"command": "ls"}, "output": text}}
+
+
+def test_text_by_message_groups_and_skips_tools():
+    events = [
+        _text_ev("m1", "hello"),
+        _tool_ev("tool-output"),
+        _text_ev("m1", "world"),
+        _text_ev("m2", "second"),
     ]
-    assert _blocks_to_text(blocks) == "hello\nworld"
+    by_msg, order = _text_by_message(events)
+    assert by_msg["m1"] == ["hello", "world"]
+    assert by_msg["m2"] == ["second"]
+    assert order == ["m1", "m2"]
+    assert "tool-output" not in "\n".join(sum(by_msg.values(), []))
 
 
-def test_blocks_to_text_string_passthrough():
-    assert _blocks_to_text("plain string") == "plain string"
-
-
-def test_blocks_to_text_empty():
-    assert _blocks_to_text([]) == ""
-    assert _blocks_to_text(None) == ""
+def test_text_by_message_empty():
+    assert _text_by_message([]) == ({}, [])
+    assert _text_by_message([_tool_ev("x")]) == ({}, [])
 
 
 # ── find_tagged_message: THE BUGFIX ──────────────────────────────────────────
 
+_MIDS = iter(range(1000))
+
+
 def _asst(text: str) -> dict:
-    return {"type": "assistant",
-            "message": {"content": [{"type": "text", "text": text}]}}
+    """One opencode text event = one assistant message."""
+    mid = f"msg-{next(_MIDS)}"
+    return {"type": "text", "sessionID": "s",
+            "part": {"type": "text", "messageID": mid, "text": text}}
 
 
 def _user(text: str) -> dict:
-    return {"type": "user", "message": {"content": text}}
+    """Tool results are `tool` events — never assistant text, so tags echoed
+    inside them must be ignored by find_tagged_message."""
+    return {"type": "tool", "sessionID": "s",
+            "part": {"type": "tool", "tool": "bash", "state": "completed",
+                     "input": {"command": "x"}, "output": text}}
 
 
 def test_find_tagged_message_tags_in_last():
