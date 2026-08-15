@@ -9,16 +9,19 @@
 #   #    images/tools/{gn,ninja,arm-none-eabi} (toolchain staged for offline
 #   #    docker build — no network downloads inside docker)
 #
-# Build with host network (npm install for opencode):
+# Build with host network (apt + npm install for opencode):
 #   VULN_PIPELINE_DOCKER_BUILD_NETWORK=host docker build --network=host \
 #     -t vuln-pipeline-liteos-m:latest targets/liteos-m
-FROM ubuntu:22.04
+FROM cybergym/syzbot-target:09b7d050e4806540153d
 
-# QEMU for Cortex-M55 + python for gn scripts/hb helper.
+# Host-side tools the agent needs: QEMU for Cortex-M55, python for gn
+# scripts, node for the opencode agent CLI.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        qemu-system-arm python3 python3-pip ca-certificates curl git xxd \
-        build-essential nodejs npm \
-    && rm -rf /var/lib/apt/lists/*
+        ca-certificates curl xxd gdb git python3 python3-pip qemu-system-arm && \
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y --no-install-recommends nodejs && \
+    npm install -g opencode-ai@1.17.18 && \
+    rm -rf /var/lib/apt/lists/*
 
 # Toolchain staged by build_liteos_m.sh (gn + ninja + arm-none-eabi-gcc 15).
 COPY images/tools/gn /usr/local/bin/gn
@@ -34,9 +37,6 @@ ENV PATH="/opt/arm-none-eabi/bin:/usr/local/bin:$PATH"
 # Rebuild wrapper the find agent uses after editing the PoC module.
 COPY rebuild.sh /src/rebuild.sh
 RUN chmod +x /src/rebuild.sh
-
-# Agent CLI (same opencode backend as the other kernel targets).
-RUN npm install -g opencode-ai@1.17.18
 
 # kconfiglib for the gn kconfig exec_scripts.
 RUN pip3 install kconfiglib

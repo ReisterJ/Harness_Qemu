@@ -47,17 +47,89 @@ clone_shallow "$GITEE/vendor_ohemu.git"                  vendor/ohemu
 clone_shallow "$GITEE/device_qemu.git"                   device/qemu
 
 echo "==> [2/6] applying build-adapt patches"
-for f in kernel/liteos_m/config.gni kernel/liteos_m/BUILD.gn \
-         device/qemu/arm_mps3_an547/liteos_m/config.gni \
-         device/qemu/arm_mps3_an547/liteos_m/board/BUILD.gn; do
-  git -C "$(dirname "$f")" apply "$ROOT/patches/0001-liteos-m-build-adapt.patch" \
-    --include="$(basename "$f")" 2>/dev/null || true
-done
-# Product-level adapts (config.json / debug.config) applied directly:
-cp "$ROOT/overlays/config.json" vendor/ohemu/$PRODUCT/config.json
-cat vendor/ohemu/$PRODUCT/kernel_configs/debug.config \
-    "$ROOT/overlays/lms.config" > /tmp/dbg.config.$$
-mv /tmp/dbg.config.$$ vendor/ohemu/$PRODUCT/kernel_configs/debug.config
+python3 - "$SRC" <<'PYEOF'
+import sys
+src = sys.argv[1]
+
+# 1) kernel config.gni: make liteos_kernel_only overridable via gn --args.
+p = f"{src}/kernel/liteos_m/config.gni"
+s = open(p).read()
+s = s.replace("liteos_kernel_only = false",
+              "declare_args() {\n  liteos_kernel_only = false\n}")
+open(p, "w").write(s)
+
+# 2) kernel BUILD.gn: board SDK is present in-tree; device_qemu is combined
+#    board+soc (not decoupled) so the //-style path works without hb.
+p = f"{src}/kernel/liteos_m/BUILD.gn"
+s = open(p).read()
+s = s.replace(
+'''cmd = "if [ -f $device_path/BUILD.gn ]; then echo true; else echo false; fi"
+HAVE_DEVICE_SDK = exec_script("//build/lite/run_shell_cmd.py", [ cmd ], "value")''',
+'''# cmd = "if [ -f $device_path/BUILD.gn ]; then echo true; else echo false; fi"
+# HAVE_DEVICE_SDK = exec_script("//build/lite/run_shell_cmd.py", [ cmd ], "value")
+HAVE_DEVICE_SDK = true''')
+s = s.replace(
+'''BOARD_SOC_FEATURE =
+    device_path == string_replace(device_path, "/vendor/", "") &&
+    device_path != string_replace(device_path, "/board/", "")''',
+'''BOARD_SOC_FEATURE = false''')
+open(p, "w").write(s)
+
+# 3) board config.gni: gcc-15 warning compat + exidx defsym + heap-only LMS
+#    instrumentation flags used by the instrumented board module.
+p = f"{src}/device/qemu/arm_mps3_an547/liteos_m/config.gni"
+s = open(p).read()
+s = s.replace('board_cflags = [',
+'''board_cflags = [
+  "-O0",
+  "-Wno-error=implicit-function-declaration",
+  "-Wno-error=implicit-int",
+  "-Wno-error=int-conversion",
+  "-Wno-error=incompatible-pointer-types",''')
+s = s.replace('board_ld_flags = []',
+'''board_ld_flags = [
+  "-Wl,--defsym=__exidx_start=0",
+  "-Wl,--defsym=__exidx_end=0",
+]''')
+open(p, "w").write(s)
+
+# 4) board BUILD.gn: instrument the board module (incl. the PoC entry point
+#    test_demo.c) with the kernel-address sanitizer, like the official lms
+#    sample module.
+p = f"{src}/device/qemu/arm_mps3_an547/liteos_m/board/BUILD.gn"
+s = open(p).read()
+s = s.replace('''kernel_module(module_name) {
+  asmflags = board_asmflags
+
+  sources = [''',
+'''kernel_module(module_name) {
+  asmflags = board_asmflags
+
+  # LMS PoC instrumentation (module-scoped, like the official lms sample).
+  cflags = [
+    "-fsanitize=kernel-address",
+    "-O0",
+  ]
+
+  sources = [''')
+open(p, "w").write(s)
+
+# 5) product config: kernel-only subsystems.
+p = f"{src}/vendor/ohemu/qemu_cm55_mini_system_demo/config.json"
+import json
+cfg = json.load(open(p))
+cfg["subsystems"] = [
+    {"subsystem": "kernel",
+     "components": [{"component": "liteos_m", "features": []}]}
+]
+json.dump(cfg, open(p, "w"), indent=2, ensure_ascii=False)
+
+# 6) board debug config: enable LMS + strict checks.
+p = f"{src}/vendor/ohemu/qemu_cm55_mini_system_demo/kernel_configs/debug.config"
+with open(p, "a") as f:
+    f.write("\nLOSCFG_KERNEL_LMS=y\nLOSCFG_LMS_CHECK_STRICT=y\n")
+print("patches applied")
+PYEOF
 
 echo "==> [3/6] root .gn / BUILD.gn (kernel-only)"
 printf 'buildconfig = "//build/config/BUILDCONFIG.gn"\n' > .gn
@@ -87,7 +159,34 @@ cat > out/ohos_config.json <<EOF
 }
 EOF
 
-echo "==> [5/6] gn gen + ninja"
+echo "==> [5/6] preloader outputs (hb would generate these; kernel-only build needs only two)"
+PRELOADER="$SRC/out/preloader/$PRODUCT"
+mkdir -p "$PRELOADER"
+cat > "$PRELOADER/build_config.json" <<EOF
+{
+  "is_host_product": false,
+  "product_path": "//vendor/ohemu/$PRODUCT",
+  "product_config_path": "$SRC/vendor/ohemu/$PRODUCT",
+  "os_level": "mini",
+  "device_name": "$BOARD",
+  "product_company": "ohemu",
+  "compile_mode": "cross",
+  "product_name": "$PRODUCT",
+  "device_company": "qemu",
+  "target_os": "ohos",
+  "target_cpu": "arm",
+  "kernel_version": "3.0.0",
+  "device_build_path": "$SRC/device/qemu/$BOARD",
+  "product_toolchain_label": ""
+}
+EOF
+cat > "$PRELOADER/parts_config.json" <<'EOF'
+{
+  "kernel_liteos_m": true
+}
+EOF
+
+echo "==> [6/6] gn gen + ninja"
 OUT="$SRC/out/$BOARD/$PRODUCT"
 GN_ARGS="product_name=\"$PRODUCT\" is_mini_system=true \
 product_path=\"//vendor/ohemu/$PRODUCT\" \
@@ -104,7 +203,7 @@ gn gen --script-executable="$(command -v python3)" \
        --args="$GN_ARGS" "$OUT"
 ninja -C "$OUT" liteos
 
-echo "==> [6/6] stage artifacts (incl. toolchain for the docker build)"
+echo "==> [7/7] stage artifacts (incl. toolchain for the docker build)"
 mkdir -p "$ROOT/images/tools"
 cp "$OUT/obj/kernel/liteos_m/bin/liteos" "$ROOT/images/OHOS_Image"
 cp -r "$SRC" "$ROOT/images/src-tree"
