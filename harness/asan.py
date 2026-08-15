@@ -31,6 +31,9 @@ def project_frames(crash_output: str, n: int = 3) -> list[str]:
     """
     if _looks_like_kernel(crash_output):
         return _kasan().project_frames(crash_output, n=n)
+    if _looks_like_lms(crash_output):
+        from . import lms
+        return lms.project_frames(crash_output, n=n)
     frames = _ASAN_FRAME.findall(crash_output)
     if not frames:
         m = _ASSERTION.search(crash_output)
@@ -59,6 +62,9 @@ def top_frame(crash_output: str) -> str | None:
     """First project-source frame from the crash stack (convenience wrapper)."""
     if _looks_like_kernel(crash_output):
         return _kasan().top_frame(crash_output)
+    if _looks_like_lms(crash_output):
+        from . import lms
+        return lms.top_frame(crash_output)
     frames = project_frames(crash_output, n=1)
     return frames[0] if frames else None
 
@@ -78,6 +84,9 @@ def crash_reason(crash_output: str) -> dict[str, str | None]:
     """
     if _looks_like_kernel(crash_output):
         return _kasan().crash_reason(crash_output)
+    if _looks_like_lms(crash_output):
+        from . import lms
+        return lms.crash_reason(crash_output)
     m = _ASAN_SUMMARY.search(crash_output)
     crash_type = m.group(1) if m else None
     if crash_type in (None, "ABRT") and _ASSERTION.search(crash_output):
@@ -97,6 +106,9 @@ def asan_excerpt(crash_output: str, max_frames: int = 10) -> str:
     """
     if _looks_like_kernel(crash_output):
         return _kasan().kasan_excerpt(crash_output, max_frames=max_frames)
+    if _looks_like_lms(crash_output):
+        from . import lms
+        return lms.lms_excerpt(crash_output, max_frames=max_frames)
     lines = crash_output.splitlines()
     out: list[str] = []
     frame_count = 0
@@ -130,3 +142,20 @@ def _looks_like_kernel(crash_output: str) -> bool:
     and keeps every downstream consumer (dedup, judge, found_bugs) working
     for both target kinds without threading a detector flag."""
     return _kasan().looks_like_kernel(crash_output)
+
+
+def _looks_like_lms(crash_output: str) -> bool:
+    """Delegate LiteOS-M LMS reports to lms.py (same spirit as above)."""
+    from . import lms
+    return lms.looks_like_lms(crash_output)
+
+
+def _delegate(crash_output: str):
+    """Detector dispatch: LMS (LiteOS-M) > kernel KASAN > userspace ASAN."""
+    if _looks_like_lms(crash_output):
+        from . import lms
+        return lms
+    if _looks_like_kernel(crash_output):
+        from . import kasan
+        return kasan
+    return None

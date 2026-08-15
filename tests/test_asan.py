@@ -162,3 +162,29 @@ def test_write_result_no_crash_no_reason(tmp_path):
 
     d = json.loads((tmp_path / "result.json").read_text())
     assert d["crash"] is None
+
+
+def test_lms_detector_delegation():
+    """LiteOS-M LMS reports delegate to lms.py through asan.py."""
+    from harness import asan
+    sample = (
+        "[ERR][TaskSampleEntry1]*****  Kernel Address Sanitizer Error Detected Start *****\n"
+        "[ERR][TaskSampleEntry1]Heap buffer overflow error detected\n"
+        "[ERR][TaskSampleEntry1]Illegal WRITE address at: [0x2102ecbc]\n"
+        "taskName = TaskSampleEntry1\n"
+        "----- traceback start -----\n"
+        "traceback 0 -- lr = 0x2100966a\n"
+        "traceback 1 -- lr = 0x2100fbf2\n"
+        "----- traceback end -----\n"
+    )
+    reason = asan.crash_reason(sample)
+    assert reason["crash_type"] == "Heap-buffer-overflow-error-detected"
+    assert reason["operation"] == "WRITE"
+    assert asan.top_frame(sample) == "traceback 0 -- lr = 0x2100966a"
+    assert "Kernel Address Sanitizer" in asan.asan_excerpt(sample)
+
+
+def test_lms_use_after_free_class():
+    from harness import asan
+    sample = "[ERR][T]Use after free error detected\n"
+    assert asan.crash_reason(sample)["crash_type"] == "Use-after-free-error-detected"

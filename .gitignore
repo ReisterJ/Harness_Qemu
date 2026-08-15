@@ -37,3 +37,4 @@ RESPONSE-*.md
 # dnrcanary (dnr target) generated artifacts
 targets/dnrcanary/logs/
 targets/dnrcanary/app/dnrcanary.db
+armgcc.tar.gz

@@ -29,7 +29,7 @@ class TargetConfig:
     focus_areas: list[str] = field(default_factory=list)
     known_bugs: list[str] = field(default_factory=list)
     attack_surface: str | None = None
-    detector: str = "asan"            # "asan" (userspace), "kasan" (Linux kernel), or "qemu-asan" (userspace ASAN inside a QEMU guest)
+    detector: str = "asan"            # "asan" (userspace), "kasan" (Linux kernel), "lms" (LiteOS-M kernel), or "qemu-asan" (userspace ASAN inside a QEMU guest)
     devices: list[str] = field(default_factory=list)  # --device passthrough (e.g. /dev/kvm)
     grade_reference: str | None = None  # grade-only ground truth (official crash signature); never shown to find
     agent_prebuilt: bool = False      # image already carries the agent CLI (no agent_image.ensure layering)

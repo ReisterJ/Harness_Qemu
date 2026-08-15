@@ -1,0 +1,145 @@
+diff --git a/arm_mps3_an547/liteos_m/config.gni b/arm_mps3_an547/liteos_m/config.gni
+index e6a716c..50e141e 100644
+--- a/arm_mps3_an547/liteos_m/config.gni
++++ b/arm_mps3_an547/liteos_m/config.gni
+@@ -44,6 +44,14 @@ board_opt_flags = []
+ 
+ # Board related common compile flags.
+ board_cflags = [
++  # LMS instrumentation: every kernel C file gets ASAN-style shadow checks,
++  # backed by LiteOS-M's built-in LMS runtime (__asan_storeN etc.).
++  "-O0",
++  "-Wno-error=implicit-function-declaration",
++  "-Wno-error=implicit-int",
++  "-Wno-error=int-conversion",
++  "-Wno-error=incompatible-pointer-types",
++
+   "-Wall",
+   "-mcpu=cortex-m55",
+   "-mfloat-abi=hard",
+@@ -69,7 +77,12 @@ board_asmflags += board_opt_flags
+ 
+ board_cxx_flags = board_cflags
+ 
+-board_ld_flags = []
++board_ld_flags = [
++  # gcc 15 libgcc unwind-arm.o references the EABI exception index symbols
++  # that the LiteOS-M linker script does not define (gcc 10 didn't need them).
++  "-Wl,--defsym=__exidx_start=0",
++  "-Wl,--defsym=__exidx_end=0",
++]
+ 
+ # Newlib adapt.
+ board_ld_flags += [
+diff --git a/arm_mps3_an547/liteos_m/board/BUILD.gn b/arm_mps3_an547/liteos_m/board/BUILD.gn
+index 729e9f1..6c3e717 100644
+--- a/arm_mps3_an547/liteos_m/board/BUILD.gn
++++ b/arm_mps3_an547/liteos_m/board/BUILD.gn
+@@ -34,6 +34,12 @@ module_name = "bsp_config"
+ kernel_module(module_name) {
+   asmflags = board_asmflags
+ 
++  # LMS PoC instrumentation (module-scoped, like the official lms sample).
++  cflags = [
++    "-fsanitize=kernel-address",
++    "-O0",
++  ]
++
+   sources = [
+     "driver/arm_uart_drv.c",
+     "driver/uart.c",
+diff --git a/qemu_cm55_mini_system_demo/config.json b/qemu_cm55_mini_system_demo/config.json
+index 53da5d9..fc4ef25 100755
+--- a/qemu_cm55_mini_system_demo/config.json
++++ b/qemu_cm55_mini_system_demo/config.json
+@@ -1,56 +1,23 @@
+-{
+-    "product_name": "qemu_cm55_mini_system_demo",
+-    "ohos_version": "OpenHarmony 1.0",
+-    "type":"mini",
+-    "version": "3.0",
+-    "device_company": "qemu",
+-    "board": "arm_mps3_an547",
+-    "kernel_type": "liteos_m",
+-    "kernel_version": "3.0.0",
+-    "subsystems": [
+-      {
+-        "subsystem": "kernel",
+-        "components": [
+-          { "component": "liteos_m", "features":[] }
+-        ]
+-      },
+-      {
+-        "subsystem": "hiviewdfx",
+-        "components": [
+-          { "component": "hievent_lite", "features":[] }
+-        ]
+-      },
+-      {
+-        "subsystem": "systemabilitymgr",
+-        "components": [
+-          { "component": "samgr_lite", "features":[] }
+-        ]
+-      },
+-      {
+-        "subsystem": "startup",
+-        "components": [
+-          { "component": "bootstrap_lite", "features":[] },
+-          {
+-            "component": "init",
+-            "features": [
+-              "init_feature_begetctl_liteos = true"
+-            ]
+-          }
+-        ]
+-      },
+-      {
+-        "subsystem": "security",
+-        "components": [
+-          { "component": "huks", "features":
+-            [
+-              "huks_use_lite_storage = true",
+-              "huks_use_hardware_root_key = true",
+-              "huks_config_file = \"hks_config_lite.h\""
+-            ]
+-          }
+-        ]
+-      }
+-    ],
+-    "third_party_dir": "",
+-    "product_adapter_dir": "//vendor/ohemu/qemu_cm55_mini_system_demo/hals"
+-  }
++{
++  "product_name": "qemu_cm55_mini_system_demo",
++  "ohos_version": "OpenHarmony 1.0",
++  "type": "mini",
++  "version": "3.0",
++  "device_company": "qemu",
++  "board": "arm_mps3_an547",
++  "kernel_type": "liteos_m",
++  "kernel_version": "3.0.0",
++  "subsystems": [
++    {
++      "subsystem": "kernel",
++      "components": [
++        {
++          "component": "liteos_m",
++          "features": []
++        }
++      ]
++    }
++  ],
++  "third_party_dir": "",
++  "product_adapter_dir": "//vendor/ohemu/qemu_cm55_mini_system_demo/hals"
++}
+\ No newline at end of file
+diff --git a/qemu_cm55_mini_system_demo/kernel_configs/debug.config b/qemu_cm55_mini_system_demo/kernel_configs/debug.config
+index c125d34..6d8ddd3 100755
+--- a/qemu_cm55_mini_system_demo/kernel_configs/debug.config
++++ b/qemu_cm55_mini_system_demo/kernel_configs/debug.config
+@@ -5,3 +5,5 @@ LOSCFG_KERNEL_PM=y
+ LOSCFG_FS_FAT=y
+ LOSCFG_SHELL=y
+ LOSCFG_KERNEL_TEST=n
++LOSCFG_KERNEL_LMS=y
++LOSCFG_LMS_CHECK_STRICT=y

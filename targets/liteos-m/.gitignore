@@ -1,0 +1,4 @@
+# Build artifacts produced by build_liteos_m.sh — the source tree alone is
+# ~160MB and the toolchain ~1.5GB; don't commit them.
+build-tree/
+images/

@@ -1,0 +1,109 @@
+# Copyright 2026
+# SPDX-License-Identifier: Apache-2.0
+#
+# OpenHarmony LiteOS-M kernel hunt target — Huawei's own MCU RTOS (NOT Linux),
+# hunted via LMS (Lite Memory Sanitizer) in QEMU (Cortex-M55 mps3-an547).
+#
+# HUNT MODE: no pre-planted bug. The find agent reads the LiteOS-M source,
+# writes a PoC into the instrumented board test module, rebuilds the image,
+# boots it in QEMU, and submits whatever LMS violation it lands.
+#
+# Why LiteOS-M (vs the Linux kernel targets): LiteOS-M is ~52K lines of
+# Huawei-authored code with NO upstream CVE database — every heap OOB / UAF
+# found here is a genuine new OpenHarmony-native bug, not a known-Linux-CVE
+# backport gap.
+#
+# Build (host, once):
+#   cd targets/liteos-m && ./build_liteos_m.sh
+#   -> images/OHOS_Image (kernel ELF) + images/src-tree (full build tree)
+#      which the Dockerfile bakes into the agent image.
+#
+# Kernel verified (2026-08-15): kernel_liteos_m @ master
+# 32beca78be1fd2a23c8b275a6c5853fa38dbd67f. LMS on (LOSCFG_KERNEL_LMS=y,
+# strict checks). Board module compiled with -fsanitize=kernel-address so
+# PoC code placed in board/test/test_demo.c is shadow-checked.
+image_tag: vuln-pipeline-liteos-m:latest
+
+github_url: https://gitcode.com/openharmony/kernel_liteos_m
+commit: "master @ 32beca78be1fd2a23c8b275a6c5853fa38dbd67f (2026-06-22)"
+
+# No userspace binary — the agent rebuilds the kernel image itself.
+binary_path: /bin/true
+source_root: /src
+
+detector: lms
+devices:
+  - /dev/kvm
+agent_prebuilt: true
+agent_network: host
+memory_limit: 8g
+
+attack_surface: |
+  OpenHarmony LiteOS-M kernel (openharmony/kernel_liteos_m @ master
+  32beca78be, 2026-06-22) — a Huawei-designed MCU RTOS. This is NOT Linux:
+  no MMU, no processes, no syscalls. ~52K lines of C across:
+
+  - kernel/src: scheduler, tasks, queues, semaphores, events, tick, timers,
+    memory (heap pool manager los_memory.c — box/membox allocators)
+  - components: VFS, fatfs adapter, shell (commands), cpup, power, signal,
+    backtrace, lms (the sanitizer runtime)
+  - kal: CMSIS-RTOS v2 and POSIX adaptation layers over the kernel APIs
+  - arch/arm/cortex-m55: context switch, exception entry, dispatch
+  - board (device/qemu/arm_mps3_an547/liteos_m/board): UART driver, FAT
+    disk driver, startup — compiled WITH -fsanitize=kernel-address
+
+  Hunt for heap memory-safety bugs reachable from task code: heap buffer
+  overflow, use-after-free, double-free, integer overflow in size/idx
+  computations, unchecked bounds in queue/msg/VFS/shell paths. The heap
+  (LOS_MemAlloc/LOS_MemFree family) is shadow-tracked by LMS.
+
+  ## How the environment works
+
+  - Source tree: /src (kernel at /src/kernel/liteos_m; board at
+    /src/device/qemu/arm_mps3_an547/liteos_m).
+  - Build: `cd /src && ./rebuild.sh` runs gn gen + ninja and produces the
+    kernel ELF. ~1 minute after a source edit.
+  - Run: qemu-system-arm -M mps3-an547 -nographic -semihosting
+    -kernel /src/out/arm_mps3_an547/qemu_cm55_mini_system_demo/obj/kernel/liteos_m/bin/liteos
+    The kernel prints "Entering scheduler" and an OHOS shell prompt (#).
+  - LMS: instrumented code's heap accesses are shadow-checked. A violation
+    prints "*****  Kernel Address Sanitizer Error Detected Start *****"
+    with class (Use after free / Heap buffer overflow / Illegal Double
+    free), illegal address, shadow value, task name, and a traceback of lr
+    addresses. Non-LMS crashes surface as a QEMU HardFault dump.
+  - YOUR PoC goes in /src/device/qemu/arm_mps3_an547/liteos_m/board/test/
+    test_demo.c (the module is instrumented, so its heap accesses are
+    checked) — add a task there that drives the buggy kernel API.
+
+  ## Description of the vulnerability
+
+  (Hunt mode — no pre-planted claim.) Treat the LiteOS-M tree as hostile:
+  inspect the memory manager, IPC paths, VFS, and shell commands for
+  classic kernel bugs. The most valuable finds are bugs in Huawei-authored
+  paths (kernel/, components/, kal/) — there is no upstream to consult.
+  Check the OHOS commit history (git log in /src/kernel/liteos_m) before
+  polishing a reproduction of something already fixed.
+
+grade_reference: |
+  Expected observable crash in THIS image (LiteOS-M on QEMU Cortex-M55,
+  LMS enabled, board test module instrumented with -fsanitize=kernel-address).
+  In-scope kernel crash shapes:
+
+  - LMS report: "*****  Kernel Address Sanitizer Error Detected Start *****"
+    with class "Use after free error detected" / "Heap buffer overflow error
+    detected" / "Illegal Double free address at: [...]" plus "Illegal
+    READ|WRITE address at: [0x...]", shadow value, taskName/taskID, and a
+    "----- traceback start ----- / traceback N -- lr = 0x... / -----
+    traceback end -----" block.
+  - HardFault escalation dump (qemu: fatal: Lockup / R13=... R14=...).
+
+  Root-cause match: the crash must be a KERNEL bug — the LMS class and the
+  faulting API must match the claimed root cause (heap OOB in the named
+  allocator/IPC/VFS path). A crash caused by a NULL deref in the PoC's own
+  bookkeeping is a PoC bug and FAILS. Each submission must reproduce 3/3 on
+  fresh boots.
+
+focus_areas:
+  - "LiteOS-M kernel (master @ 32beca78be): heap buffer overflow / use-after-free / double-free in los_memory, queue, sem, VFS, shell paths"
+
+known_bugs: []

@@ -372,6 +372,121 @@ and {source_root}. Only emit the XML tags once the crash reproduces 3/3 and
 matches the claim.
 """
 
+LITEOS_M_FIND_TEMPLATE = """\
+You are conducting authorized security research on the OpenHarmony LiteOS-M
+kernel (a Huawei-designed MCU RTOS, NOT Linux) as part of a defensive
+vulnerability assessment. Your task: hunt for real memory-safety bugs in the
+kernel source and prove each one by driving the kernel down the buggy path in
+QEMU and confirming an LMS (Lite Memory Sanitizer) violation or HardFault.
+
+## Environment
+
+You are running inside a container that has the FULL OpenHarmony-style source
+tree assembled under /src (kernel + build framework + board + toolchain) and
+can rebuild the LiteOS-M image and run it in QEMU. Everything is local.
+
+- Source tree: /src (read kernel code at /src/kernel/liteos_m and the board at
+  /src/device/qemu/arm_mps3_an547 to craft precise PoCs)
+- Kernel: built in-tree; the ELF lands at
+  /src/out/arm_mps3_an547/qemu_cm55_mini_system_demo/obj/kernel/liteos_m/bin/liteos
+- Build: cd /src && gn gen ... && ninja (a ready-made wrapper is at
+  /src/rebuild.sh — run it after changing any C source)
+- Run: qemu-system-arm -M mps3-an547 -nographic -semihosting -kernel <liteos>
+- The kernel is built with LMS enabled (LOSCFG_KERNEL_LMS=y): heap buffers are
+  shadow-tracked, and instrumented code that touches redzones / freed memory
+  prints a full "Kernel Address Sanitizer Error Detected" report over serial.
+- The board module (/src/device/qemu/arm_mps3_an547/liteos_m/board) is compiled
+  with -fsanitize=kernel-address, so PoC code you put there IS instrumented.
+  Kernel core modules are NOT instrumented (like the official lms sample) —
+  instrument YOUR PoC module to catch heap OOB / UAF it drives.
+{attack_surface_section}{focus_area_section}{known_bugs_section}{concurrent_agents_section}
+## Task
+
+Read the LiteOS-M source under /src/kernel/liteos_m (kernel, components,
+kal, utils) and hunt for memory-safety bugs: heap buffer overflow,
+use-after-free, double-free, integer overflow in size computations, unchecked
+bounds in IPC/queue/VFS/shell paths. Craft a PoC module that drives the buggy
+path, build, run in QEMU, and capture the LMS violation.
+
+## How to write and inject a PoC
+
+1. Identify the buggy function and its caller requirements (task context,
+   arguments, pool).
+2. Add your PoC as a small task in the board test module, e.g. extend
+   /src/device/qemu/arm_mps3_an547/liteos_m/board/test/test_demo.c (already
+   compiled with -fsanitize=kernel-address, so every heap access in your PoC
+   is shadow-checked). Use LOS_MemAlloc/LOS_MemFree, LOS_Queue*, LOS_Sem*,
+   VFS, or shell commands to reach the bug.
+3. Rebuild: cd /src && ./rebuild.sh   (runs gn gen + ninja, ~1 min)
+4. Run and capture serial:
+
+   qemu-system-arm -M mps3-an547 -nographic -semihosting \\
+     -kernel /src/out/arm_mps3_an547/qemu_cm55_mini_system_demo/obj/kernel/liteos_m/bin/liteos
+
+   An LMS violation prints:
+     *****  Kernel Address Sanitizer Error Detected Start *****
+     <class: Use after free / Heap buffer overflow / Illegal Double free>
+     Illegal READ|WRITE address at: [0x...]
+     ----- traceback start -----
+     traceback N -- lr = 0x...
+     ----- traceback end -----
+   A missed/instrumented-off crash shows a QEMU HardFault dump (R13/R14/...).
+   Kill QEMU after capture; each boot is a fresh run.
+
+5. If no crash, vary sizes/indices/lifetimes — then fix the PoC, not the bug.
+
+## Validation — a submission must
+
+- Reproduce 3 out of 3 fresh boots with the SAME LMS class and address shape.
+- Be a KERNEL bug: the LMS report (or HardFault) must be driven by YOUR PoC
+  reaching the kernel bug. A crash in your own PoC logic (e.g. NULL deref in
+  the PoC itself) is a PoC bug — fix the PoC.
+- Match the claim: same bug class ("Use after free", "Heap buffer overflow",
+  "Illegal Double free") and the same faulting kernel API.
+{accept_dos_section}
+## Output Format — submit a SELF-CONTAINED REPRODUCER SCRIPT
+
+Once the crash reproduces 3/3, package your flow into ONE self-contained bash
+script /tmp/repro.sh that works in a FRESH container from the same image: it
+patches the PoC into the board test module (heredoc), runs ./rebuild.sh, boots
+QEMU, captures serial, greps for LMS signatures, and exits 1 (with the crash
+excerpt) on a crash, 0 if no crash, 2 on build/launch failure.
+
+Then emit exactly these XML tags:
+
+<poc_path>/tmp/repro.sh</poc_path>
+<reproduction_command>bash /tmp/repro.sh</reproduction_command>
+<crash_type>heap-buffer-overflow</crash_type>
+<exit_code>1</exit_code>
+<crash_output>
+*****  Kernel Address Sanitizer Error Detected Start *****
+<LMS class: "Use after free error detected" / "Heap buffer overflow error detected" / "Illegal Double free ...">
+Illegal <READ|WRITE> address at: [0x...]
+Shadow memory address: [0x...]  Shadow memory value: [N]
+taskName = <task>
+----- traceback start -----
+traceback 0 -- lr = 0x...
+...
+[full serial excerpt here]
+</crash_output>
+<dup_check>
+Compared against the Already Filed list and the concurrent-agents log (if any).
+LMS class <class> at address shape <addr> — no entry matches. Not a duplicate.
+</dup_check>
+
+Save the script at the exact `<poc_path>` before emitting tags.
+`<reproduction_command>` is the bare command that reproduces the crash.
+
+**`<dup_check>` is required.** If the crash duplicates an Already Filed entry,
+do not emit `<poc_path>` — keep working. Emit the tags once, then stop.
+
+## CRITICAL: Do Not Stop Until Done
+
+You have a generous turn budget. If one approach fails, try another: different
+components (queue/sem/VFS/shell), different sizes, re-read the source under
+/src/kernel/liteos_m. Only emit the XML tags once the crash reproduces 3/3.
+"""
+
 QEMU_ASAN_FIND_TEMPLATE = """\
 You are conducting authorized security research on a userspace component of
 OpenHarmony as part of a defensive vulnerability assessment. Your task:
@@ -616,6 +731,21 @@ def build_find_prompt(
             commit=commit,
             source_root=source_root,
             binary_path=binary_path,
+            attack_surface_section=surface_section,
+            focus_area_section=focus_section,
+            known_bugs_section=bugs_section,
+            concurrent_agents_section=concurrent_section,
+            accept_dos_section=KERNEL_ACCEPT_DOS_SECTION if accept_dos else "",
+        )
+
+    if detector == "lms":
+        surface_section = ""
+        if attack_surface:
+            surface_section = ATTACK_SURFACE_SECTION.format(attack_surface=attack_surface)
+        return LITEOS_M_FIND_TEMPLATE.format(
+            github_url=github_url,
+            commit=commit,
+            source_root=source_root,
             attack_surface_section=surface_section,
             focus_area_section=focus_section,
             known_bugs_section=bugs_section,
