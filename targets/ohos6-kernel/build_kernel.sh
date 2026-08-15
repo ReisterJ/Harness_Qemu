@@ -138,7 +138,9 @@ scripts/config \
   --enable UNIX --enable INET --enable PACKET --enable KALLSYMS \
   --enable NAMESPACES --enable UTS_NS --enable IPC_NS --enable PID_NS \
   --enable NET_NS --enable USER_NS --enable TIME_NS --enable NSFS \
-  --enable DEVPTS_MULTIPLE_INSTANCES --enable MEMCG --enable VETH
+  --enable DEVPTS_MULTIPLE_INSTANCES --enable MEMCG --enable VETH \
+  --enable SOFTLOCKUP_DETECTOR --enable BOOTPARAM_SOFTLOCKUP_PANIC \
+  --enable HUNG_TASK --enable DETECT_HUNG_TASK
 make olddefconfig $TC_OVERRIDES KCFLAGS="$KCFLAGS_EXTRA"
 
 # ---- 4. Build ---------------------------------------------------------------
