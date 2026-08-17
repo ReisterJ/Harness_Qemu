@@ -47,6 +47,28 @@ vuln-pipeline run targets/liteos-m --dangerously-no-sandbox \
   illegal address, shadow value, task, and `lr` traceback — parsed by
   `harness/lms.py` (detector `lms`), feeding dedup/judge/found_bugs as usual.
 
+## Detection coverage — read before reporting
+
+LMS here is a **heap-only** checker with **module-level instrumentation**
+(the official LiteOS-M pattern — whole-kernel `-fsanitize=kernel-address`
+faults at boot). Practical consequences:
+
+- **What is detected:** heap lifetime bugs (UAF / double-free / heap OOB)
+  that are touched through (a) LMS-instrumented code (the board module the
+  PoC lives in) or (b) the LMS-wrapped libc entry points (`memcpy`,
+  `memcpy_s`, `memset`, `malloc`/`free`, ...) that kernel paths call.
+  All findings to date have been `memcpy`-family UAFs — this is the
+  instrumented surface, not a property of the kernel.
+- **What is *not* detected:** stack overflows, global-buffer overflows,
+  writes from uninstrumented kernel code that bypass libc (direct pointer
+  dereferences, `memmove` variants not wrapped, asm copies), and use of
+  uninitialized memory. **Absence of a report is not absence of a bug.**
+- **Build flags:** board/test modules are compiled `-O0` (instrumentation
+  fidelity), kernel core `-Os`. The lifetime defects this target finds are
+  optimization-independent; this does not affect validity of findings.
+- **Environment:** bare-metal QEMU (`mps3-an547`), no user/kernel split —
+  PoCs run as kernel tasks by design, which is the MCU threat model.
+
 ## Verified (2026-08-15)
 
 - kernel_liteos_m master `32beca78be1fd2a23c8b275a6c5853fa38dbd67f`
