@@ -1,0 +1,37 @@
+# Copyright 2026 Anthropic PBC
+# SPDX-License-Identifier: Apache-2.0
+image_tag: vuln-pipeline-libyaml:latest
+agent_network: host
+# Upstream libyaml (yaml/libyaml), pinned commit.
+github_url: https://github.com/yaml/libyaml
+commit: "90a56d4 (master @ 2026-08-21)"
+# The find agent compiles the PoC against libyaml sources; there's no single
+# host binary shipped in the image (the harness /work/run_parser is built at
+# image build time and used as the target entry).
+binary_path: /work/run_parser
+source_root: /work/libyaml
+build_command: >-
+  cmake -S /work/libyaml -B /work/libyaml/build -DBUILD_SHARED_LIBS=OFF
+  -DCMAKE_BUILD_TYPE=Debug -DYAML_BUILD_TEST=OFF && cmake --build
+  /work/libyaml/build -j4 && gcc -O1 -g -fsanitize=address
+  -fno-omit-frame-pointer -I /work/libyaml/build/include -I /work/libyaml/include
+  /work/libyaml/tests/run-parser.c /work/libyaml/build/libyaml.a -o /work/run_parser
+test_command: >-
+  printf 'a: 1\n' > /tmp/t1.yml && printf 'a: [1,2,{b: 3}]\n' > /tmp/t2.yml &&
+  /work/run_parser /tmp/t1.yml && /work/run_parser /tmp/t2.yml
+
+focus_areas:
+  - "yaml_parser / yaml_parser_parse — event-driven parser state machine (parser.c): token->event flow, error recovery paths"
+  - "yaml_scanner — tokenizer (scanner.c): plain scalars, quoted scalars, directives, alias/anchors, unicode"
+  - "yaml_reader — input buffer / UTF-8/16/32 decoding (reader.c): buffer growth, BOM handling, invalid sequences"
+  - "yaml_emitter / yaml_loader — emitter (emitter.c) and loader (loader.c): output buffer sizing, aliases, anchors"
+
+# No known bugs filed yet (this is a live upstream target).
+known_bugs: []
+
+attack_surface: |
+  libyaml is a C YAML 1.1 parser/emitter. Entry point is
+  /work/run_parser <file> — the official tests/run-parser.c harness which
+  reads a file, runs yaml_parser_parse() to exhaustion, and deletes events.
+  Any untrusted YAML file reaches the full scanner/parser/composer stack.
+  libyaml is used by Ruby, Python (PyYAML), Go (go-yaml) and many tools.

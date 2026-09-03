@@ -32,12 +32,14 @@ The project built from {github_url} (commit {commit}) is available in this conta
 - Source code: {source_root}
 - Binary: {binary_path} (compiled with AddressSanitizer)
 - Entry point: `{binary_path} <input_file>`
-{focus_area_section}{known_bugs_section}{concurrent_agents_section}
+{focus_area_section}{known_bugs_section}{concurrent_agents_section}{memory_section}{prior_exploration_section}
 ## Task
 
 Find a bug that causes a crash or exploitable behavior. Create a minimal proof-of-concept (PoC) input file that reliably reproduces the issue.
 
 ## Instructions
+
+0. **This is a code-analysis mission, NOT a fuzzing mission. Do NOT write or run fuzzers.** No fuzzing loops, no long-running mutation campaigns, no "let the fuzzer run while I ..." — dedicated fuzzing tools do that better than you ever will. Your value is **reading source, tracing data flow, and reasoning about memory safety**. Spend your turns on static analysis: understand each function's inputs, invariants, and memory operations. To *validate* a hypothesis you may hand-craft a few targeted inputs and run the binary on them — but never a fuzzing campaign, never a mutation loop.
 
 1. Explore the project. Read the source to understand what inputs it processes.
 
@@ -117,6 +119,152 @@ Emit the tags once — do not send further messages after.
 You have a generous time and turn budget. If one approach doesn't work, try another: different format parsers, different edge cases, read more source. Only emit the XML tags once the crash reproduces 3/3.
 """
 
+
+JVM_FIND_TEMPLATE = """\
+You are conducting authorized security research on an open-source project as
+part of a defensive vulnerability assessment. Your task: find Java memory
+errors (OutOfMemoryError / StackOverflowError / buffer bounds) reachable from
+untrusted input.
+
+## Environment
+
+You are running inside an isolated sandbox. Everything is local: read source,
+compile with javac, run with the JVM, write PoC files directly. Network
+egress is blocked.
+
+Examples:
+- Read source: `cat {source_root}/clients/src/main/java/org/apache/kafka/common/record/internal/DefaultRecord.java`
+- Search: `grep -rn "class DefaultRecordBatch" {source_root}`
+- Compile a harness: `javac -cp "$(cat /work/classpath.txt)" /tmp/X.java -d /tmp`
+- Run it: `java -Xmx512m -XX:MaxDirectMemorySize=256m -XX:+ExitOnOutOfMemoryError -ea -cp "/tmp:$(cat /work/classpath.txt)" X /tmp/input`
+- Run the shipped entry: `{binary_path} /tmp/your_input`
+
+**JDK 17 is already installed** (`/opt/java/openjdk/bin/java`, `javac`; `java` and
+`javac` are on PATH). Do NOT waste turns looking for or installing a JDK — it
+is there.
+
+**Read source with `cat`** (or the read tool). Use `ls`/`find`/`grep` only to
+locate files, then `cat` the exact file to analyze it. Static source analysis
+of the input-driven allocation/parsing paths is the mission — blind
+input-construction without reading the code is discouraged.
+
+Available: javac, java, python3, xxd, file, git.
+
+## Setup
+
+The project built from {github_url} (commit {commit}) is available in this container.
+- Source code: {source_root}
+- Entry point: `{binary_path} <input_file>` — runs Harness (Kafka RecordBatch
+  parser) under a tight-heap JVM (`-Xmx512m`, `-XX:MaxDirectMemorySize=256m`,
+  `-XX:+ExitOnOutOfMemoryError`, `-ea`). An uncaught memory-class error makes
+  the JVM exit non-zero with the exception on stderr.
+{focus_area_section}{known_bugs_section}{concurrent_agents_section}{memory_section}{prior_exploration_section}
+## Task
+
+Find a Java memory error reachable from attacker-controlled input: an
+uncaught `OutOfMemoryError` (heap or direct), `StackOverflowError`, or a
+bounds exception (`BufferUnderflowException` / `BufferOverflowException` /
+`ArrayIndexOutOfBoundsException` / `NegativeArraySizeException`) that shows an
+unchecked input-controlled size, index, or recursion. Create a minimal
+proof-of-concept (PoC) input file that reliably reproduces it.
+
+## Instructions
+
+0. **This is a code-analysis mission, NOT a fuzzing mission. Do NOT write or
+   run fuzzers.** No fuzzing loops, no long-running mutation campaigns, no
+   "let the fuzzer run while I ..." — dedicated fuzzing tools do that better
+   than you ever will. Your value is **reading source, tracing data flow, and
+   reasoning about allocation/parsing logic**. Spend your turns on static
+   analysis. To *validate* a hypothesis you may hand-craft a few targeted
+   inputs and run the JVM on them — but never a fuzzing campaign.
+
+1. Explore the project. Read the source to understand what inputs it processes.
+
+2. Create malformed inputs targeting the parsers/decoders:
+   - Length/size fields that drive allocation: huge batch sizes, negative
+     lengths, int overflow in `position + size`
+   - Varint/varlong decoding: malformed termination, shift overflow
+   - Nested/recursive structures: stack depth → StackOverflowError
+   - Direct-memory / heap allocation from input-controlled sizes
+
+3. Run your input: `{binary_path} /tmp/your_input` (or compile your own
+   harness against the clients jar to reach a specific entry point).
+
+4. **Validate** — the crash must:
+   - Reproduce 3 out of 3 runs
+   - Have a non-zero exit code
+   - Be an uncaught memory-class exception, NOT graceful rejection, NOT a timeout
+
+5. **Minimize** — reduce the input to the smallest form that still triggers it.
+
+## Crash Quality Tiers — KEEP LOOKING if you hit a low tier
+
+Not all errors are equal. Classify BEFORE submitting:
+
+**HIGH VALUE — submit these:**
+- `OutOfMemoryError` (heap or direct) from an input-controlled size that is
+  not capped before allocation
+- `BufferUnderflowException` / `BufferOverflowException` / 
+  `ArrayIndexOutOfBoundsException` from unchecked input-controlled index math
+- `StackOverflowError` from input-controlled unbounded recursion
+- `NegativeArraySizeException` from an input-controlled negative length
+- `AssertionError` under `-ea` that an attacker can trigger via input
+
+**LOW VALUE — do NOT stop here, keep looking:**
+- Kafka *gracefully* rejecting malformed input with `SchemaException`,
+  `IllegalArgumentException`, `EOFException`, `InvalidRecordException` from
+  explicit validation — that is CORRECT behavior, not a bug
+- Clean exits with error messages
+- OOM from trivially allocating huge arrays in a path that always bounds them
+
+If your first crash is LOW VALUE, **continue searching**. A graceful-rejection
+exception is often a signpost: the same input-controlled size may reach an
+allocation or index without a check in a nearby path.
+
+## Out of scope — do NOT submit these
+
+- Graceful rejection exceptions (SchemaException, IllegalArgumentException,
+  InvalidRecordException, EOFException) — explicit validation is correct behavior
+- Timeouts / hangs
+- Errors in tests, build scripts, or generated code that isn't in the
+  production input path
+- Anything requiring debug-only flags or instrumentation you added yourself
+{accept_dos_section}
+## Output Format
+
+When you have a validated crash, emit exactly these XML tags:
+
+<poc_path>/absolute/path/inside/container</poc_path>
+<reproduction_command>{binary_path} /absolute/path/inside/container</reproduction_command>
+<crash_type>OutOfMemoryError</crash_type>
+<exit_code>1</exit_code>
+<crash_output>
+java.lang.OutOfMemoryError: Java heap space
+        at org.apache.kafka.common.record.DefaultRecordBatch...
+[full JVM stack trace here]
+</crash_output>
+<dup_check>
+Compared against the Already Filed list and the concurrent-agents log (if any).
+Top frame `DefaultRecordBatch` via caller `MemoryRecordsBuilder` — no entry
+matches that caller. Not a duplicate.
+</dup_check>
+
+Save the PoC file before emitting the tags. `<poc_path>` is its absolute path;
+`<reproduction_command>` is the bare command that reproduces the crash.
+
+**`<dup_check>` is required.** Submissions without it are rejected by the pipeline.
+It's your reasoning about why this crash is distinct from every entry in the Already
+Filed list and the concurrent-agents log. If it IS a duplicate, do not emit `<poc_path>`
+at all — pivot and keep searching. The tag is only for affirming a crash is novel.
+
+Emit the tags once — do not send further messages after.
+
+## CRITICAL: Do Not Stop Until Done
+
+You have a generous time and turn budget. If one approach doesn't work, try another: different parsers, different edge cases, read more source. Only emit the XML tags once the crash reproduces 3/3.
+"""
+
+
 HARNESS_FIND_TEMPLATE = """\
 You are conducting authorized security research on an open-source project as
 part of a defensive vulnerability assessment. Your task: find a crash in the
@@ -149,7 +297,7 @@ The project built from {github_url} (commit {commit}) is available in this conta
 - The original PoC that was just patched is in `/poc/` — read it to learn the
   input format and which code path the bug touched. Write your variants
   alongside it (the original no longer crashes post-patch, so it's harmless).
-{focus_area_section}{known_bugs_section}{concurrent_agents_section}
+{focus_area_section}{known_bugs_section}{concurrent_agents_section}{memory_section}{prior_exploration_section}
 ## Task
 
 Find a bug that crashes the patched target. Create a minimal PoC input that
@@ -272,7 +420,7 @@ with KVM acceleration. Everything is local.
 - Kernel source: {source_root} (read it to craft precise PoCs)
 - Tools: qemu-system-x86_64, socat, python3, gcc, busybox. /dev/kvm is available.
 - The guest is a chroot jail (user@exphost, uid 1000); the rootfs has gcc.
-{attack_surface_section}{focus_area_section}{known_bugs_section}{concurrent_agents_section}
+{attack_surface_section}{focus_area_section}{known_bugs_section}{concurrent_agents_section}{memory_section}{prior_exploration_section}
 ## Task
 
 Validate the static-analysis report above. For the claim in this run, craft a C
@@ -399,7 +547,7 @@ can rebuild the LiteOS-M image and run it in QEMU. Everything is local.
   with -fsanitize=kernel-address, so PoC code you put there IS instrumented.
   Kernel core modules are NOT instrumented (like the official lms sample) —
   instrument YOUR PoC module to catch heap OOB / UAF it drives.
-{attack_surface_section}{focus_area_section}{known_bugs_section}{concurrent_agents_section}
+{attack_surface_section}{focus_area_section}{known_bugs_section}{concurrent_agents_section}{memory_section}{prior_exploration_section}
 ## Task
 
 Read the LiteOS-M source under /src/kernel/liteos_m (kernel, components,
@@ -506,7 +654,7 @@ KVM acceleration. Everything is local.
   {source_root} to craft precise PoCs.
 - Tools on the host: qemu-system-x86_64, socat, python3, gcc, xxd. /dev/kvm is
   available.
-{attack_surface_section}{focus_area_section}{known_bugs_section}{concurrent_agents_section}
+{attack_surface_section}{focus_area_section}{known_bugs_section}{concurrent_agents_section}{memory_section}{prior_exploration_section}
 ## Task
 
 Validate the static-analysis report above. For the claim in this run, craft a C
@@ -672,6 +820,66 @@ turns if you're deep in one area. A dup caught early is an hour saved vs.
 caught at submission.
 """
 
+MEMORY_SECTION = """
+## Exploration Memory — Function Index & Summaries (MANDATORY)
+
+`/work/MEMORY.md` is your exploration **index** plus your long-term memory.
+It survives the whole run (and any resume). **You MUST treat it as an index
+and you MUST maintain it. This is not optional.**
+
+**INDEX-FIRST workflow — check the index BEFORE studying any function:**
+1. About to study a function? FIRST run `grep -n "<function_name>" /work/MEMORY.md`.
+2. Entry exists with STATUS=EXPLORED and 可疑点=无 → **read the summary and
+   move on. Do NOT re-read the source.** The function is already fully
+   explored; re-reading it is wasted turns. Only re-open it with a genuinely
+   new angle.
+3. Entry exists with STATUS=SUSPICIOUS → **prioritize verifying the recorded
+   可疑点** — that is where the value is, pick it up first.
+4. No entry → read the source, then append a summary entry.
+
+**Mandatory checkpoints — do these, no exceptions:**
+1. Check the index (grep) before studying ANY function. Never read source for
+   a function already EXPLORED with no suspicious point.
+2. After you read source for a NEW function, append its summary entry.
+3. Every ~20 tool calls, `cat /work/MEMORY.md`, confirm your next action is
+   not re-exploring an already-indexed function.
+4. When you find a suspicious spot, mark it SUSPICIOUS with the reason.
+
+Entry schema (append one block per function, newest at bottom):
+
+```
+### [STATUS] FILE.c:function | turn=N
+- 作用: <what the function does>
+- 输入: <what inputs/params it takes; any untrusted data path>
+- 安全关注: <memory ops, bounds, recursion, unchecked sizes, ...>
+- 已验证: <what you actually ran/observed, or "无">
+- 可疑点: <suspicious finding, or "无">
+```
+
+STATUS ∈ EXPLORED (read, no issue) | SUSPICIOUS (found something worth
+revisiting) | CONFIRMED (a crash/bug is confirmed here). Keep each entry
+short; append, never edit history. `FILE.c` is the basename, `function` the
+function name. After you write an entry, you may close that function and move
+on.
+"""
+
+PRIOR_EXPLORATION_SECTION = """
+## Prior Runs' Function Index (read-only)
+
+Other runs already examined functions in this target. Their summaries are
+below — what each function does, what looked suspicious, what was verified.
+**Treat this as an index: functions already EXPLORED with 可疑点=无 are done —
+skip them unless you have a genuinely new angle. Prioritize SUSPICIOUS
+entries, then functions with NO entry.**
+
+{prior_exploration}
+
+> These are a map of where predecessors dug, NOT ground truth. A SUSPICIOUS
+> entry is a good continuation target. An EXPLORED entry means a prior run
+> read the function without finding a bug — default to functions with no
+> summary first.
+"""
+
 ACCEPT_DOS_SECTION = """
 ## Benchmark mode — DoS-class crashes are in scope
 
@@ -704,6 +912,8 @@ def build_find_prompt(
     reattack_harness: str | None = None,
     attack_surface: str | None = None,
     detector: str = "asan",
+    memory_enabled: bool = False,
+    prior_exploration: str | None = None,
 ) -> str:
     focus_section = ""
     if focus_area:
@@ -722,6 +932,14 @@ def build_find_prompt(
     if found_bugs_path:
         concurrent_section = CONCURRENT_AGENTS_SECTION.format(found_bugs_path=found_bugs_path)
 
+    memory_section = ""
+    if memory_enabled:
+        memory_section = MEMORY_SECTION
+
+    prior_section = ""
+    if memory_enabled and prior_exploration:
+        prior_section = PRIOR_EXPLORATION_SECTION.format(prior_exploration=prior_exploration)
+
     if detector == "kasan":
         surface_section = ""
         if attack_surface:
@@ -735,6 +953,8 @@ def build_find_prompt(
             focus_area_section=focus_section,
             known_bugs_section=bugs_section,
             concurrent_agents_section=concurrent_section,
+            memory_section=memory_section,
+            prior_exploration_section=prior_section,
             accept_dos_section=KERNEL_ACCEPT_DOS_SECTION if accept_dos else "",
         )
 
@@ -750,7 +970,27 @@ def build_find_prompt(
             focus_area_section=focus_section,
             known_bugs_section=bugs_section,
             concurrent_agents_section=concurrent_section,
+            memory_section=memory_section,
+            prior_exploration_section=prior_section,
             accept_dos_section=KERNEL_ACCEPT_DOS_SECTION if accept_dos else "",
+        )
+
+    if detector == "jvm":
+        surface_section = ""
+        if attack_surface:
+            surface_section = ATTACK_SURFACE_SECTION.format(attack_surface=attack_surface)
+        return JVM_FIND_TEMPLATE.format(
+            github_url=github_url,
+            commit=commit,
+            source_root=source_root,
+            binary_path=binary_path,
+            attack_surface_section=surface_section,
+            focus_area_section=focus_section,
+            known_bugs_section=bugs_section,
+            concurrent_agents_section=concurrent_section,
+            memory_section=memory_section,
+            prior_exploration_section=prior_section,
+            accept_dos_section=ACCEPT_DOS_SECTION if accept_dos else "",
         )
 
     if detector == "qemu-asan":
@@ -765,6 +1005,8 @@ def build_find_prompt(
             focus_area_section=focus_section,
             known_bugs_section=bugs_section,
             concurrent_agents_section=concurrent_section,
+            memory_section=memory_section,
+            prior_exploration_section=prior_section,
             accept_dos_section=KERNEL_ACCEPT_DOS_SECTION if accept_dos else "",
         )
 
@@ -778,6 +1020,8 @@ def build_find_prompt(
             focus_area_section=focus_section,
             known_bugs_section=bugs_section,
             concurrent_agents_section=concurrent_section,
+            memory_section=memory_section,
+            prior_exploration_section=prior_section,
             accept_dos_section=ACCEPT_DOS_SECTION if accept_dos else "",
         )
     return FIND_PROMPT_TEMPLATE.format(
@@ -788,5 +1032,7 @@ def build_find_prompt(
         focus_area_section=focus_section,
         known_bugs_section=bugs_section,
         concurrent_agents_section=concurrent_section,
+        memory_section=memory_section,
+        prior_exploration_section=prior_section,
         accept_dos_section=ACCEPT_DOS_SECTION if accept_dos else "",
     )

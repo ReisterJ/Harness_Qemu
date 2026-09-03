@@ -242,6 +242,9 @@ async def _run_once(
     stream_ctx: dict | None = None,
     accept_dos: bool = False,
     system_prompt: str | None = None,
+    memory_enabled: bool = False,
+    prior_exploration: str | None = None,
+    exploration_memory_path: Path | None = None,
 ) -> RunResult:
     """One find(+grade) attempt. Assumes image is already built.
 
@@ -279,6 +282,9 @@ async def _run_once(
             progress_prefix=f"[find:{run_idx}]",
             accept_dos=accept_dos,
             system_prompt=system_prompt,
+            memory_enabled=memory_enabled,
+            prior_exploration=prior_exploration,
+            memory_out_path=str(out_dir / "MEMORY.md") if memory_enabled else None,
         )
     except Exception as e:
         traceback.print_exc()
@@ -288,6 +294,16 @@ async def _run_once(
             error=f"find agent: {type(e).__name__}: {e}",
         ))
     timings.update(find_timings)
+
+    # Persist this run's exploration memory into the batch ledger (layer 2).
+    if memory_enabled and exploration_memory_path is not None:
+        memory_file = out_dir / "MEMORY.md"
+        if memory_file.exists():
+            from .memory import parse_memory_md, append_entries
+            entries = parse_memory_md(memory_file.read_text(encoding="utf-8", errors="replace"), run_idx=run_idx)
+            if entries:
+                append_entries(exploration_memory_path, entries)
+                print(f"[find:{run_idx}] memory: {len(entries)} entr(ies) -> {exploration_memory_path.name}")
     find_error: str | None = None
     find_transcript = find_result.transcript()
     resumes = f" ({find_result.resume_count} resume(s))" if find_result.resume_count else ""
@@ -755,6 +771,13 @@ async def _run_all(
     if found_bugs_path and not (args.resume and found_bugs_path.exists()):
         _seed_found_bugs(found_bugs_path, target.known_bugs)
 
+    # Exploration-memory ledger (layer 2). Seeded empty; each finished run
+    # appends its parsed MEMORY.md entries. Later runs get a rendering of the
+    # history injected into the find prompt (memory_enabled only).
+    exploration_memory_path = (results_root / "exploration_memory.jsonl").absolute()
+    if not exploration_memory_path.exists():
+        exploration_memory_path.write_text("", encoding="utf-8")
+
     # Streaming: shared judge lock + reports root + task sink. Serialized
     # judge calls mean two simultaneous grade-passes don't both claim NEW for
     # the same bug; report dispatch happens outside the lock.
@@ -790,9 +813,16 @@ async def _run_all(
     def _task(i: int):
         if i in checkpoints:
             return _checkpointed(i)
+        # Render prior exploration from whatever runs have already appended.
+        prior = ""
+        if args.memory and exploration_memory_path.exists():
+            from .memory import read_entries, render_prior_exploration
+            prior = render_prior_exploration(read_entries(exploration_memory_path))
         return _run_once(i, target, args.model, args.find_only, args.max_turns, agent_env,
                          out_dirs[i], _assigned_focus(i, focus_areas), found_bugs_path,
-                         stream_ctx, accept_dos=args.accept_dos, system_prompt=system_prompt)
+                         stream_ctx, accept_dos=args.accept_dos, system_prompt=system_prompt,
+                         memory_enabled=args.memory, prior_exploration=prior,
+                         exploration_memory_path=exploration_memory_path)
 
     if args.parallel:
         n_live = args.runs - len(checkpoints)
@@ -886,6 +916,10 @@ def main() -> int:
     p_run.add_argument("--novelty", action="store_true",
                        help="(--stream only) Enable host-side upstream novelty check for reports. "
                             "Clones github_url; off by default for air-gapped environments.")
+    p_run.add_argument("--memory", dest="memory", action="store_true",
+                       help="Enable exploration memory: agent maintains /work/MEMORY.md; "
+                            "per-run entries append to exploration_memory.jsonl and are "
+                            "rendered into later runs' find prompts.")
     p_run.add_argument("--report-max-turns", type=int, default=REPORT_MAX_TURNS,
                        help=f"(--stream only) Report-agent turn budget (default {REPORT_MAX_TURNS})")
     p_run.add_argument("--dangerously-no-sandbox", dest="dangerously_no_sandbox",

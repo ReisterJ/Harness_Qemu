@@ -1,0 +1,46 @@
+# Copyright 2026 Anthropic PBC
+# SPDX-License-Identifier: Apache-2.0
+image_tag: vuln-pipeline-kafka-exp-a:latest
+agent_network: host
+detector: jvm
+# Apache Kafka, pinned to 4.4.0-rc0.
+github_url: https://github.com/apache/kafka
+commit: "4.4.0-rc0"
+# The find agent compiles Java harnesses against the kafka-clients jar; the
+# shipped entry is run_harness.sh -> Harness (RecordBatch parser) under a
+# tight-heap JVM. Java has no ASAN: a "crash" is a non-zero exit with an
+# uncaught memory-class exception (OutOfMemoryError / StackOverflowError /
+# BufferUnderflow/Overflow / ArrayIndexOutOfBoundsException).
+binary_path: /work/run_harness.sh
+source_root: /work/kafka
+build_command: >-
+  cd /work/kafka && ./gradlew :clients:jar -x test --no-daemon -PskipSigning=true
+test_command: >-
+  printf '\x00\x00\x00\x01\x00\x00' > /tmp/t1.records && /work/run_harness.sh /tmp/t1.records
+
+focus_areas:
+  - "org.apache.kafka.common.record (MemoryRecords / DefaultRecordBatch / MemoryRecordsBuilder) — RecordBatch parsing: size fields, varints, compression, batch iteration"
+  - "org.apache.kafka.common.protocol (ByteBufferAccessor / Type / Readable) — protocol read/write: bounds, integer overflow in position+size, arrays/strings from length fields"
+  - "org.apache.kafka.common.utils.internals.ByteUtils — varint/varlong/zigzag decoding: malformed termination, shift overflow, negative lengths"
+  - "org.apache.kafka.common.memory (MemoryPool / BufferSupplier) + NetworkReceive — allocation from input-controlled sizes: direct-memory / heap OOM paths"
+
+# No known bugs filed (live upstream target).
+known_bugs: []
+
+attack_surface: |
+  Apache Kafka 4.4.0-rc0 is a distributed event-streaming platform. The
+  harness entry is /work/run_harness.sh <file>: Harness reads the file bytes
+  and feeds them to MemoryRecords.readableRecords(...).batches(), the
+  message-record parser in kafka-clients (pure Java). Any untrusted bytes
+  reach DefaultRecordBatch / ByteUtils / MemoryRecords parsing. Java memory
+  errors: OutOfMemoryError (heap/direct), StackOverflowError,
+  BufferUnderflow/OverflowException (NIO), ArrayIndexOutOfBoundsException.
+  The JVM runs with -Xmx512m -XX:MaxDirectMemorySize=256m
+  -XX:+ExitOnOutOfMemoryError -ea, so OOM aborts the process (non-zero exit).
+  Distinguish real bugs from graceful rejection: Kafka throws
+  SchemaException / IllegalArgumentException to reject malformed input — that
+  is CORRECT behavior, not a bug. A real find is an UNEXPECTED
+  OutOfMemoryError / StackOverflowError / bounds exception that indicates an
+  unchecked input-controlled size/loop, or memory exhaustion reachable from
+  attacker-controlled input. Agents may compile their own harness variants:
+  javac -cp "$(cat /work/classpath.txt)" /tmp/YourHarness.java -d /tmp && java ...

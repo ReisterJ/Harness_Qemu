@@ -12,6 +12,7 @@ from . import docker_ops, sandbox
 from .agent import run_agent, parse_xml_tag, AgentResult
 from .artifacts import CrashArtifact
 from .config import TargetConfig
+from .memory import seed_memory_content, collect_run_memory, MEMORY_PATH
 from .prompts.find_prompt import build_find_prompt
 
 
@@ -32,11 +33,21 @@ async def run_find(
     accept_dos: bool = False,
     system_prompt: str | None = None,
     max_resume_attempts: int = 20,
+    memory_enabled: bool = False,
+    prior_exploration: str | None = None,
+    memory_out_path: str | None = None,
 ) -> tuple[CrashArtifact | None, AgentResult, dict[str, float]]:
     """Run one find attempt against a target.
 
     Returns (crash_or_none, agent_result, timings).
     crash is None if no PoC was emitted or the claimed path was empty.
+
+    When ``memory_enabled``:
+      - ``/work/MEMORY.md`` is seeded (empty) before the agent starts;
+      - the find prompt gains MEMORY_SECTION (+ PRIOR_EXPLORATION_SECTION if
+        ``prior_exploration`` is provided);
+      - the agent's final MEMORY.md is written to ``memory_out_path`` (if
+        given) right before the container is torn down.
 
     Assumes the image is already built (caller owns docker_ops.build).
     """
@@ -49,6 +60,9 @@ async def run_find(
         network=target.agent_network, devices=target.devices,
         prebuilt=target.agent_prebuilt,
     ) as container:
+        if memory_enabled:
+            docker_ops.write_file(container, MEMORY_PATH, seed_memory_content())
+
         prompt = build_find_prompt(
             github_url=target.github_url,
             commit=target.commit,
@@ -61,6 +75,8 @@ async def run_find(
             reattack_harness=target.reattack_harness,
             attack_surface=target.attack_surface,
             detector=target.detector,
+            memory_enabled=memory_enabled,
+            prior_exploration=prior_exploration,
         )
         t0 = time.time()
         result = await run_agent(
@@ -75,6 +91,15 @@ async def run_find(
             tools=["Read", "Write", "Bash"],
         )
         timings["find"] = time.time() - t0
+
+        # Collect the agent's exploration memory before teardown.
+        memory_text = ""
+        if memory_enabled:
+            memory_text = collect_run_memory(container, MEMORY_PATH)
+            if memory_out_path and memory_text:
+                with open(memory_out_path, "w", encoding="utf-8") as f:
+                    f.write(memory_text)
+            timings["memory"] = len(memory_text)
 
         # Parse tags — scan backwards, don't trust the last message
         text = result.find_tagged_message("poc_path")
