@@ -244,6 +244,7 @@ async def _run_once(
     system_prompt: str | None = None,
     memory_enabled: bool = False,
     prior_exploration: str | None = None,
+    prior_memory: str | None = None,
     exploration_memory_path: Path | None = None,
 ) -> RunResult:
     """One find(+grade) attempt. Assumes image is already built.
@@ -284,6 +285,7 @@ async def _run_once(
             system_prompt=system_prompt,
             memory_enabled=memory_enabled,
             prior_exploration=prior_exploration,
+            prior_memory=prior_memory,
             memory_out_path=str(out_dir / "MEMORY.md") if memory_enabled else None,
         )
     except Exception as e:
@@ -813,15 +815,22 @@ async def _run_all(
     def _task(i: int):
         if i in checkpoints:
             return _checkpointed(i)
-        # Render prior exploration from whatever runs have already appended.
+        # Render prior exploration from whatever runs have already appended:
+        #   prior        — one-line index injected into the prompt
+        #   prior_memory — full write-up history seeded into the container at
+        #                  /work/PRIOR_MEMORY.md (read-only, agent can grep it)
         prior = ""
+        prior_memory = ""
         if args.memory and exploration_memory_path.exists():
-            from .memory import read_entries, render_prior_exploration
-            prior = render_prior_exploration(read_entries(exploration_memory_path))
+            from .memory import read_entries, render_prior_exploration, entries_to_markdown
+            entries = read_entries(exploration_memory_path)
+            prior = render_prior_exploration(entries)
+            prior_memory = entries_to_markdown(entries)
         return _run_once(i, target, args.model, args.find_only, args.max_turns, agent_env,
                          out_dirs[i], _assigned_focus(i, focus_areas), found_bugs_path,
                          stream_ctx, accept_dos=args.accept_dos, system_prompt=system_prompt,
                          memory_enabled=args.memory, prior_exploration=prior,
+                         prior_memory=prior_memory,
                          exploration_memory_path=exploration_memory_path)
 
     if args.parallel:

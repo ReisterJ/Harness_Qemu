@@ -136,6 +136,7 @@
    [run i] run_find()
         ├─ sandbox.agent_container() 起容器
         ├─ seed_memory_content() 写空 /work/MEMORY.md              find.py L62
+        ├─ entries_to_markdown(ledger) → 写 /work/PRIOR_MEMORY.md   find.py（只读历史，可 grep）
         ├─ build_find_prompt(memory_enabled, prior_exploration)
         │     └─ 模板拼 MEMORY_SECTION + PRIOR_EXPLORATION_SECTION
         ├─ run_agent()（agent 执行 max_turns 步）
@@ -380,6 +381,30 @@ _FIELD_RE = re.compile(r"^\s*-\s*(?P<key>[\w/]+)\s*[:：]\s*(?P<val>.*)$")
 建议：优先探索无索引的函数；SUSPICIOUS 的值得先续；EXPLORED 若你发现新角度可重查。
 ```
 
+### 11.3 可查询历史文件 /work/PRIOR_MEMORY.md（2026-09-03 新增）
+
+**动机**：注入的索引是每函数一行（15 行上限），agent 若想细看前人某函数的完整分析
+（作用/输入/安全关注/已验证全文），提示词里拿不到。改进：把前序完整分析落成容器内
+**只读文件**，提示词只给索引 + 指引，细节由 agent `grep` 查询。
+
+- 路径：`/work/PRIOR_MEMORY.md`（常量 `memory.PRIOR_MEMORY_PATH`）；每 run 启动时由
+  `entries_to_markdown(read_entries(ledger))` 重建并写入容器（只读，60KB 上限）。
+- 内容：ledger 条目**全字段**渲染回 markdown（与索引同策略：按函数去重取新），带
+  `run=`/`turn=` 溯源；agent 可 `grep -A 10 "<func>" /work/PRIOR_MEMORY.md` 拿全文。
+- 提示词契约：MEMORY_SECTION 与 PRIOR_EXPLORATION_SECTION 均加指引
+  （"FULL write-ups live at /work/PRIOR_MEMORY.md — grep it for details"）。
+- 真实示例：Kafka exp-B ledger 14 条 → 去重 11 个条目 → 5385 字符完整历史
+  （含 CONFIRMED 的 DataLogInputStream 完整论证）。
+
+```markdown
+### [EXPLORED] ByteBufferAccessor.java:readArray | run=1 turn=6
+- 作用: Readable impl; reads `size` bytes into a new byte[] from the underlying ByteBuffer.
+- 输入: `size` from caller (generated Message code reads it from input fields).
+- 安全关注: negative size → NegativeArraySizeException; size>remaining → RuntimeException (checked).
+- 已验证: read source; generated callers guard ...
+- 可疑点: 无 (negative size reachable only via non-guarding caller; none found in production).
+```
+
 ---
 
 ## 12. 管线集成点（代码地图）
@@ -472,6 +497,7 @@ _FIELD_RE = re.compile(r"^\s*-\s*(?P<key>[\w/]+)\s*[:：]\s*(?P<val>.*)$")
 2. **单 run 内写侧纪律不稳**：v3 后明显改善，但执行型任务（构造 PoC/跑 harness）密集的 run 仍可能少写。
 3. **解析器是启发式**：只认"标题+字段"结构；自由文本、多函数合并、非标准字段会被跳过（可接受——它们不是"可去重/可接续"的单元）。
 4. **渲染截断**：ledger 大时 prior 只展示 15 行（SUSPICIOUS 优先），信息有损。
+   缓解：完整分析可经 `/work/PRIOR_MEMORY.md`（60KB 上限）由 agent 自行 grep。
 5. **函数粒度歧义**：agent 有时一个条目覆盖多函数（`DefaultRecordBatch.java:iterator / count`），去重按"冒号后首个 token"取，可能把相关函数拆开。
 6. **观测器对 bash ls/find 探索统计不全**（Java 靶标 agent 常这样探索结构）——覆盖率用独立脚本补足。
 7. **样本量**：各轮 3 runs/组，单 run 方差大；结论方向性可信，数值需更大样本确认。

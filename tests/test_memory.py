@@ -6,6 +6,7 @@ from harness.memory import (
     append_entries,
     read_entries,
     render_prior_exploration,
+    entries_to_markdown,
     EMPTY_MEMORY,
 )
 
@@ -106,6 +107,35 @@ def test_render_prior_exploration_groups_and_dedups():
 def test_render_prior_exploration_empty():
     assert render_prior_exploration([]) == ""
     assert render_prior_exploration([{"status": "UNKNOWN", "func": "a.c:f"}]) == ""
+
+
+def test_entries_to_markdown_full_writeups_dedup_newest():
+    entries = [
+        {"status": "EXPLORED", "func": "a.c:foo", "run": 0, "run_turn": 5,
+         "fields": {"作用": "older role", "可疑点": "older suspicion"}},
+        {"status": "SUSPICIOUS", "func": "a.c:foo", "run": 1, "run_turn": 9,
+         "fields": {"作用": "newer role", "输入": "buf", "安全关注": "bounds",
+                    "已验证": "ran 3x", "可疑点": "newer suspicion"}},
+        {"status": "CONFIRMED", "func": "b.c:bar", "run": 1, "run_turn": 12,
+         "fields": {"可疑点": "confirmed bug"}},
+    ]
+    md = entries_to_markdown(entries)
+    # newest wins for a.c:foo
+    assert "newer role" in md and "older role" not in md
+    assert "newer suspicion" in md and "older suspicion" not in md
+    # every field of the kept entry is present (queryable history)
+    assert "输入: buf" in md and "安全关注: bounds" in md and "已验证: ran 3x" in md
+    # headers carry status + provenance
+    assert "### [SUSPICIOUS] a.c:foo | run=1 turn=9" in md
+    assert "### [CONFIRMED] b.c:bar | run=1 turn=12" in md
+    # empty -> empty
+    assert entries_to_markdown([]) == ""
+
+
+def test_entries_to_markdown_cap():
+    long = {"status": "EXPLORED", "func": "a.c:foo", "fields": {"作用": "x" * 500}}
+    md = entries_to_markdown([long], cap_chars=100)
+    assert "truncated" in md and len(md) <= 150
 
 
 def test_seed_memory_has_header():

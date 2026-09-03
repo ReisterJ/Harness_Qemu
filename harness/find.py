@@ -12,7 +12,12 @@ from . import docker_ops, sandbox
 from .agent import run_agent, parse_xml_tag, AgentResult
 from .artifacts import CrashArtifact
 from .config import TargetConfig
-from .memory import seed_memory_content, collect_run_memory, MEMORY_PATH
+from .memory import (
+    seed_memory_content,
+    collect_run_memory,
+    MEMORY_PATH,
+    PRIOR_MEMORY_PATH,
+)
 from .prompts.find_prompt import build_find_prompt
 
 
@@ -35,6 +40,7 @@ async def run_find(
     max_resume_attempts: int = 20,
     memory_enabled: bool = False,
     prior_exploration: str | None = None,
+    prior_memory: str | None = None,
     memory_out_path: str | None = None,
 ) -> tuple[CrashArtifact | None, AgentResult, dict[str, float]]:
     """Run one find attempt against a target.
@@ -62,6 +68,13 @@ async def run_find(
     ) as container:
         if memory_enabled:
             docker_ops.write_file(container, MEMORY_PATH, seed_memory_content())
+            # Queryable prior-exploration history (read-only): rebuilt from the
+            # batch ledger so later agents can grep full write-ups, not just
+            # the one-line index injected into the prompt.
+            if prior_memory:
+                docker_ops.write_file(
+                    container, PRIOR_MEMORY_PATH, prior_memory.encode("utf-8")
+                )
 
         prompt = build_find_prompt(
             github_url=target.github_url,

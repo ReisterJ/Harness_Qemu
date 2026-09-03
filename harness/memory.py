@@ -28,6 +28,10 @@ from pathlib import Path
 # Memory file inside the agent container (layer 1).
 MEMORY_PATH = "/work/MEMORY.md"
 
+# Read-only prior-exploration history inside the agent container: a rebuild of
+# every finished run's entries so later agents can grep full write-ups.
+PRIOR_MEMORY_PATH = "/work/PRIOR_MEMORY.md"
+
 # Batch-level memory ledger (layer 2), relative to a results root.
 BATCH_MEMORY_NAME = "exploration_memory.jsonl"
 
@@ -196,6 +200,56 @@ def render_prior_exploration(entries: list[dict], max_lines: int = 15) -> str:
         + "\n\n建议：优先探索无索引的函数；SUSPICIOUS 的值得先续；"
         "EXPLORED 若你发现新角度可重查。"
     )
+
+
+def entries_to_markdown(entries: list[dict], cap_chars: int = 60_000) -> str:
+    """Rebuild a queryable prior-exploration history file from ledger entries.
+
+    The injected index (render_prior_exploration) is one line per function.
+    This renders the FULL write-up of every entry (all fields: 作用/输入/
+    安全关注/已验证/可疑点) so an agent can `grep` a function's details from
+    the read-only history file instead of only seeing the one-line index.
+
+    Dedups by function keeping the newest — same policy as the index, so a
+    grep hit reflects the latest state (EXPLORED -> CONFIRMED evolution).
+    Empty history -> empty string.
+    """
+    if not entries:
+        return ""
+
+    def newest_by_func(items: list[dict]) -> list[dict]:
+        by_func: dict[str, dict] = {}
+        for e in items:  # later entries overwrite earlier ones
+            by_func[e.get("func") or "?"] = e
+        return list(by_func.values())
+
+    blocks: list[str] = []
+    for e in newest_by_func(entries):
+        status = e.get("status") or "?"
+        func = e.get("func") or "?"
+        run = e.get("run")
+        turn = e.get("run_turn")
+        hdr = f"### [{status}] {func}"
+        meta: list[str] = []
+        if run is not None:
+            meta.append(f"run={run}")
+        if turn is not None:
+            meta.append(f"turn={turn}")
+        if meta:
+            hdr += " | " + " ".join(meta)
+        lines = [hdr]
+        fields = e.get("fields") or {}
+        for key in ("作用", "role", "输入", "inputs", "安全关注", "safety",
+                    "已验证", "verified", "可疑点", "notes", "备注", "conclusion"):
+            val = fields.get(key)
+            if val:
+                lines.append(f"- {key}: {val}")
+        blocks.append("\n".join(lines))
+
+    text = "\n\n".join(blocks) + "\n"
+    if len(text) > cap_chars:
+        text = text[:cap_chars] + "\n... (prior history truncated)\n"
+    return text
 
 
 def collect_run_memory(container: str, memory_path: str = MEMORY_PATH) -> str:

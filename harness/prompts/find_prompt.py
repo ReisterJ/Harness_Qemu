@@ -861,6 +861,12 @@ revisiting) | CONFIRMED (a crash/bug is confirmed here). Keep each entry
 short; append, never edit history. `FILE.c` is the basename, `function` the
 function name. After you write an entry, you may close that function and move
 on.
+
+> **Prior runs' FULL write-ups live at `/work/PRIOR_MEMORY.md` (read-only).**
+> The prior index in this prompt is one line per function; when you need a
+> function's complete analysis (作用/输入/安全关注/已验证) to decide whether to
+> re-open it, `grep -A 10 "<function_name>" /work/PRIOR_MEMORY.md` instead of
+> re-reading source.
 """
 
 PRIOR_EXPLORATION_SECTION = """
@@ -878,6 +884,11 @@ entries, then functions with NO entry.**
 > entry is a good continuation target. An EXPLORED entry means a prior run
 > read the function without finding a bug — default to functions with no
 > summary first.
+
+> **Full write-ups for the entries above are in `/work/PRIOR_MEMORY.md`
+> (read-only, seeded before this run).** The index here is one line per
+> function; `grep -A 10 "<function_name>" /work/PRIOR_MEMORY.md` when you
+> need the complete 作用/输入/安全关注/已验证 analysis of a prior function.
 """
 
 ACCEPT_DOS_SECTION = """
