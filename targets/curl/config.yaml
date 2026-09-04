@@ -1,0 +1,46 @@
+# Copyright 2026 Anthropic PBC
+# SPDX-License-Identifier: Apache-2.0
+image_tag: vuln-pipeline-curl:latest
+agent_network: host
+# curl, pinned to the 8.22.0 release tag.
+github_url: https://github.com/curl/curl
+commit: "curl-8_22_0"
+# The find agent compiles nothing extra: run_curl.sh serves a crafted raw HTTP
+# response to the ASAN-instrumented curl, so any input file is parsed by the
+# response-handling paths (status line, headers, content-encoding, cookies).
+binary_path: /work/run_curl.sh
+source_root: /work/curl
+build_command: >-
+  cmake -S /work/curl -B /work/curl/build -DBUILD_SHARED_LIBS=OFF
+  -DBUILD_CURL_EXE=ON -DBUILD_TESTING=OFF -DCURL_USE_OPENSSL=OFF
+  -DCURL_USE_LIBPSL=OFF -DCURL_USE_BROTLI=OFF -DCURL_USE_ZSTD=OFF
+  -DCURL_ZLIB=ON -DCMAKE_C_FLAGS="-fsanitize=address -g -O1
+  -fno-omit-frame-pointer" -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address"
+  && cmake --build /work/curl/build -j2
+test_command: >-
+  printf 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n' > /tmp/ok.http &&
+  /work/run_curl.sh /tmp/ok.http
+
+focus_areas:
+  - "HTTP response parsing (lib/http.c) — status line / header / chunked transfer-encoding parsing, Curl_http_readwrite_headers"
+  - "Content-Encoding decoding (lib/content_encoding.c) — gzip/deflate decompression of response bodies, size/alloc paths"
+  - "Cookie parsing (lib/cookie.c) — Set-Cookie header handling, expiry/domain/path fields"
+  - "URL parsing (lib/urlapi.c) + transfer state machine (lib/transfer.c) — URL components, redirect handling, connection reuse"
+
+# No known bugs filed (live upstream target).
+known_bugs: []
+
+attack_surface: |
+  curl 8.22.0 is a C HTTP/URL client library + CLI. The harness entry is
+  /work/run_curl.sh <file>: the file is served verbatim as the raw HTTP
+  response by a local server, and an ASAN-instrumented curl requests it over
+  http://127.0.0.1. Any crafted response reaches the full response-parsing
+  stack: status line + header parsing (http.c), chunked transfer decoding,
+  Content-Encoding decompression (content_encoding.c: gzip/deflate via zlib),
+  cookie handling (cookie.c), and connection/transfer logic (transfer.c).
+  Untrusted-response-driven memory bugs to look for: buffer over/underflow in
+  header/status parsing, integer overflow in Content-Length / chunk-size
+  arithmetic, decompression size/alloc mismatches, unbounded allocs from
+  attacker-controlled lengths. SSL/TLS is disabled in this build (plain HTTP
+  only) — focus on the parsing/encoding layers above. Agents may serve any
+  raw bytes, including compressed bodies they craft with python3/gzip.
