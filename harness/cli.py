@@ -20,7 +20,8 @@
   vuln-pipeline dedup <results_dir>                            # group crashes by signature
   vuln-pipeline report <results_dir> --model <m> [--novelty]   # exploitability analysis per unique crash
 
-Output: ./results/<target>/<timestamp>/{result.json,find_transcript.jsonl,
+Output: ./results/<target>/<timestamp>/{result.json,static_analysis.json,
+static_transcript.jsonl,dynamic_validation.json,find_transcript.jsonl,
 grade_transcript.jsonl,poc.bin}; reports → .../reports/bug_NN/
 
 Auth: resolved by ``harness.auth`` (Bedrock / Vertex / ANTHROPIC_API_KEY /
@@ -147,8 +148,8 @@ def _on_signal(signum, frame) -> None:
     SIGTERM leaves containers orphaned (4GB memory reservation each) AND the
     SDK's Node subprocess orphaned to init, still executing tool calls against
     whatever container holds the name. Kill children first, then containers.
-    Container names are target-scoped (find_<target>_N, grader_<target>_N,
-    recon_<target>, report_<target>_N) so parallel runs on different targets
+    Container names are target-scoped (static_find_<target>_N, find_<target>_N,
+    grader_<target>_N, recon_<target>, report_<target>_N) so parallel runs on different targets
     don't collide. The filter matches only this process's target.
     """
     print(f"\n[cleanup] signal {signum} received, terminating subprocesses + removing containers", file=sys.stderr)
@@ -157,6 +158,7 @@ def _on_signal(signum, frame) -> None:
     r = subprocess.run(
         ["docker", "ps", "-q",
          "--filter", f"name=find_{t}_",
+         "--filter", f"name=static_find_{t}_",
          "--filter", f"name=grader_{t}_",
          "--filter", f"name=recon_{t}",
          "--filter", f"name=report_{t}_"],
@@ -270,16 +272,22 @@ async def _run_once(
     focus_note = f" (focus: {focus_area})" if focus_area else ""
     print(color(f"[find:{run_idx}] Starting find agent (model={model}, max_turns={max_turns}){focus_note} ...", "find"))
     try:
-        crash, find_result, find_timings = await run_find(
+        find_outcome = await run_find(
             target, model=model, max_turns=max_turns, agent_env=agent_env,
             container_name=find_container, focus_area=focus_area,
             known_bugs=known_bugs,
             found_bugs_path=str(found_bugs_path) if found_bugs_path else None,
             transcript_path=str(out_dir / "find_transcript.jsonl"),
+            static_transcript_path=str(out_dir / "static_transcript.jsonl"),
+            static_result_path=str(out_dir / "static_analysis.json"),
+            dynamic_result_path=str(out_dir / "dynamic_validation.json"),
             progress_prefix=f"[find:{run_idx}]",
             accept_dos=accept_dos,
             system_prompt=system_prompt,
         )
+        # FindPhaseResult preserves the historical three-value iteration API;
+        # tuple-returning test doubles and older integrations remain valid.
+        crash, find_result, find_timings = find_outcome
     except Exception as e:
         traceback.print_exc()
         return _done(RunResult(
@@ -291,7 +299,13 @@ async def _run_once(
     find_error: str | None = None
     find_transcript = find_result.transcript()
     resumes = f" ({find_result.resume_count} resume(s))" if find_result.resume_count else ""
-    print(f"[find:{run_idx}] done in {timings.get('find', 0):.1f}s, {len(find_transcript)} messages{resumes}")
+    static_seconds = timings.get("static_analysis", 0.0)
+    dynamic_seconds = timings.get("dynamic_validation", 0.0)
+    print(
+        f"[find:{run_idx}] done in {static_seconds + dynamic_seconds:.1f}s "
+        f"(static={static_seconds:.1f}s, dynamic={dynamic_seconds:.1f}s), "
+        f"{len(find_transcript)} messages{resumes}"
+    )
 
     # Agent died mid-run (ProcessError, retries exhausted). Transcript preserved.
     if find_result.error:

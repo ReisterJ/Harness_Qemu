@@ -204,7 +204,7 @@ class AgentResult:
 DEFAULT_TOOLS = ["Read", "Write", "Bash"]
 
 # Container-name prefixes → per-phase opencode agent names (vuln-<phase>).
-_AGENT_PREFIXES = ("find", "grader", "recon", "report", "judge", "compare", "patch")
+_AGENT_PREFIXES = ("find", "static", "grader", "recon", "report", "judge", "compare", "patch")
 
 # opencode permission keys we control; anything not listed stays denied.
 _TOOL_PERMISSIONS = (

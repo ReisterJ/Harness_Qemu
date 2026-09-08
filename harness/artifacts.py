@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import base64
 import json
+import math
+import re
 from dataclasses import dataclass, field, asdict
 from typing import Any
 
@@ -38,6 +40,102 @@ class CrashArtifact:
             crash_output=d["crash_output"],
             exit_code=d["exit_code"],
             dup_check=d.get("dup_check"),
+        )
+
+
+@dataclass
+class StaticFinding:
+    """A source-level hypothesis produced by the static find phase.
+
+    This is deliberately not a ``CrashArtifact``.  A static finding is a
+    hypothesis plus evidence that an external input may reach it; it becomes
+    eligible for grading only after the dynamic phase produces a PoC.
+    """
+
+    candidate_id: str
+    bug_class: str
+    location: str
+    static_call_chain: str
+    entry_points: str
+    attacker_controlled_data: str
+    reachability_evidence: str
+    required_conditions: str
+    root_cause: str
+    verification_plan: str
+    confidence: float
+    related_candidates: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> StaticFinding:
+        """Deserialize an agent-produced finding with conservative defaults.
+
+        Static output is model-authored and may omit optional prose fields.
+        Keeping the parser tolerant lets the dynamic phase decide whether a
+        weak candidate is actually reachable instead of failing the whole run.
+        """
+        raw_confidence = d.get("confidence", 0.0)
+        try:
+            confidence = float(raw_confidence)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        if not math.isfinite(confidence):
+            confidence = 0.0
+        confidence = max(0.0, min(1.0, confidence))
+        related = d.get("related_candidates", [])
+        if isinstance(related, str):
+            related = [related]
+        if not isinstance(related, list):
+            related = []
+        candidate_id = str(d.get("candidate_id") or "candidate_unnamed").strip()
+        candidate_id = re.sub(r"[^A-Za-z0-9_.-]", "_", candidate_id)[:80]
+        return cls(
+            candidate_id=candidate_id or "candidate_unnamed",
+            bug_class=str(d.get("bug_class") or "unknown"),
+            location=str(d.get("location") or "unknown"),
+            static_call_chain=str(d.get("static_call_chain") or ""),
+            entry_points=str(d.get("entry_points") or ""),
+            attacker_controlled_data=str(d.get("attacker_controlled_data") or ""),
+            reachability_evidence=str(d.get("reachability_evidence") or ""),
+            required_conditions=str(d.get("required_conditions") or ""),
+            root_cause=str(d.get("root_cause") or ""),
+            verification_plan=str(d.get("verification_plan") or ""),
+            confidence=confidence,
+            related_candidates=[str(x) for x in related],
+        )
+
+
+@dataclass
+class DynamicValidationResult:
+    """Result of trying to turn one static finding into a PoC."""
+
+    candidate_id: str
+    status: str  # validated, not_reached, reached_no_crash, wrong_path,
+                 # environment_blocked, invalid_submission, agent_failed
+    reached_functions: list[str] = field(default_factory=list)
+    reachability_evidence: str = ""
+    reason: str = ""
+    crash: CrashArtifact | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        d = asdict(self)
+        d["crash"] = self.crash.to_dict() if self.crash else None
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> DynamicValidationResult:
+        reached = d.get("reached_functions", [])
+        if isinstance(reached, str):
+            reached = [reached]
+        return cls(
+            candidate_id=str(d.get("candidate_id") or ""),
+            status=str(d.get("status") or "unknown"),
+            reached_functions=[str(x) for x in reached] if isinstance(reached, list) else [],
+            reachability_evidence=str(d.get("reachability_evidence") or ""),
+            reason=str(d.get("reason") or ""),
+            crash=CrashArtifact.from_dict(d["crash"]) if d.get("crash") else None,
         )
 
 

@@ -1,21 +1,44 @@
 # Copyright 2026 Anthropic PBC
 # SPDX-License-Identifier: Apache-2.0
-"""Find loop: start container, run find-agent, parse output, extract PoC.
+"""Split find loop: static hypothesis generation, then dynamic validation.
 
-Budget: max_turns=2000 (one run is hours, not minutes).
+The public three-value iteration contract is retained for existing callers:
+``crash, agent_result, timings = await run_find(...)``.  New callers can keep
+the returned ``FindPhaseResult`` object to inspect both phase results.
 """
 from __future__ import annotations
 
+import json
 import time
+from dataclasses import dataclass, field
+from pathlib import Path
 
-from . import docker_ops, sandbox
-from .agent import run_agent, parse_xml_tag, AgentResult
-from .artifacts import CrashArtifact
+from .agent import AgentResult
+from .artifacts import CrashArtifact, DynamicValidationResult, StaticFinding
 from .config import TargetConfig
-from .prompts.find_prompt import build_find_prompt
+from .dynamic_validation import run_dynamic_validation
+from .static_analysis import run_static_analysis
 
 
 DEFAULT_FIND_MAX_TURNS = 2000
+
+
+@dataclass
+class FindPhaseResult:
+    """Complete split-find result with backwards-compatible tuple unpacking."""
+
+    crash: CrashArtifact | None
+    agent_result: AgentResult
+    timings: dict[str, float]
+    static_findings: list[StaticFinding] = field(default_factory=list)
+    dynamic_result: DynamicValidationResult | None = None
+    static_parse_error: str | None = None
+
+    def __iter__(self):
+        # Preserve the old run_find() API used by patch re-attack and tests.
+        yield self.crash
+        yield self.agent_result
+        yield self.timings
 
 
 async def run_find(
@@ -32,83 +55,145 @@ async def run_find(
     accept_dos: bool = False,
     system_prompt: str | None = None,
     max_resume_attempts: int = 20,
-) -> tuple[CrashArtifact | None, AgentResult, dict[str, float]]:
-    """Run one find attempt against a target.
+    static_transcript_path: str | None = None,
+    static_result_path: str | None = None,
+    dynamic_result_path: str | None = None,
+) -> FindPhaseResult:
+    """Run static analysis followed by dynamic validation.
 
-    Returns (crash_or_none, agent_result, timings).
-    crash is None if no PoC was emitted or the claimed path was empty.
-
-    Assumes the image is already built (caller owns docker_ops.build).
+    Only the highest-ranked static candidate is selected in this first
+    implementation. The static artifact still records all candidates, so a
+    future policy can validate several candidates without changing the phase
+    contracts or the grade boundary.
     """
     timings: dict[str, float] = {}
+    all_known_bugs = known_bugs if known_bugs is not None else target.known_bugs
 
-    mounts = [(str(found_bugs_path), "/tmp/found_bugs.jsonl")] if found_bugs_path else None
-    with sandbox.agent_container(
-        target.image_tag, container_name, agent_env,
-        memory=target.memory_limit, shm_size=target.shm_size, mounts=mounts,
-        network=target.agent_network, devices=target.devices,
-        prebuilt=target.agent_prebuilt,
-    ) as container:
-        prompt = build_find_prompt(
-            github_url=target.github_url,
-            commit=target.commit,
-            source_root=target.source_root,
-            binary_path=target.binary_path,
-            focus_area=focus_area,
-            known_bugs=known_bugs if known_bugs is not None else target.known_bugs,
-            found_bugs_path="/tmp/found_bugs.jsonl" if found_bugs_path else None,
-            accept_dos=accept_dos,
-            reattack_harness=target.reattack_harness,
-            attack_surface=target.attack_surface,
-            detector=target.detector,
+    static_started = time.time()
+    findings, static_agent, static_timings, parse_error = await run_static_analysis(
+        target=target,
+        model=model,
+        max_turns=max_turns,
+        agent_env=agent_env,
+        container_name=f"static_{container_name}",
+        focus_area=focus_area,
+        known_bugs=all_known_bugs,
+        transcript_path=static_transcript_path,
+        progress_prefix=(f"{progress_prefix}:static" if progress_prefix else None),
+        system_prompt=system_prompt,
+        max_resume_attempts=max_resume_attempts,
+    )
+    timings.update(static_timings)
+    timings.setdefault("static_analysis", time.time() - static_started)
+    # The prompt asks for ranked output; confidence provides a deterministic
+    # fallback when the model's textual order and numeric ranking disagree.
+    findings.sort(key=lambda finding: finding.confidence, reverse=True)
+
+    # A clean empty array is a valid static conclusion. A malformed response
+    # is an agent failure, because silently treating it as "no bug" would
+    # conflate protocol failure with a considered negative result.
+    if parse_error and not findings and not static_agent.error:
+        static_agent.error = f"static analysis output: {parse_error}"
+
+    if static_result_path:
+        _write_json(
+            static_result_path,
+            {
+                "phase": "static_analysis",
+                "status": (
+                    "agent_failed" if static_agent.error else
+                    "parse_error" if parse_error and not findings else
+                    "candidates_found" if findings else "no_candidates"
+                ),
+                "candidate_count": len(findings),
+                "findings": [finding.to_dict() for finding in findings],
+                "parse_error": parse_error,
+                "agent_error": static_agent.error,
+                "timings": static_timings,
+            },
         )
-        t0 = time.time()
-        result = await run_agent(
-            prompt=prompt,
-            max_turns=max_turns,
-            model=model,
-            container=container,
-            transcript_path=transcript_path,
-            progress_prefix=progress_prefix,
-            system_prompt=system_prompt,
-            max_resume_attempts=max_resume_attempts,
-            tools=["Read", "Write", "Bash"],
+
+    if not findings:
+        timings["find"] = sum(timings.values())
+        if transcript_path:
+            _write_transcript(transcript_path, static_agent.transcript())
+        return FindPhaseResult(
+            crash=None,
+            agent_result=static_agent,
+            timings=timings,
+            static_findings=[],
+            static_parse_error=parse_error,
         )
-        timings["find"] = time.time() - t0
 
-        # Parse tags — scan backwards, don't trust the last message
-        text = result.find_tagged_message("poc_path")
-        poc_path = parse_xml_tag(text, "poc_path")
-        reproduction_command = parse_xml_tag(text, "reproduction_command")
-        crash_type = parse_xml_tag(text, "crash_type")
-        crash_output = parse_xml_tag(text, "crash_output") or ""
-        exit_code_str = parse_xml_tag(text, "exit_code")
-        dup_check = parse_xml_tag(text, "dup_check")
+    # The static prompt ranks candidates from strongest to weakest. The MVP
+    # validates one per run to keep the existing run budget and output shape
+    # stable; all candidates remain available in static_analysis.json.
+    candidate = findings[0]
+    dynamic_result, dynamic_agent, dynamic_timings = await run_dynamic_validation(
+        target=target,
+        candidate=candidate,
+        model=model,
+        max_turns=max_turns,
+        agent_env=agent_env,
+        container_name=container_name,
+        focus_area=focus_area,
+        known_bugs=all_known_bugs,
+        found_bugs_path=found_bugs_path,
+        transcript_path=transcript_path,
+        progress_prefix=(f"{progress_prefix}:dynamic" if progress_prefix else None),
+        accept_dos=accept_dos,
+        system_prompt=system_prompt,
+        max_resume_attempts=max_resume_attempts,
+    )
+    timings.update(dynamic_timings)
+    timings["find"] = timings.get("static_analysis", 0.0) + timings.get(
+        "dynamic_validation", 0.0
+    )
 
-        if not poc_path or not reproduction_command:
-            return None, result, timings
-
-        # Empty bytes → agent narrated a path it never wrote.
-        poc_bytes = docker_ops.read_file(container, poc_path)
-        if not poc_bytes:
-            return None, result, timings
-
-        crash = CrashArtifact(
-            poc_path=poc_path,
-            poc_bytes=poc_bytes,
-            reproduction_command=reproduction_command,
-            crash_type=crash_type or "unknown",
-            crash_output=crash_output[:10_000],  # ASAN traces are huge; top is what matters
-            exit_code=_parse_exit_code(exit_code_str),
-            dup_check=dup_check,
+    if dynamic_result_path:
+        _write_json(
+            dynamic_result_path,
+            {
+                "phase": "dynamic_validation",
+                "candidate": candidate.to_dict(),
+                "result": dynamic_result.to_dict(),
+                "timings": dynamic_timings,
+            },
         )
-        return crash, result, timings
+
+    combined = _combine_agent_results(static_agent, dynamic_agent)
+    if transcript_path:
+        _write_transcript(transcript_path, combined.transcript())
+    return FindPhaseResult(
+        crash=dynamic_result.crash,
+        agent_result=combined,
+        timings=timings,
+        static_findings=findings,
+        dynamic_result=dynamic_result,
+        static_parse_error=parse_error,
+    )
 
 
-def _parse_exit_code(s: str | None) -> int:
-    if s is None:
-        return -1
-    s = s.strip()
-    if s.lstrip("-").isdigit():
-        return int(s)
-    return -1
+def _combine_agent_results(static: AgentResult, dynamic: AgentResult) -> AgentResult:
+    """Expose both phase transcripts through the legacy find result."""
+    return AgentResult(
+        messages=[*static.messages, *dynamic.messages],
+        result_message=dynamic.result_message or static.result_message,
+        session_id=dynamic.session_id or static.session_id,
+        error=dynamic.error or static.error,
+        resume_count=static.resume_count + dynamic.resume_count,
+    )
+
+
+def _write_json(path: str, value: dict) -> None:
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
+
+
+def _write_transcript(path: str, events: list[dict]) -> None:
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in events)
+    )

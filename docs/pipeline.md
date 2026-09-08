@@ -52,20 +52,23 @@ don't all converge on the same bug. `--auto-focus` runs this as a part of
 the full pipeline. You can skip recon if you've hand-written `focus_areas:`
 in the target's `config.yaml`.
 
-**Find.** The core part of the loop. Each run gets one agent in its own 
-network-isolated container. The agent reads the source, crafts malformed inputs, 
-and runs the ASAN binary until an input crashes 3 out of 3 times. It outputs
-the crashing input file (not a written report). Parallel find agents share a 
-`found_bugs.jsonl` log and must justify why their addition is not a duplicate 
-of something already listed before adding to it.
+**Find.** The core part of the loop. Each run first starts a read-only
+static-analysis agent in its own network-isolated container. It reads the
+source and emits ranked `StaticFinding` candidates with an external entry
+point, call chain, reachability evidence, and a dynamic verification plan. A
+separate dynamic-validation agent consumes the highest-ranked candidate,
+crafts and runs the PoC, and emits the existing `CrashArtifact` only when it
+has a non-empty reproducer. Parallel find runs share a `found_bugs.jsonl` log,
+but static candidates never enter that log; only a PoC with `<dup_check>` does.
 
-**Grade.** A second agent in a fresh container re-runs the PoC and checks that the 
-crash is real (i.e., it reproduces, it's in project code, and it isn't just memory 
-exhaustion). The only thing that crosses from the find container to the grader is 
-the PoC bytes, so the grader isn't influenced by the find agent's reasoning. 
-Flaky-but-real crashes (races, heap-layout-dependent) can pass this step, though
-they will receive a lower score. Each run's verdict is written to `run_NNN/result.json` 
-as soon as the grader agent finishes.
+**Grade.** A separate agent in a fresh container re-runs the PoC and checks
+that the crash is real (i.e., it reproduces, it's in project code, and it
+isn't just memory exhaustion). The only thing that crosses from the dynamic
+find container to the grader is the PoC bytes, so the grader isn't influenced
+by the static reasoning or dynamic agent's explanation. Flaky-but-real crashes
+(races, heap-layout-dependent) can pass this step, though they will receive a
+lower score. Each run's verdict is written to `run_NNN/result.json` as soon as
+the grader agent finishes.
 
 **Judge.** When a finding passes the grader, a short no-tools agent compares 
 the crash against the bugs already in `reports/manifest.jsonl` and decides 

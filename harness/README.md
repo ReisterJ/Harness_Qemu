@@ -61,7 +61,9 @@ bin/vp-sandboxed run drlibs --auto-focus --runs 3 --parallel --stream
 # --runs 3 --parallel : 3 concurrent find agents, each in its own container
 # --stream : judge + report stream as each grade lands (first report in minutes)
 #
-# → results/drlibs/<timestamp>/run_NNN/{result.json, poc.bin, find_transcript.jsonl}
+# → results/drlibs/<timestamp>/run_NNN/{result.json, static_analysis.json,
+#    static_transcript.jsonl, dynamic_validation.json, poc.bin,
+#    find_transcript.jsonl}
 #   results/drlibs/<timestamp>/reports/bug_NN/report.json
 ```
 
@@ -128,8 +130,9 @@ bin/vp-sandboxed patch results/drlibs/<timestamp>/
 
 ## Watching a run
 
-Each find-agent is a headless `claude -p` session inside its own container.
-Tail its transcript as it works:
+Each run now has a read-only static-analysis agent followed by a dynamic
+validation agent, both inside isolated containers. The combined find transcript
+and phase-specific artifacts can be tailed as they work:
 
 ```bash
 tail -f results/drlibs/<timestamp>/run_000/find_transcript.jsonl | python3 -c \
@@ -140,6 +143,10 @@ for line in sys.stdin:
         for b in m.get("message", {}).get("content", []):
             if b.get("type") == "tool_use":
                 print(f"→ {b['name']}: {str(b.get('input',{}))[:120]}")'
+
+# Static candidates and the selected dynamic result:
+cat results/drlibs/<timestamp>/run_000/static_analysis.json
+cat results/drlibs/<timestamp>/run_000/dynamic_validation.json
 ```
 
 ## After the run

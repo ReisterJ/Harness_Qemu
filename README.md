@@ -84,6 +84,7 @@ claude
 - [**Detection & response**](docs/detection-response.md) · Hunting an attacker already in the logs; the D&R skills and pipeline
 - [**Customize**](docs/customizing.md) · Port to my stack; which files change and why
 - [**Kernel validation**](docs/kernel-validation.md) · Validate Linux-kernel static-analysis reports via QEMU/KVM + `targets/kernelval` (CVE-2025-40019 record, fixes, reproduction)
+- [**Experimental targets**](docs/experimental-target-selection.md) · Select C/Rust projects and configure Sanitizer-based end-to-end experiments
 - [**Patching**](docs/patching.md) · Generate and verify fixes for verified crashes
 - [**Other use cases**](docs/other-use-cases.md) · Binary analysis, embedded, bug chains, threat intel
 - [**Troubleshooting**](docs/troubleshooting.md) · Duplicates, rate limits, subagent model pinning
@@ -200,9 +201,11 @@ container and proposes a partition, i.e., *"here are N distinct input-parsing
 subsystems worth attacking separately"*, so that parallel find agents explore
 different areas instead of converging on the same bug. Without the `--auto-focus`
 flag, the pipeline uses the `focus_areas` list from the target's `config.yaml`.
-3. **Find**: N agents run in parallel, each in its own isolated container.
-Each agent reads the source, crafts malformed inputs, and runs the ASAN
-binary until a given input produces a crash 3 out of 3 times.
+3. **Find**: N runs execute a read-only static-analysis agent followed by a
+dynamic-validation agent in isolated containers. Static analysis emits ranked
+source-level candidates; dynamic validation turns the highest-ranked candidate
+into a PoC when reachable. Only the resulting PoC enters the unchanged grade
+stage.
 4. **Verify**: A separate grader agent reproduces each crash in a fresh
 container that the find agent hasn't touched. The only thing that crosses over
 from the find agent to the grader is the proof of concept it produced.
