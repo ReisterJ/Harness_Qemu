@@ -16,10 +16,15 @@ dev = [
 [project.scripts]
 vuln-pipeline = "harness.cli:main"
 dnr-pipeline = "dnr_harness.cli:main"
+secrun = "secrun.cli:main"
 
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["harness*", "dnr_harness*"]
+include = ["harness*", "dnr_harness*", "secrun*"]
+
+[tool.pytest.ini_options]
+# Upstream source snapshots contain unrelated executable test scripts.
+testpaths = ["tests"]

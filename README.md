@@ -92,6 +92,17 @@ claude
 
 ---
 
+## Repository to runnable image
+
+Use the independent `secrun` command to fetch a repository's latest branch commit,
+generate a Dockerfile from its documentation, build an image, and verify real
+functionality in fresh containers. It does not invoke the security pipelines.
+See the [secrun guide](docs/secrun.md) for setup, progress, cancellation, and output paths.
+
+```bash
+secrun --name flex --repo https://github.com/westes/flex.git
+```
+
 ## Ramp Up
 
 The most successful security teams we've partnered with are those 

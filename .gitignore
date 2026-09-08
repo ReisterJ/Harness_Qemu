@@ -6,6 +6,8 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 results/
+# Generated image contexts include complete upstream source snapshots.
+targets/*/image/
 build/
 dist/
 
