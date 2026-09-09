@@ -4,7 +4,7 @@ This repo has two halves:
 
 - **Interactive skills** (`.claude/skills/`) — read and write files in the
   repo (no target-code execution, except `/dnr-hunt` / `/dnr-respond`, which
-  run the bundled demo app locally — see `docs/security.md`), run in this
+  run the bundled demo app locally — see `docs/architecture/security.md`), run in this
   session:
   `/quickstart` (front door / Q&A), `/threat-model` (bootstrap, interview, or
   bootstrap-then-interview → `THREAT_MODEL.md`), `/vuln-scan` (static review →
@@ -15,7 +15,7 @@ This repo has two halves:
   review, Q&A, and post-run triage. (`/verify` is contributor tooling for
   validating harness changes on docker-less hosts, not part of the user flow.)
 - **`vuln-pipeline`** (`harness/`) — the autonomous pipeline. Docker + ASAN,
-  executes target code, needs a sandbox (see `docs/security.md`). Route here
+  executes target code, needs a sandbox (see `docs/architecture/security.md`). Route here
   when the user wants to actually find and verify crashes.
 
 Docs for each topic are in `docs/`; targets are in `targets/` (canary is the
@@ -156,7 +156,7 @@ a fix and emits a `git diff`; a separate grader container walks the
 verification ladder — T0 apply + rebuild → T1 original PoC no longer crashes
 → T2 target test suite passes → re-attack: a 50-turn find-agent attacks the
 patched binary (T3 is an opt-in advisory style judge via `--style`; see
-`docs/patching.md`). On a failing tier the evidence is fed back and the patch
+`docs/research/patching.md`). On a failing tier the evidence is fed back and the patch
 agent iterates (≤5). Output: `reports/bug_NN/{patch.diff, patch_result.json}`;
 tier results land as `t0_builds`/`t1_poc_stops`/`t2_tests_pass`/`re_attack_clean`.
 
@@ -166,7 +166,7 @@ will error early. The four shipped targets have it.
 
 **Tell the user the ladder verifies the crash is gone, not that the diff is
 safe to upstream.** Surface `patch.diff` for human review and point at
-`docs/patching.md#reviewing-generated-patches` for what to look for. Don't
+`docs/research/patching.md#reviewing-generated-patches` for what to look for. Don't
 offer to apply the diff to anything outside the pipeline containers.
 
 For a quick demo without a prior find run, point at the canary fixture:
@@ -222,7 +222,7 @@ touches the grade container — defeats reward-hacking via pre-positioned state.
 sets the runtime/proxy env and execs the pipeline; each find/grade/report
 agent then runs `claude -p` inside its own gVisor container (`--runtime=runsc
 --network=vp-internal`, egress = the configured allowlist via the proxy —
-default `api.anthropic.com:443`; see docs/agent-sandbox.md for
+default `api.anthropic.com:443`; see docs/architecture/agent-sandbox.md for
 Bedrock/Vertex). The agent's `Read`/`Write`/`Bash` are confined to that
 container.
 Agent-spawning subcommands refuse to start outside the sandbox unless
@@ -238,7 +238,7 @@ the prompt, one short call each. No MCP, no web access.
 `cyber-runbook/` User-Agent token, 1P auth only). `VULN_PIPELINE_NO_TELEMETRY=1`
 removes the pipeline marker; interactive sessions get a header-only marker
 from `.claude/settings.json` instead (override in `.claude/settings.local.json`).
-See `docs/pipeline.md#usage-marker`.
+See `docs/architecture/pipeline.md#usage-marker`.
 
 **`-e CLAUDECODE=` and `-e IS_SANDBOX=1` in `agent.py` are load-bearing.**
 The first stops the in-container CLI's nested-session check; the second lets
@@ -286,7 +286,7 @@ the submission crosses the boundary. Also takes `--max-turns`,
 `results/<target>/<ts>/run_NNN/`, even for a single run.
 `ground_truth.yaml`, `grade.py`, and `generate_logs.py` source are
 spoilers — never mount or read them on the hunt side. See
-`docs/detection-response.md`.
+`docs/detection-response/detection-response.md`.
 
 ## Tests
 

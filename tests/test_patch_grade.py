@@ -9,6 +9,7 @@ tests/test_patch_grade_e2e.py (canary only).
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -165,6 +166,22 @@ def mock_docker():
         m.run.return_value = "pgrade"
         m.commit.return_value = "patched:tmp"
         yield m
+
+
+@pytest.fixture(autouse=True)
+def fake_patch_grade_container(monkeypatch):
+    """Keep patch-grader unit tests independent of Docker image availability."""
+    @contextmanager
+    def _container(*_args, **_kwargs):
+        yield "pgrade"
+
+    monkeypatch.setattr("harness.patch_grade.sandbox.agent_container", _container)
+
+    async def _direct_to_thread(func, /, *args, **kwargs):
+        """Run mocked Docker calls inline for deterministic unit tests."""
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", _direct_to_thread)
 
 
 def test_t0_fail_short_circuits(mock_docker):

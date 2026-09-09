@@ -130,9 +130,9 @@ def require(override: bool) -> str | None:
     if not rt:
         return (
             "error: refusing to spawn agents outside the sandbox.\n"
-            "  Run via `bin/vp-sandboxed ...` (see docs/agent-sandbox.md), or pass\n"
+            "  Run via `bin/vp-sandboxed ...` (see docs/architecture/agent-sandbox.md), or pass\n"
             "  --dangerously-no-sandbox to run without gVisor isolation\n"
-            "  (auto-mode permission classifier only; development use — see docs/security.md)."
+            "  (auto-mode permission classifier only; development use — see docs/architecture/security.md)."
         )
     runtimes = subprocess.run(
         ["docker", "info", "--format", "{{range $k,$v := .Runtimes}}{{$k}} {{end}}"],

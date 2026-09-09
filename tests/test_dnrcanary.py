@@ -611,6 +611,18 @@ def _assert_generate_logs_aborts(tmp_path, payload: bytes) -> None:
     assert "Traceback" not in out.stderr
 
 
+LOOPBACK_SOCKET_AVAILABLE = True
+try:
+    with socket.socket() as _probe:
+        _probe.bind(("127.0.0.1", 0))
+except OSError:
+    LOOPBACK_SOCKET_AVAILABLE = False
+
+
+@pytest.mark.skipif(
+    not LOOPBACK_SOCKET_AVAILABLE,
+    reason="loopback sockets are unavailable in this test environment",
+)
 def test_generate_logs_aborts_when_http_server_owns_port(tmp_path):
     # a foreign HTTP server answering 404 must read as "port occupied":
     # HTTPError subclasses OSError, so it must not fall into the
@@ -622,6 +634,10 @@ def test_generate_logs_aborts_when_http_server_owns_port(tmp_path):
     )
 
 
+@pytest.mark.skipif(
+    not LOOPBACK_SOCKET_AVAILABLE,
+    reason="loopback sockets are unavailable in this test environment",
+)
 def test_generate_logs_aborts_when_non_http_service_owns_port(tmp_path):
     # a non-HTTP listener answering garbage raises BadStatusLine — an
     # HTTPException, wrapped by neither HTTPError nor OSError

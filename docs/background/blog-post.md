@@ -17,7 +17,7 @@ Teams finding and fixing the most vulnerabilities converged on a variation of ex
 5. **Triage:** Deduplicate findings, assign severity, and prioritize what needs fixing.  
 6. **Patching:** Apply the fix, confirm the vulnerability is nullified, and search for variants.
 
-![Overview of the find-and-fix loop](../static/defenders-loop.png)
+![Overview of the find-and-fix loop](../../static/defenders-loop.png)
 
 The first two steps—building a threat model and a sandbox—are the setup for the rest of the loop. These are typically done once per codebase and revisited when the underlying system changes. The next four steps are the loop you’ll run against the source: discover, verify, triage, and patch.
 

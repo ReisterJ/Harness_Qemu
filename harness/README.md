@@ -7,13 +7,13 @@ builds ASAN-instrumented targets, and grades every finding with an
 executable oracle (the PoC crashes, or it doesn't).
 
 This README is the copy-paste path to a demo. For the architecture, every
-CLI flag, and rate-limit math, see [`docs/pipeline.md`](../docs/pipeline.md).
+CLI flag, and rate-limit math, see [`docs/architecture/pipeline.md`](../docs/architecture/pipeline.md).
 
 > ⚠️ **`run`, `recon`, `report`, and `patch` execute target code.** The
 > harness refuses to spawn agents outside its gVisor sandbox. Run
 > `scripts/setup_sandbox.sh` once, then invoke everything through
 > `bin/vp-sandboxed`. Never mount credentials into the agent environment.
-> See [`docs/security.md`](../docs/security.md).
+> See [`docs/architecture/security.md`](../docs/architecture/security.md).
 
 ## Prerequisites
 
@@ -41,7 +41,7 @@ that pulls your code at a pinned commit and builds it instrumented.
 cd <repo-root>
 python3 -m venv .venv
 .venv/bin/pip install -e .
-export ANTHROPIC_API_KEY=sk-ant-...        # or CLAUDE_CODE_OAUTH_TOKEN, or Bedrock — see docs/agent-sandbox.md
+export ANTHROPIC_API_KEY=sk-ant-...        # or CLAUDE_CODE_OAUTH_TOKEN, or Bedrock — see docs/architecture/agent-sandbox.md
 export VULN_PIPELINE_MODEL=<model-id>      # Claude Opus recommended; override per-call with --model
 
 # Installs gVisor, builds the target + agent images, verifies isolation; needs sudo.
@@ -97,10 +97,10 @@ Full expected-results table and run notes in
 > **Network note.** The `docker build` step in `setup_sandbox.sh` needs
 > outbound HTTPS to fetch the target source. After that, the find/grade/patch
 > agents run with egress locked to the configured allowlist (default
-> `api.anthropic.com:443`; see [`docs/agent-sandbox.md`](../docs/agent-sandbox.md)
+> `api.anthropic.com:443`; see [`docs/architecture/agent-sandbox.md`](../docs/architecture/agent-sandbox.md)
 > for Bedrock/Vertex); they never see the network beyond it. This is the
 > setup → attack isolation split described in
-> [`docs/security.md`](../docs/security.md#separating-setup-and-attack-phases).
+> [`docs/architecture/security.md`](../docs/architecture/security.md#separating-setup-and-attack-phases).
 
 > **Env-name note.** The `VULN_PIPELINE_*` env vars and the `vp-internal`
 > network name are the contract with `bin/vp-sandboxed` and
@@ -176,5 +176,5 @@ has its own `targets/<name>/README.md`.
 The C/C++/ASAN specifics live in `prompts/`, `asan.py`, and
 `patch_grade.py:_t1_passes()`. The orchestration (`cli.py`, `find.py`,
 `grade.py`, `report.py`) is mostly domain-neutral. See
-[`docs/customizing.md`](../docs/customizing.md), or run `/customize` in
+[`docs/guides/customizing.md`](../docs/guides/customizing.md), or run `/customize` in
 Claude Code from the repo root.

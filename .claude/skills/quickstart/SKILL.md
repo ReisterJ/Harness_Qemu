@@ -92,22 +92,22 @@ Don't answer from general knowledge when the repo has a specific answer.
 
 | If the question is about…       | Read first                              | Then offer |
 |---------------------------------|-----------------------------------------|------------|
-| running the pipeline             | `docs/pipeline.md`, README Step 2        | the `recon` / `run` command |
-| too many findings, triage       | `docs/triage.md`                        | `/triage <path>` |
-| porting, Java/Go/Rust/etc.      | `docs/customizing.md`, README Step 3    | `/customize` |
-| safety, sandbox, Docker         | `docs/security.md`                      | cite; no action |
-| rate limits, 429, token budget  | `docs/pipeline.md`: Rate limits, `docs/troubleshooting.md#rate-limits` | cite the numbers |
-| duplicates, dedup               | `docs/troubleshooting.md#duplicate-findings` | `known_bugs:` hint |
+| running the pipeline             | `docs/architecture/pipeline.md`, README Step 2        | the `recon` / `run` command |
+| too many findings, triage       | `docs/research/triage.md`                        | `/triage <path>` |
+| porting, Java/Go/Rust/etc.      | `docs/guides/customizing.md`, README Step 3    | `/customize` |
+| safety, sandbox, Docker         | `docs/architecture/security.md`                      | cite; no action |
+| rate limits, 429, token budget  | `docs/architecture/pipeline.md`: Rate limits, `docs/guides/troubleshooting.md#rate-limits` | cite the numbers |
+| duplicates, dedup               | `docs/guides/troubleshooting.md#duplicate-findings` | `known_bugs:` hint |
 | CLI flags, "what does --X do"   | `harness/cli.py` (grep the argparse)    | exact flag + example |
-| which model, subagent pinning   | `docs/troubleshooting.md`: Subagents    | the `export` line |
-| best practices, prompting       | `docs/best-practices.md`, `docs/prompting.md` | cite the principle |
-| threat model, attack surface, scope | `docs/threat-model.md`              | `/threat-model bootstrap <target-dir>` |
+| which model, subagent pinning   | `docs/guides/troubleshooting.md`: Subagents    | the `export` line |
+| best practices, prompting       | `docs/research/best-practices.md`, `docs/research/prompting.md` | cite the principle |
+| threat model, attack surface, scope | `docs/architecture/threat-model.md`              | `/threat-model bootstrap <target-dir>` |
 | scan, audit, find vulns         | `.claude/skills/vuln-scan/SKILL.md`     | `/vuln-scan <target-dir>` |
 | "how do I start"                | README Step 1                           | offer Guided first run |
-| patching, fix, diff, re-attack  | `docs/patching.md`, README Step 4       | `/patch <input>` |
-| threat hunting, incident response, logs | `docs/detection-response.md`    | `/dnr-hunt` or `/dnr-respond` |
-| autonomous D&R, dnrcanary       | `docs/detection-response.md`, `targets/dnrcanary/README.md` | the `dnr-pipeline run` command |
-| binary, embedded, other domains | `docs/other-use-cases.md`               | cite section |
+| patching, fix, diff, re-attack  | `docs/research/patching.md`, README Step 4       | `/patch <input>` |
+| threat hunting, incident response, logs | `docs/detection-response/detection-response.md`    | `/dnr-hunt` or `/dnr-respond` |
+| autonomous D&R, dnrcanary       | `docs/detection-response/detection-response.md`, `targets/dnrcanary/README.md` | the `dnr-pipeline run` command |
+| binary, embedded, other domains | `docs/guides/other-use-cases.md`               | cite section |
 | anything else                   | README Table of contents                | best-match doc |
 
 ### Answer format

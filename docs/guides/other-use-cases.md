@@ -1,6 +1,6 @@
 # Other Security Tasks and Use Cases
 
-The model performs well on security use cases beyond source code analysis and detection & response. We provide basic high-level guidance on a few of these in the below. This list is not exhaustive -- please experiment, and keep [security.md](security.md) in mind as you do.
+The model performs well on security use cases beyond source code analysis and detection & response. We provide basic high-level guidance on a few of these in the below. This list is not exhaustive -- please experiment, and keep [security.md](../architecture/security.md) in mind as you do.
 
 ## Binary Analysis
 

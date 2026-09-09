@@ -44,7 +44,7 @@ org bug-bar), and whether to bias toward precision or recall on split
 votes. These answers shape how reachability is judged and how severity is
 labeled. If you pick CVSS, have the model emit vectors and compute the
 scores with a tool — see
-[docs/best-practices.md#cvss](../../../docs/best-practices.md#cvss).
+[docs/research/best-practices.md#cvss](../../../docs/research/best-practices.md#cvss).
 To skip the interview and use precision-biased defaults:
 
 ```

@@ -986,7 +986,7 @@ point at real call sites) and a sample of FALSE_POSITIVE rejects (the
 ## Design notes
 
 - **Checkpoints are per-phase JSON**, not conversation state. The pipeline's
-  `--resume <session_id>` (docs/pipeline.md) restores transcript history but
+  `--resume <session_id>` (docs/architecture/pipeline.md) restores transcript history but
   doesn't help when the orchestrator's context window itself fills;
   file-backed checkpoints let a brand-new session pick up from the last
   completed phase. `./.triage-state/` is scratch — add to `.gitignore`.

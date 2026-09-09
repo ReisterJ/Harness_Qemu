@@ -13,6 +13,7 @@
 # limitations under the License.
 """CLI entrypoint.
 
+  vuln-pipeline build <name> --repo <url> [--branch <branch>] --model <model>
   vuln-pipeline run <target> --model <model>                   # one find + grade cycle
   vuln-pipeline run <target> --model <m> --runs 8 --parallel   # 8 concurrent, round-robin focus areas
   vuln-pipeline run <target> --model <m> --auto-focus          # recon discovers focus areas first
@@ -25,7 +26,7 @@ static_transcript.jsonl,dynamic_validation.json,find_transcript.jsonl,
 grade_transcript.jsonl,poc.bin}; reports → .../reports/bug_NN/
 
 Auth: resolved by ``harness.auth`` (Bedrock / Vertex / ANTHROPIC_API_KEY /
-CLAUDE_CODE_OAUTH_TOKEN — one required; see docs/agent-sandbox.md).
+CLAUDE_CODE_OAUTH_TOKEN — one required; see docs/architecture/agent-sandbox.md).
 Model: --model flag, or VULN_PIPELINE_MODEL env var (required, one or the other).
 """
 from __future__ import annotations
@@ -56,6 +57,14 @@ from .patch import run_patch, PATCH_MAX_TURNS, DEFAULT_MAX_ITERATIONS
 from .recon import run_recon, RECON_MAX_TURNS
 from .report import run_report, REPORT_MAX_TURNS
 from .prompts.system_prompt import build_system_prompt
+from .target_builder import (
+    BUILD_MAX_TURNS,
+    DEFAULT_BUILD_RETRIES,
+    DEFAULT_BUILD_TIMEOUT_S,
+    BuildError,
+    BuildOptions,
+    build_target,
+)
 from .auth import (  # noqa: F401
     resolve_auth_env as _resolve_auth_env,
     warn_bedrock_model as _warn_bedrock_model,
@@ -161,7 +170,8 @@ def _on_signal(signum, frame) -> None:
          "--filter", f"name=static_find_{t}_",
          "--filter", f"name=grader_{t}_",
          "--filter", f"name=recon_{t}",
-         "--filter", f"name=report_{t}_"],
+         "--filter", f"name=report_{t}_",
+         "--filter", f"name=build_{t}_"],
         capture_output=True, text=True,
     )
     ids = r.stdout.split()
@@ -869,6 +879,36 @@ def main() -> int:
     parser = argparse.ArgumentParser(prog="vuln-pipeline")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    p_build = sub.add_parser(
+        "build",
+        help="Generate, build, validate, and publish a target from a repository",
+    )
+    p_build.add_argument("name", help="Target name to create under ./targets/")
+    p_build.add_argument("--repo", required=True, help="Git repository URL")
+    revision = p_build.add_mutually_exclusive_group()
+    revision.add_argument("--branch", default=None,
+                          help="Branch to build; omitted means the repository default branch")
+    revision.add_argument("--ref", default=None,
+                          help="Fixed tag or commit to build instead of a branch")
+    p_build.add_argument("--kind", choices=("auto", "cli", "library", "kernel"),
+                         default="auto", help="Expected target shape (default: auto)")
+    p_build.add_argument("--model", default=os.environ.get("VULN_PIPELINE_MODEL"),
+                         help="Planning-agent model (required; or set VULN_PIPELINE_MODEL)")
+    p_build.add_argument("--max-turns", type=int, default=BUILD_MAX_TURNS,
+                         help=f"Build planning/repair agent turn budget (default {BUILD_MAX_TURNS})")
+    p_build.add_argument("--build-retries", type=int, default=DEFAULT_BUILD_RETRIES,
+                         help=f"Repair-agent retries after Docker build failures (default {DEFAULT_BUILD_RETRIES})")
+    p_build.add_argument("--build-timeout", type=int, default=DEFAULT_BUILD_TIMEOUT_S,
+                         help=f"Timeout per Docker build attempt in seconds (default {DEFAULT_BUILD_TIMEOUT_S})")
+    p_build.add_argument("--targets-dir", type=Path, default=Path("targets"),
+                         help="Where to publish the generated target (default: ./targets)")
+    p_build.add_argument("--builds-dir", type=Path, default=Path("results/builds"),
+                         help="Where to keep source, logs, and transcripts (default: ./results/builds)")
+    p_build.add_argument("--force", action="store_true",
+                         help="Replace an existing target only after the new build passes")
+    p_build.add_argument("--dangerously-no-sandbox", dest="dangerously_no_sandbox",
+                         action="store_true", help="Run the planning agent without gVisor; use only in a throwaway VM")
+
     p_run = sub.add_parser("run", help="Run find+grade against a target")
     p_run.add_argument("target", help="Target name (under ./targets/) or path to target dir")
     p_run.add_argument("--find-only", action="store_true", help="Skip grade stage")
@@ -906,7 +946,7 @@ def main() -> int:
                        action="store_true",
                        help="Spawn agents under plain runc with no syscall isolation. The "
                             "shipped path is `bin/vp-sandboxed` (gVisor); see "
-                            "docs/agent-sandbox.md. Development on a throwaway VM only.")
+                            "docs/architecture/agent-sandbox.md. Development on a throwaway VM only.")
     p_run.add_argument("--engagement-context", type=Path, default=None,
                        help="Path to an authorization/engagement-scope file injected into the "
                             "agent system prompt. Defaults to a built-in authorized-security-"
@@ -979,11 +1019,13 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    if args.command in ("run", "recon", "report", "patch"):
+    if args.command in ("build", "run", "recon", "report", "patch"):
         if err := sandbox.require(args.dangerously_no_sandbox):
             print(err, file=sys.stderr)
             return 1
 
+    if args.command == "build":
+        return _cmd_build(args)
     if args.command == "run":
         return _cmd_run(args)
     if args.command == "recon":
@@ -995,6 +1037,65 @@ def main() -> int:
     if args.command == "patch":
         return _cmd_patch(args)
     return 1
+
+
+def _cmd_build(args) -> int:
+    """Generate and publish one target without entering the find workflow."""
+    global _current_target_name
+    _current_target_name = args.name
+
+    if not args.model:
+        print("error: --model required (or set VULN_PIPELINE_MODEL)", file=sys.stderr)
+        return 1
+    agent_env = _resolve_auth_env()
+    if agent_env is None:
+        print(NO_AUTH_MSG, file=sys.stderr)
+        return 1
+    _warn_bedrock_model(args.model)
+
+    print(f"Target build: {args.name}")
+    print(f"  repository: {args.repo}")
+    print(f"  revision:   {args.ref or args.branch or '(default branch)'}")
+    print(f"  kind:       {args.kind}")
+    print(f"  model:      {args.model}")
+    print(f"  retries:    {args.build_retries}")
+    print(f"  timeout:    {args.build_timeout}s per Docker build")
+    print()
+    try:
+        result = asyncio.run(build_target(
+            BuildOptions(
+                name=args.name,
+                repo=args.repo,
+                branch=args.branch,
+                ref=args.ref,
+                kind=args.kind,
+                model=args.model,
+                targets_dir=args.targets_dir,
+                builds_dir=args.builds_dir,
+                max_turns=args.max_turns,
+                retries=args.build_retries,
+                timeout_s=args.build_timeout,
+                force=args.force,
+            ),
+            agent_env,
+        ))
+    except BuildError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("error: target build cancelled", file=sys.stderr)
+        return 1
+
+    print("\n── Target ready ───────────────────────────────────────────────────────────────")
+    print(f"  target:     {result.target_dir}")
+    print(f"  commit:     {result.source_lock.commit}")
+    print(f"  source sha: {result.source_lock.snapshot_sha256}")
+    print(f"  image:      {result.image_tag}")
+    if result.agent_image_tag:
+        print(f"  agent image: {result.agent_image_tag}")
+    print(f"  build log:  {result.job_dir}/build-{result.build_attempts}.log")
+    print(f"  next:       vuln-pipeline run {args.name} --model {args.model}")
+    return 0
 
 
 def _cmd_run(args) -> int:

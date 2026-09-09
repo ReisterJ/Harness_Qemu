@@ -11,7 +11,7 @@ the pipeline does, how to watch a run, and relevant CLI flags.
 > and [agent-sandbox.md](agent-sandbox.md).
 
 > This document covers how the reference pipeline works. For the general
-> best practices it implements, see the [blog post](blog-post.md).
+> best practices it implements, see the [blog post](../background/blog-post.md).
 
 ## Install and first run
 
@@ -19,7 +19,7 @@ the pipeline does, how to watch a run, and relevant CLI flags.
 # One-time setup
 python3 -m venv .venv && .venv/bin/pip install -e .
 ./scripts/setup_sandbox.sh   # installs gVisor, builds the agent images, and verifies isolation; note: requires Docker
-export ANTHROPIC_API_KEY=sk-ant-...   # or CLAUDE_CODE_OAUTH_TOKEN, or Bedrock — see docs/agent-sandbox.md
+export ANTHROPIC_API_KEY=sk-ant-...   # or CLAUDE_CODE_OAUTH_TOKEN, or Bedrock — see docs/architecture/agent-sandbox.md
 
 # Run the recon → find → verify → report loop
 bin/vp-sandboxed run drlibs --model <model-id> --runs 3 --parallel --stream --auto-focus
@@ -39,7 +39,7 @@ happening mid-run, and stop early without losing anything.
 
 ## What each stage does
 
-![Overview of the demo pipeline stages.](../static/harness-diagram.png)
+![Overview of the demo pipeline stages.](../../static/harness-diagram.png)
 
 **Build.** The target's `Dockerfile` is built into an ASAN-instrumented image
 the first time you run a scan against it. The same image is reused for find, grade,
@@ -98,7 +98,7 @@ results by ASAN signature. It's useful for a quick summary of "these N crashes
 cluster into M signatures".
 
 **Patch.** A separate command that generates a candidate patch for each unique
-bug. For details, see [patching.md](patching.md).
+bug. For details, see [patching.md](../research/patching.md).
 
 ## Watching a run
 
@@ -170,7 +170,7 @@ or `error`; the batch's `found_bugs.jsonl` and `focus_areas.json` are
 reused, not re-seeded. `report` skips `bug_NN/report.json` checkpoints
 that were successfully submitted and redoes failed ones automatically;
 `--fresh` redoes all of them, including the good ones. Recovery recipe:
-[troubleshooting.md § Pipeline run died mid-batch](troubleshooting.md#pipeline-run-died-mid-batch).
+[troubleshooting.md § Pipeline run died mid-batch](../guides/troubleshooting.md#pipeline-run-died-mid-batch).
 
 ## Design principles
 
@@ -209,7 +209,7 @@ and running the target throttles token consumption naturally. As a sizing
 rule of thumb, keep concurrent agents to **~100 per 1M
 input-tokens-per-minute** of rate-limit headroom — check your account's
 limit in the [Claude Console](https://console.claude.com/settings/limits);
-same guidance as [troubleshooting.md § Rate limits](troubleshooting.md#rate-limits).
+same guidance as [troubleshooting.md § Rate limits](../guides/troubleshooting.md#rate-limits).
 The small first wave in
 [§ Install and first run](#install-and-first-run) is there so you can
 measure your target's actual burn rate before scaling up.

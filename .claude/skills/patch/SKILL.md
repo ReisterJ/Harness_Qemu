@@ -33,7 +33,7 @@ Turns a ranked list of verified findings into candidate diffs.
 
 The skill **never applies a diff** to the target repo. Output is inert text
 in `./PATCHES/` for a human to review and apply out-of-band — see
-`docs/patching.md#reviewing-generated-patches`. There is no `--apply` or
+`docs/research/patching.md#reviewing-generated-patches`. There is no `--apply` or
 `--approve` flag by design: the capability isn't present, so it can't be
 prompt-injected into use.
 
@@ -506,7 +506,7 @@ In exec mode, also Read the pipeline's
 > **Static review only.** These diffs were authored and reviewed by
 > independent agents reading source. They were NOT compiled, run, or
 > re-attacked. Read each diff yourself before applying — see
-> `docs/patching.md#reviewing-generated-patches` for what to look for.
+> `docs/research/patching.md#reviewing-generated-patches` for what to look for.
 
 {if mode == "exec":}
 > **Execution-verified.** Each diff passed (or failed) the pipeline
@@ -560,7 +560,7 @@ Patches generated ({mode} mode): {N} findings → {M} diffs.
   {if exec:} Ladder passed: {n}/{M}
 
 Wrote ./PATCHES/bug_NN/, ./PATCHES.md, ./PATCHES.json
-{if static:} These are drafts. Review before applying — see docs/patching.md.
+{if static:} These are drafts. Review before applying — see docs/research/patching.md.
 ```
 
 ---

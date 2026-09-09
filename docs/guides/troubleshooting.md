@@ -35,7 +35,7 @@ the [Claude Console](https://console.claude.com/settings/limits).
 
 Bursting past your limit is not catastrophic. The pipeline resumes on 429
 without losing conversation context (see 
-[pipeline.md#resume-on-error](pipeline.md#resume-on-error)).
+[pipeline.md#resume-on-error](../architecture/pipeline.md#resume-on-error)).
 You should not need to throttle far below provisioned capacity.
 
 ## Spending too many tokens
@@ -49,14 +49,14 @@ doesn't evict the whole prefix. The ~10K input tokens/min per-agent rate in
 [Rate limits](#rate-limits) is the *uncached* rate; cached reads are
 roughly an order of magnitude cheaper.
 
-**Don't over-parallelize — partition, then one agent per slice.** One agent per file is excessive: agents reason across files, and tiny scopes waste the fixed per-agent overhead on shallow context. Partition the target into a handful of meaningful units and run one find agent per unit. Adding agents without re-partitioning hits diminishing returns on findings as well as on cost — see [best-practices.md#large-codebases](best-practices.md#large-codebases).
+**Don't over-parallelize — partition, then one agent per slice.** One agent per file is excessive: agents reason across files, and tiny scopes waste the fixed per-agent overhead on shallow context. Partition the target into a handful of meaningful units and run one find agent per unit. Adding agents without re-partitioning hits diminishing returns on findings as well as on cost — see [best-practices.md#large-codebases](../research/best-practices.md#large-codebases).
 
 **Patch what you found before re-scanning.** A second run on an unpatched
 tree spends most of its budget re-converging on bugs you already know
 about. Fix the first batch (or list them under `known_bugs:` in the
 target config) before the next run, so the model's time goes to new
 vulnerabilities. This is the same find→fix→find loop
-[best-practices.md](best-practices.md#iterating-scale-and-convergence)
+[best-practices.md](../research/best-practices.md#iterating-scale-and-convergence)
 recommends for recall — it's also the biggest token saver across runs.
 
 **Drop to Opus for the narrow parts.** Discovery is where Claude Mythos
@@ -117,7 +117,7 @@ that failed (`agent_failed`/ `build_failed`/`error`). `found_bugs.jsonl` and
 
 This pipeline-level resume, which survives a killed orchestrator, is different
 from the per-agent session resume described in 
-[pipeline.md#resume-on-error](pipeline.md#resume-on-error), which restores a 
+[pipeline.md#resume-on-error](../architecture/pipeline.md#resume-on-error), which restores a
 single agent's conversation after an API error.
 
 ## False positives
@@ -125,7 +125,7 @@ single agent's conversation after an API error.
 The most common cause of false positives isn't the model misreading code, it's 
 the model not knowing your trust boundaries. If a whole class of findings is
 wrong in the same way, write the missing assumption into your `THREAT_MODEL.md`.
-The blog post's [threat-model section](blog-post.md#1-threat-model-define-what-counts-as-a-vulnerability)
+The blog post's [threat-model section](../background/blog-post.md#1-threat-model-define-what-counts-as-a-vulnerability)
 describes this in detail and explains why this is the place to start.
 
 Two other fixes may also help:

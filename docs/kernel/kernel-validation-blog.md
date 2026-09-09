@@ -192,6 +192,6 @@ nohup .venv/bin/vuln-pipeline run targets/<target> \
 ---
 
 *框架基于 [defending-code-reference-harness](https://github.com/anthropics/defending-code-reference-harness)
-的 `vuln-pipeline`；内核域的适配细节与测试记录见 `docs/kernel-validation.md`，靶标在
+的 `vuln-pipeline`；内核域的适配细节与测试记录见 `docs/kernel/kernel-validation.md`，靶标在
 `targets/`（`kernelval`、`syzbot-buildid`、`tls-uaf`）。*
 

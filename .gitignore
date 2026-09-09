@@ -9,8 +9,14 @@ results/
 build/
 dist/
 
+# Documentation is organized under docs/build/; keep it versioned even though
+# generated build artifacts elsewhere are ignored.
+!docs/build/
+!docs/build/**
+
 # Local secrets — keep provider keys out of git
 .env
+.codex
 
 # Skill checkpoint state (scratch, per-run)
 .threat-model-state/
@@ -37,4 +43,5 @@ RESPONSE-*.md
 # dnrcanary (dnr target) generated artifacts
 targets/dnrcanary/logs/
 targets/dnrcanary/app/dnrcanary.db
+targets/libpng/
 armgcc.tar.gz

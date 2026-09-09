@@ -130,4 +130,4 @@ example lives at `targets/drlibs/THREAT_MODEL.md`.
   https://shostack.org/files/papers/The_Four_Question_Framework.pdf
 - OWASP Threat Modeling Cheat Sheet —
   https://cheatsheetseries.owasp.org/cheatsheets/Threat_Modeling_Cheat_Sheet.html
-- This repo's `docs/security.md` and `docs/prompting.md`.
+- This repo's `docs/architecture/security.md` and `docs/research/prompting.md`.

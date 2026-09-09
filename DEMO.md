@@ -31,7 +31,7 @@ up, exports the runtime/proxy env, and execs `.venv/bin/vuln-pipeline`.
 
 ## 2. Auth
 
-Pick one, per [`docs/agent-sandbox.md`](docs/agent-sandbox.md):
+Pick one, per [`docs/architecture/agent-sandbox.md`](docs/architecture/agent-sandbox.md):
 
 ```bash
 # Local dev / laptop (recommended for the demo)
@@ -41,7 +41,7 @@ export CLAUDE_CODE_OAUTH_TOKEN=<token>
 # or: an API key
 export ANTHROPIC_API_KEY=sk-ant-...
 
-# or: Amazon Bedrock (see docs/agent-sandbox.md for the full setup)
+# or: Amazon Bedrock (see docs/architecture/agent-sandbox.md for the full setup)
 export CLAUDE_CODE_USE_BEDROCK=1
 export AWS_REGION=us-east-1
 export AWS_BEARER_TOKEN_BEDROCK=...
@@ -136,7 +136,7 @@ jq  . $RESULTS/reports/bug_00/patch_result.json     # t0_builds .. re_attack_cle
 
 The ladder verifies the crash is gone, not that the diff is safe to upstream —
 review `patch.diff` by hand (see
-[`docs/patching.md#reviewing-generated-patches`](docs/patching.md#reviewing-generated-patches)).
+[`docs/research/patching.md#reviewing-generated-patches`](docs/research/patching.md#reviewing-generated-patches)).
 
 ## 9. Cleanup
 

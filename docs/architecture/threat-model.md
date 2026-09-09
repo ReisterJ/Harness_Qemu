@@ -23,7 +23,7 @@ which raises its likelihood ranking. And because threats survive
 patching, the threat model is durable: you can scan, fix, and scan
 again against the same `THREAT_MODEL.md`.
 
-The [skill's README](../.claude/skills/threat-model/README.md) tells you how to use the skill and what outputs to expect.
+The [skill's README](../../.claude/skills/threat-model/README.md) tells you how to use the skill and what outputs to expect.
 
 ## What it does
 
@@ -42,7 +42,7 @@ Read-only: it does not build, execute, or probe the target.
 
 - **Always, before the first scan of a new target.** Mythos Preview time/tokens spent here save human time triaging false positives. See
   ["Map the system first" in
-  best-practices.md](best-practices.md#map-first).
+  best-practices.md](../research/best-practices.md#map-first).
 - **For open-source targets:** read the project's `SECURITY.md` first and feed its stated scope as a constraint — many projects explicitly rule out classes of bugs as "by design," and aligning the threat model up front cuts findings the maintainers will reject.
 
 ## After threat modeling: scan
@@ -52,6 +52,6 @@ context when it's present in the target directory; `vuln-pipeline recon`
 turns it into `focus_areas` for the autonomous pipeline. See
 [pipeline.md](pipeline.md).
 
-→ Deeper: [example output](../targets/canary/THREAT_MODEL.md) ·
-[skill source](../.claude/skills/threat-model/SKILL.md) ·
-[output schema](../.claude/skills/threat-model/schema.md)
+→ Deeper: [example output](../../targets/canary/THREAT_MODEL.md) ·
+[skill source](../../.claude/skills/threat-model/SKILL.md) ·
+[output schema](../../.claude/skills/threat-model/schema.md)

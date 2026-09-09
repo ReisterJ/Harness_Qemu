@@ -36,7 +36,7 @@ other downstream use).
   authenticated path = Medium; three or more, or local-only = Low. You can swap
   in your own scoring standard when the skill asks at the start of a run.
 
-To see the full reasoning behind both, read the [blog post's triage section](blog-post.md#5-triage-deduplicate-by-root-cause-rank-by-preconditions-and-impact).
+To see the full reasoning behind both, read the [blog post's triage section](../background/blog-post.md#5-triage-deduplicate-by-root-cause-rank-by-preconditions-and-impact).
 
 ## Run it
 
@@ -71,9 +71,9 @@ collapsed, and ranked.
 
 If pipeline runs are consistently noisy, it's better to look into improving the pipeline 
 itself. Ensure you're using `--stream` so a judge agent gates what gets reported (see
-[pipeline.md](pipeline.md)) and seed the target's `known_bugs` so agents stop
+[pipeline.md](../architecture/pipeline.md)) and seed the target's `known_bugs` so agents stop
 re-converging on the same crashes (see 
-[troubleshooting.md's duplicate findings](troubleshooting.md#duplicate-findings)).
+[troubleshooting.md's duplicate findings](../guides/troubleshooting.md#duplicate-findings)).
 For scanners of your own, add a skeptical judge agent at the source — see
 [best-practices.md#judge](best-practices.md#judge).
 

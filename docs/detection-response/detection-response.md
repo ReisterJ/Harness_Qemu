@@ -6,7 +6,7 @@ an **attacker is already in the logs**. This track helps you find them,
 scope the damage, and respond. Many of the same principles apply: evidence
 over plausibility and verification over vibes. But they're applied to
 telemetry instead of source code. Looking for the static source scan?
-That's the [`/vuln-scan` skill](../.claude/skills/vuln-scan/SKILL.md).
+That's the [`/vuln-scan` skill](../../.claude/skills/vuln-scan/SKILL.md).
 
 The track ships as two skills: `/dnr-hunt` and `/dnr-respond`. They can be
 used in combination with the other skills as follows:
@@ -22,7 +22,7 @@ shouldn't be there, and generate alerts.
 an IOC, or a hunt finding goes in; a verdict, a quantified blast radius, and
 a proposed response plan come out.
 
-See [best-practices.md#detection-and-response](best-practices.md#detection-and-response)
+See [best-practices.md#detection-and-response](../research/best-practices.md#detection-and-response)
 for the DNR best practices these skills implement.
 
 
@@ -37,11 +37,11 @@ design: big enough that the agent must query it rather than read it, which
 is closer to what hunting real logs feels like.
 
 How to run the skills and the outputs to expect is captured in their
-READMEs: [`dnr-hunt`](../.claude/skills/dnr-hunt/README.md) (no alert in
-hand) and [`dnr-respond`](../.claude/skills/dnr-respond/README.md) (lead
+READMEs: [`dnr-hunt`](../../.claude/skills/dnr-hunt/README.md) (no alert in
+hand) and [`dnr-respond`](../../.claude/skills/dnr-respond/README.md) (lead
 in hand). The scenario you're dropped into, and the corpus's determinism
 guarantees, are in
-[`targets/dnrcanary/README.md`](../targets/dnrcanary/README.md).
+[`targets/dnrcanary/README.md`](../../targets/dnrcanary/README.md).
 
 Each skill writes to a per-run directory, `results/<target>/<timestamp>/`,
 and prints the path — `INCIDENTS.json`, the incident report, and the
@@ -127,9 +127,9 @@ is always a runtime argument (`--model` / `VULN_PIPELINE_MODEL`).
 - Log-only detection is hard; treat the demo as a method to practice, not
   a guarantee of recall on arbitrary corpora. Seeded exercises (the
   seed-ground-truth practice in
-  [best-practices.md#detection-and-response](best-practices.md#detection-and-response))
+  [best-practices.md#detection-and-response](../research/best-practices.md#detection-and-response))
   are how you measure recall on *your* telemetry.
 
-→ Deeper: [example output](../targets/dnrcanary/example_skill_runs/) ·
-[dnr-hunt skill source](../.claude/skills/dnr-hunt/SKILL.md) ·
-[dnr-respond skill source](../.claude/skills/dnr-respond/SKILL.md)
+→ Deeper: [example output](../../targets/dnrcanary/example_skill_runs/) ·
+[dnr-hunt skill source](../../.claude/skills/dnr-hunt/SKILL.md) ·
+[dnr-respond skill source](../../.claude/skills/dnr-respond/SKILL.md)

@@ -7,7 +7,7 @@ patch to your repo. The last leg of the vulnerability cycle: consumes
 `/triage` output (preferred) or any findings file the triage ingest
 recognizes, and delegates vuln-pipeline results to the execution-verified
 `vuln-pipeline patch` ladder. For how it fits the pipeline and how to
-review what it produces, see [docs/patching.md](../../../docs/patching.md).
+review what it produces, see [docs/research/patching.md](../../../docs/research/patching.md).
 
 ## Requirements
 
@@ -60,7 +60,7 @@ bin/vp-sandboxed patch targets/canary/fixtures/results_sample --model <m>
 
 Full flag reference (`--bug`, `--parallel`, `--no-reattack`, `--style`,
 iteration and turn caps):
-[docs/patching.md § CLI reference](../../../docs/patching.md#cli-reference).
+[docs/research/patching.md § CLI reference](../../../docs/research/patching.md#cli-reference).
 
 ## Output
 
@@ -91,7 +91,7 @@ iteration and turn caps):
   `--apply` flag by design: the capability isn't present, so it can't be
   prompt-injected into use. Applying the fix is your move, after the
   review pass described in
-  [docs/patching.md#reviewing-generated-patches](../../../docs/patching.md#reviewing-generated-patches).
+  [docs/research/patching.md#reviewing-generated-patches](../../../docs/research/patching.md#reviewing-generated-patches).
 
 ## Questions
 

@@ -20,7 +20,7 @@ you can review and upstream.
 
 > ⚠️ **The patch grader executes target code and applies model-generated
 > diffs to it.** Apply the same isolation as other steps of the pipeline. See
-> [security.md](security.md) for more details.
+> [security.md](../architecture/security.md) for more details.
 
 > ⚠️ See [Reviewing generated patches](#reviewing-generated-patches)
 > below before upstreaming any changes. The verification ladder described
@@ -52,7 +52,7 @@ iteration.
 ## How the patch loop works
 
 A patch agent runs in a sandboxed container (see 
-[agent-sandbox.md](agent-sandbox.md) for details) with the source, the
+[agent-sandbox.md](../architecture/agent-sandbox.md) for details) with the source, the
 proof of concept, the reproduction command, and the ASAN trace. Its prompt
 pushes it to fix the root cause rather than narrowly address the crash site,
 to look for sibling call sites with the same bug, and to keep the diff as 
@@ -160,7 +160,7 @@ a human with the analysis instead of emitting a diff.
 > as data, not instructions. But prompt-level fencing is a mitigation, not a
 > guarantee. If you're running against third-party code you don't fully trust,
 > a poisoned target's influence may surface in diff generation and review. See
-> [security.md](security.md#prompt-injection) for the broader threat model.
+> [security.md](../architecture/security.md#prompt-injection) for the broader threat model.
 
 ## CLI reference
 

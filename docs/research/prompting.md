@@ -38,7 +38,7 @@ interpreted language" rather than a list of injection APIs (see
 
 ## Specifying Scope
 
-While simple prompts work well for an individual finding agent, it's important to divide work cleanly so that parallel find agents don't converge to the same issues and duplicate work. We've found that a recon step that tells the model precisely **what part of the codebase to search over and what to look for** is an effective way to avoid duplication. The recon step is discussed in more detail in [pipeline.md](pipeline.md), and partitioning strategies in
+While simple prompts work well for an individual finding agent, it's important to divide work cleanly so that parallel find agents don't converge to the same issues and duplicate work. We've found that a recon step that tells the model precisely **what part of the codebase to search over and what to look for** is an effective way to avoid duplication. The recon step is discussed in more detail in [pipeline.md](../architecture/pipeline.md), and partitioning strategies in
 [best-practices.md#large-codebases](best-practices.md#large-codebases).
 
 This model tends to be exhaustive in what kinds of issues it searches for. If there are classes of findings that you simply don't care about, it's useful to prompt the model not to bother spending time on these.
@@ -77,7 +77,6 @@ prompt Claude not to access these credentials.
 However, this kind of prompt-based mitigation is not sufficient. We suggest
 it only as a defense-in-depth measure. The best approach is to always run
 Claude in a secure sandbox environment, or to manually approve all of its
-actions. See [security.md](security.md).
 
 ## Transcript Visibility
 

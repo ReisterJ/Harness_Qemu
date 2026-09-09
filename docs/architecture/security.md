@@ -10,13 +10,13 @@
 > its proposed plan before approving. The detection & response skills
 > (`/dnr-hunt`, `/dnr-respond`) additionally run the demo app on `127.0.0.1`
 > to verify PoCs — see
-> [detection-response.md](detection-response.md#scope-and-limits).
+> [detection-response.md](../detection-response/detection-response.md#scope-and-limits).
 
 ## Usage marker
 
 Agent API requests carry a declared, removable usage marker (an
 `anthropic-cyber-runbook` header and a User-Agent token) — structural metadata only,
-never content. See `docs/pipeline.md#usage-marker` for exactly what is sent
+never content. See `docs/architecture/pipeline.md#usage-marker` for exactly what is sent
 and how to remove it.
 
 ## Why the sandbox is necessary
@@ -25,7 +25,7 @@ Frontier models are increasingly good at finding creative paths around
 restrictions. This is what makes them effective vulnerability hunters. 
 However, it also makes them capable of taking unexpected actions against 
 their own execution environments. See the
-[blog post's sandbox section](blog-post.md#2-sandbox-run-agents-safely-and-verify-exploitability) for
+[blog post's sandbox section](../background/blog-post.md#2-sandbox-run-agents-safely-and-verify-exploitability) for
 examples of where teams have seen this in the wild.
 
 The lesson we've learned from our work is that models will use whatever
@@ -71,7 +71,7 @@ start outside that sandbox unless you explicitly pass `--dangerously-no-sandbox`
 ## Separating setup and attack phases
 
 The general pattern (described in the
-[blog post](blog-post.md#2-sandbox-run-agents-safely-and-verify-exploitability))
+[blog post](../background/blog-post.md#2-sandbox-run-agents-safely-and-verify-exploitability))
 is to do everything that needs the internet first (pull dependencies, install
 tools, etc.), freeze the result, and give the attack phase no egress route
 except to the model API.
@@ -87,7 +87,7 @@ In this repo, that split looks like:
    versions are pinned in the Dockerfile so every run uses the same bits.
 
 See [agent-sandbox.md](agent-sandbox.md) for more details on this setup, and
-[best-practices.md](best-practices.md#setup-attack-isolation) for the fuller
+[best-practices.md](../research/best-practices.md#setup-attack-isolation) for the fuller
 version of the pattern — per-target credential scoping and using the proxy as
 an engagement-scope enforcer.
 
@@ -107,5 +107,5 @@ a diff you may apply to a real codebase. The pipeline wraps target-derived
 text in the patch prompt in `<untrusted_data>` blocks with a per-call random 
 id and instructs the agent to treat it as only data (not instructions). However,
 these measures are a mitigation, not a guarantee. Review every generated diff
-before upstreaming. See [patching.md](patching.md#reviewing-generated-patches) 
+before upstreaming. See [patching.md](../research/patching.md#reviewing-generated-patches)
 for what to look for.

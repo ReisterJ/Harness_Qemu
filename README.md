@@ -5,7 +5,7 @@ remediation with Claude, based on our learnings from [partnering with security
 teams at several organizations](https://www.anthropic.com/glasswing)
 since launching Claude Mythos Preview. For a write up of these learnings along with
 best practices, see the [accompanying blog post](https://claude.com/blog/using-llms-to-secure-source-code)
-(also available in [`blog-post.md`](docs/blog-post.md)). For a lightweight SDK-only 
+(also available in [`blog-post.md`](docs/background/blog-post.md)). For a lightweight SDK-only
 walkthrough of the same recon → find → triage → report → patch loop, see the 
 [companion cookbook](https://platform.claude.com/cookbook/claude-agent-sdk-06-the-vulnerability-detection-agent).
 
@@ -42,7 +42,7 @@ This repo is not maintained and is not accepting contributions.
   in this repo is preventive; this track assumes an attacker is already in
   the logs — hunt the corpus, scope the damage, and propose a response.
   Demo target: `targets/dnrcanary/`. See
-  [docs/detection-response.md](docs/detection-response.md).
+  [docs/detection-response/detection-response.md](docs/detection-response/detection-response.md).
 
 > ⚠️ **Security:** `/quickstart`, `/threat-model`, `/vuln-scan`, and `/triage`
 > only read and write files. Running `/patch` on static findings (`TRIAGE.json`
@@ -55,8 +55,8 @@ This repo is not maintained and is not accepting contributions.
 > unless explicitly overridden. To get set up, run `scripts/setup_sandbox.sh` once,
 > then invoke the pipeline via `bin/vp-sandboxed`. The detection & response
 > skills (`/dnr-hunt`, `/dnr-respond`) additionally run the demo app on
-> `127.0.0.1` to verify PoCs. See [docs/security.md](docs/security.md)
-> and [docs/agent-sandbox.md](docs/agent-sandbox.md) for more details.
+> `127.0.0.1` to verify PoCs. See [docs/architecture/security.md](docs/architecture/security.md)
+> and [docs/architecture/agent-sandbox.md](docs/architecture/agent-sandbox.md) for more details.
 
 ## Getting Started
 
@@ -72,22 +72,40 @@ claude
 > /quickstart how do I triage all these bugs?
 ```
 
+To create a runnable target from an open-source repository, use the build
+workflow. It locks the selected commit, asks an isolated agent to generate the
+Dockerfile/config/entry files, builds on the host, repairs failed builds, and
+publishes only after the target interface checks pass:
+
+```bash
+bin/vp-sandboxed build flex \
+  --repo https://github.com/westes/flex.git \
+  --branch master \
+  --model <model-id>
+```
+
+Use `--ref <tag-or-commit>` for a fixed revision, or `--force` to replace an
+existing target after the new build succeeds. Details are in
+[the target build workflow](docs/build/target-build-workflow.md).
+
 ## Further Reading
 
-- [**Blog Post**](docs/blog-post.md) · The accompanying blog post with learnings + best practices
-- [**Pipeline**](docs/pipeline.md) · How it works: diagram, stages, CLI flags
-- [**Security**](docs/security.md) · Sandboxing, what not to mount
-- [**Agent sandbox**](docs/agent-sandbox.md) · gVisor isolation + egress allowlist for every agent
-- [**Best practices**](docs/best-practices.md) · Field-tested principles: verification, severity, iteration, large codebases
-- [**Prompting**](docs/prompting.md) · Prompting the model for defensive security tasks
-- [**Threat model**](docs/threat-model.md) · Why a threat model cuts false positives, and the `/threat-model` skill
-- [**Detection & response**](docs/detection-response.md) · Hunting an attacker already in the logs; the D&R skills and pipeline
-- [**Customize**](docs/customizing.md) · Port to my stack; which files change and why
-- [**Kernel validation**](docs/kernel-validation.md) · Validate Linux-kernel static-analysis reports via QEMU/KVM + `targets/kernelval` (CVE-2025-40019 record, fixes, reproduction)
-- [**Experimental targets**](docs/experimental-target-selection.md) · Select C/Rust projects and configure Sanitizer-based end-to-end experiments
-- [**Patching**](docs/patching.md) · Generate and verify fixes for verified crashes
-- [**Other use cases**](docs/other-use-cases.md) · Binary analysis, embedded, bug chains, threat intel
-- [**Troubleshooting**](docs/troubleshooting.md) · Duplicates, rate limits, subagent model pinning
+- [**Documentation index**](docs/README.md) · Topic-based navigation for the project documentation
+- [**Blog Post**](docs/background/blog-post.md) · The accompanying blog post with learnings + best practices
+- [**Pipeline**](docs/architecture/pipeline.md) · How it works: diagram, stages, CLI flags
+- [**Target build workflow**](docs/build/target-build-workflow.md) · Generate a target Dockerfile, config, and entry for the original pipeline
+- [**Security**](docs/architecture/security.md) · Sandboxing, what not to mount
+- [**Agent sandbox**](docs/architecture/agent-sandbox.md) · gVisor isolation + egress allowlist for every agent
+- [**Best practices**](docs/research/best-practices.md) · Field-tested principles: verification, severity, iteration, large codebases
+- [**Prompting**](docs/research/prompting.md) · Prompting the model for defensive security tasks
+- [**Threat model**](docs/architecture/threat-model.md) · Why a threat model cuts false positives, and the `/threat-model` skill
+- [**Detection & response**](docs/detection-response/detection-response.md) · Hunting an attacker already in the logs; the D&R skills and pipeline
+- [**Customize**](docs/guides/customizing.md) · Port to my stack; which files change and why
+- [**Kernel validation**](docs/kernel/kernel-validation.md) · Validate Linux-kernel static-analysis reports via QEMU/KVM + `targets/kernelval` (CVE-2025-40019 record, fixes, reproduction)
+- [**Experimental targets**](docs/research/experimental-target-selection.md) · Select C/Rust projects and configure Sanitizer-based end-to-end experiments
+- [**Patching**](docs/research/patching.md) · Generate and verify fixes for verified crashes
+- [**Other use cases**](docs/guides/other-use-cases.md) · Binary analysis, embedded, bug chains, threat intel
+- [**Troubleshooting**](docs/guides/troubleshooting.md) · Duplicates, rate limits, subagent model pinning
 - [**Safeguards**](https://support.claude.com/en/articles/14604842-real-time-cyber-safeguards-on-claude) · Block for dangerous cyber work
 
 ---
@@ -170,7 +188,7 @@ Running the pipeline is simple:
 # One-time setup
 python3 -m venv .venv && .venv/bin/pip install -e .
 ./scripts/setup_sandbox.sh   # installs gVisor, builds the agent images, and verifies isolation; note: requires Docker
-export ANTHROPIC_API_KEY=sk-ant-...   # or CLAUDE_CODE_OAUTH_TOKEN, or Bedrock — see docs/agent-sandbox.md
+export ANTHROPIC_API_KEY=sk-ant-...   # or CLAUDE_CODE_OAUTH_TOKEN, or Bedrock — see docs/architecture/agent-sandbox.md
 
 # Run the recon → find → verify → report loop
 bin/vp-sandboxed run drlibs --model <model-id> --runs 3 --parallel --stream --auto-focus
@@ -188,8 +206,8 @@ the `--stream` flag, the first report will appear in minutes under `reports/bug_
 > ⚠️ **`run` spawns autonomous agents.** The pipeline runs each agent
 > inside a gVisor container with egress restricted to the Claude API.
 > Agent-spawning subcommands refuse to start outside it unless explicitly 
-> overridden. For more information, see [docs/security.md](docs/security.md)
-> and [docs/agent-sandbox.md](docs/agent-sandbox.md).
+> overridden. For more information, see [docs/architecture/security.md](docs/architecture/security.md)
+> and [docs/architecture/agent-sandbox.md](docs/architecture/agent-sandbox.md).
 
 Under the hood, the pipeline walks through seven stages:
 
@@ -220,7 +238,7 @@ fix, and a grader agent confirms that the new code builds, that the original
 proof of concept input no longer crashes, that the target's test suite still 
 passes, and that a fresh find agent can't find a way around the fix.
 
-For more details, see [docs/pipeline.md](docs/pipeline.md).
+For more details, see [docs/architecture/pipeline.md](docs/architecture/pipeline.md).
 
 ### Step 3 (Days 3-5): Customize the pipeline for your target
 
@@ -267,7 +285,7 @@ set up. Validate it with a smoke run of the pipeline before scaling up.
 bin/vp-sandboxed run my-service --model <model-id> --runs 1
 ```
 
-For more details, see [docs/customizing.md](docs/customizing.md).
+For more details, see [docs/guides/customizing.md](docs/guides/customizing.md).
 
 ### Step 4 (Week 2): Start autonomous scanning, triage, and patching
 
@@ -311,8 +329,8 @@ judgments about your environment, and verified patches are not always
 upstreamable. Many partners have reported these steps as their current
 bottlenecks, and you should budget real engineering time for them.
 
-For more details, see [docs/triage.md](docs/triage.md) and 
-[docs/patching.md](docs/patching.md).
+For more details, see [docs/research/triage.md](docs/research/triage.md) and
+[docs/research/patching.md](docs/research/patching.md).
 
 ### Step 5 (Optional): Detection & response
 
@@ -343,7 +361,7 @@ bin/vp-sandboxed dnr-pipeline run targets/dnrcanary --model <model-id>
 Confirmed vulnerabilities flow into the same `/triage` → `/patch` loop as
 the static track.
 
-→ Deeper: [docs/detection-response.md](docs/detection-response.md)
+→ Deeper: [docs/detection-response/detection-response.md](docs/detection-response/detection-response.md)
 
 ## Looking Forward
 

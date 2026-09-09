@@ -40,7 +40,7 @@ for binaries, httpx for web surface — or just ask the model what it
 wants for *this* target. Letting it write small tools of its own is
 often cheaper than wiring up an MCP server.
 
-→ Related: [threat-model.md](threat-model.md) · [pipeline.md](pipeline.md)
+→ Related: [threat-model.md](../architecture/threat-model.md) · [pipeline.md](../architecture/pipeline.md)
 
 ## Verification: the load-bearing component
 
@@ -77,7 +77,7 @@ argument, so route those to a single reviewer at a higher bar.
 <a id="judge"></a>
 **Use a judge agent to cut false positives.** A finder writes a report; a critic writes a critique; a judge adjudicates between the two. The judge is token-cheap: it only reads the finder's and critic's reports. This same pattern can be used to handle severity inflation: a skeptical second-pass judge, asked directly whether the rating is inflated, reliably downgrades. `/triage` packages this loop.
 
-→ Related: [pipeline.md](pipeline.md) · [triage.md](triage.md)
+→ Related: [pipeline.md](../architecture/pipeline.md) · [triage.md](triage.md)
 
 ## Severity and triage
 
@@ -98,7 +98,7 @@ for why. We have seen instances where the model gets significant percentages of 
 - tell it to write this tool itself on the fly
 - treat the vector as the model's output and calculate the score yourself in post-processing
 
-→ Related: [triage.md](triage.md) · [other-use-cases.md](other-use-cases.md)
+→ Related: [triage.md](triage.md) · [other-use-cases.md](../guides/other-use-cases.md)
 
 ## Patching
 
@@ -182,7 +182,7 @@ are often the same surfaces the scan missed.
 
 **Pull dependencies in via a wishlist, not a full mount.** A common type of false positive is a real code path mitigated one layer up, like a sanitizer in a calling service the model hasn't read. For dependencies the agent shouldn't have unrestricted access to, let it return a list of modules it wants, provide the ones you're comfortable with, then rerun. The agent gets exactly what it needs without you mounting the whole dependency tree.
 
-→ Related: [threat-model.md](threat-model.md) · [pipeline.md](pipeline.md)
+→ Related: [threat-model.md](../architecture/threat-model.md) · [pipeline.md](../architecture/pipeline.md)
 
 ## Unattended runs: supervision and containment
 
@@ -211,7 +211,7 @@ runs in a **separate context** from the worker — one session does one
 thing well, and the supervisor's only job is keeping the worker on
 track.
 
-→ Related: [security.md](security.md)
+→ Related: [security.md](../architecture/security.md)
 
 ## Open-source targets
 
@@ -264,7 +264,7 @@ and can help. Their [AI finder
 guide](https://github.com/alpha-omega-security/ai-finder-guide) covers
 each of the points above in more depth.
 
-→ Related: [threat-model.md](threat-model.md)
+→ Related: [threat-model.md](../architecture/threat-model.md)
 
 <a id="detection-and-response"></a>
 ## Detection & response
@@ -357,4 +357,4 @@ actions are irreversible and context-heavy in ways logs don't capture
 behind it. The agent's job is to make the human's decision fast and
 well-evidenced, not to make it.
 
-→ Related: [detection-response.md](detection-response.md)
+→ Related: [detection-response.md](../detection-response/detection-response.md)

@@ -6,13 +6,32 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import contextmanager
 from unittest.mock import AsyncMock, patch
+
+import pytest
 
 from harness.agent import AgentResult
 from harness.artifacts import PatchVerdict
 from harness.patch import _failed_tier, run_patch
 
 from tests.test_patch_grade import ALPHA_CRASH, CANARY
+
+
+@pytest.fixture(autouse=True)
+def fake_patch_agent_container(monkeypatch):
+    """Keep patch-loop unit tests independent of Docker image availability."""
+    @contextmanager
+    def _container(*_args, **_kwargs):
+        yield "c"
+
+    monkeypatch.setattr("harness.patch.sandbox.agent_container", _container)
+
+    async def _direct_to_thread(func, /, *args, **kwargs):
+        """Run mocked Docker calls inline for deterministic unit tests."""
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", _direct_to_thread)
 
 
 def _agent_emitting(text: str) -> AgentResult:

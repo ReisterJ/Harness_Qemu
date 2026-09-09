@@ -8,7 +8,7 @@ containment/remediation/recovery plan. The lead-in-hand entry to the
 detection & response track — pairs with `/dnr-hunt` (no-alert hunting) and
 feeds `/triage` → `/patch`; demo target: `targets/dnrcanary`. For how the
 track fits together, see
-[docs/detection-response.md](../../../docs/detection-response.md).
+[docs/detection-response/detection-response.md](../../../docs/detection-response/detection-response.md).
 
 ## Requirements
 

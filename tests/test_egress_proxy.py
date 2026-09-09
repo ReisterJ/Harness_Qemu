@@ -90,6 +90,18 @@ PAYLOAD = b"x" * (8 * 1024 * 1024)  # past the size where the old relay died
 UPSTREAM_HOLD_S = 1.0  # upstream reads nothing this long, forcing buffers full
 
 
+def _loopback_socket_available() -> bool:
+    try:
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+    except OSError:
+        return False
+    return True
+
+
+LOOPBACK_SOCKET_AVAILABLE = _loopback_socket_available()
+
+
 def _free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -168,6 +180,10 @@ def _slow_upstream(port: int, result: dict, ready: threading.Event) -> None:
     srv.close()
 
 
+@pytest.mark.skipif(
+    not LOOPBACK_SOCKET_AVAILABLE,
+    reason="loopback sockets are unavailable in this test environment",
+)
 def test_large_upload_survives_backpressure(proxy):
     proxy_port, upstream_port = proxy
     result: dict = {}
@@ -198,6 +214,10 @@ def test_large_upload_survives_backpressure(proxy):
     assert reply == f"OK:{len(PAYLOAD)}".encode()
 
 
+@pytest.mark.skipif(
+    not LOOPBACK_SOCKET_AVAILABLE,
+    reason="loopback sockets are unavailable in this test environment",
+)
 def test_unlisted_host_is_denied(proxy):
     proxy_port, _ = proxy
     c, status = _connect_through(proxy_port, "127.0.0.1:1")
@@ -252,6 +272,10 @@ def _hold_upstream(
     srv.close()
 
 
+@pytest.mark.skipif(
+    not LOOPBACK_SOCKET_AVAILABLE,
+    reason="loopback sockets are unavailable in this test environment",
+)
 def test_idle_tunnel_is_reaped(proxy_short_timeout):
     # totally silent in both directions → the shared deadline expires and
     # the proxy closes the tunnel (a peer that died without a FIN must not
@@ -274,6 +298,10 @@ def test_idle_tunnel_is_reaped(proxy_short_timeout):
     t.join(timeout=10)
 
 
+@pytest.mark.skipif(
+    not LOOPBACK_SOCKET_AVAILABLE,
+    reason="loopback sockets are unavailable in this test environment",
+)
 def test_one_way_stream_outlives_idle_deadline(proxy_short_timeout):
     # the client is legitimately silent while a response streams back for
     # longer than the idle deadline; traffic in EITHER direction must

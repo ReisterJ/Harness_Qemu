@@ -9,7 +9,9 @@ that sandbox: read source, run the binary, write PoC files, nothing else.
 from __future__ import annotations
 
 import os
+import selectors
 import subprocess
+import time
 
 
 def build_network_args() -> list[str]:
@@ -26,12 +28,69 @@ def build_network_args() -> list[str]:
     return ["--network", v] if v else []
 
 
-def build(dockerfile_dir: str, tag: str) -> str:
-    """Build a docker image from a directory containing a Dockerfile."""
-    subprocess.run(
-        ["docker", "build", *build_network_args(), "-t", tag, dockerfile_dir],
-        check=True,
-    )
+def build(
+    dockerfile_dir: str,
+    tag: str,
+    *,
+    log_path: str | None = None,
+    timeout: int | None = None,
+) -> str:
+    """Build a docker image from a directory containing a Dockerfile.
+
+    The existing callers only need the blocking two-argument form.  Build
+    workflows can additionally provide ``log_path`` and ``timeout``: output is
+    streamed to the terminal and persisted, while a hung build is terminated
+    after the requested number of seconds.
+    """
+    cmd = ["docker", "build", *build_network_args(), "-t", tag, dockerfile_dir]
+    if log_path is None and timeout is None:
+        subprocess.run(cmd, check=True)
+        return tag
+
+    log_file = open(log_path, "wb") if log_path else None
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    except Exception:
+        if log_file:
+            log_file.close()
+        raise
+    assert proc.stdout is not None
+    selector = selectors.DefaultSelector()
+    selector.register(proc.stdout, selectors.EVENT_READ)
+    started = time.monotonic()
+    try:
+        while True:
+            remaining = None if timeout is None else timeout - (time.monotonic() - started)
+            if remaining is not None and remaining <= 0:
+                proc.kill()
+                proc.wait()
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            events = selector.select(0.5 if remaining is None else min(0.5, remaining))
+            if not events:
+                if proc.poll() is not None:
+                    break
+                continue
+            for key, _ in events:
+                chunk = key.fileobj.read1(64 * 1024)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                if log_file:
+                    log_file.write(chunk)
+                    log_file.flush()
+                print(chunk.decode("utf-8", errors="replace"), end="", flush=True)
+            if proc.poll() is not None and not selector.get_map():
+                break
+        returncode = proc.wait()
+    finally:
+        selector.close()
+        if log_file:
+            log_file.close()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    if returncode != 0:
+        raise subprocess.CalledProcessError(returncode, cmd)
     return tag
 
 

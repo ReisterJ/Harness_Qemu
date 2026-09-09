@@ -7,7 +7,7 @@ ledger, confirms suspects in source, fires a local PoC, and writes
 detection & response track — pairs with `/dnr-respond` (lead-in-hand
 workup) and feeds `/triage` → `/patch`; demo target: `targets/dnrcanary`.
 For how the track fits together, see
-[docs/detection-response.md](../../../docs/detection-response.md).
+[docs/detection-response/detection-response.md](../../../docs/detection-response/detection-response.md).
 
 ## Requirements
 

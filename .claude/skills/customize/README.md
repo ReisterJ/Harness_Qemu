@@ -5,7 +5,7 @@ language, vulnerability class, detection mechanism, or target shape. It
 reads the pipeline source, interviews you about your target, presents a
 migration plan, and executes the edits after you approve. For when to
 reach for it and what porting involves, see
-[docs/customizing.md](../../../docs/customizing.md).
+[docs/guides/customizing.md](../../../docs/guides/customizing.md).
 
 ## Requirements
 
@@ -30,7 +30,7 @@ signal, PoC shape, grading criteria), presents a file-by-file plan, waits
 for your explicit approval, then executes and validates.
 
 Setup variants — including running the port outside Claude Code — are
-covered in [docs/customizing.md](../../../docs/customizing.md).
+covered in [docs/guides/customizing.md](../../../docs/guides/customizing.md).
 
 ## Output
 

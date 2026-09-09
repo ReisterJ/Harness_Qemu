@@ -151,6 +151,6 @@ After writing the file, print to the user:
 
 ## References
 
-- [docs/security.md](../../../docs/security.md) and
-  [docs/prompting.md](../../../docs/prompting.md) for the engagement-context
+- [docs/architecture/security.md](../../../docs/architecture/security.md) and
+  [docs/research/prompting.md](../../../docs/research/prompting.md) for the engagement-context
   and authorization framing this skill inherits.
