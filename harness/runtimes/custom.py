@@ -15,3 +15,8 @@ class CustomRuntime(RuntimeAdapter):
             raise RuntimeContractError(
                 "custom runtime requires runtime.plugin"
             )
+
+    def probe(self, session) -> None:
+        raise RuntimeContractError(
+            "custom runtime plugin is not registered; cannot run the build probe"
+        )

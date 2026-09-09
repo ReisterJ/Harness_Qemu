@@ -22,3 +22,18 @@ class ProcessRuntime(RuntimeAdapter):
             raise RuntimeContractError(
                 "process runtime requires runtime.start.command"
             )
+
+    def probe(self, session) -> None:
+        # A process may require input and is therefore not launched blindly.
+        # A generated target can opt into a safe, non-mutating probe command.
+        spec = session.runtime.get("probe")
+        if not spec:
+            return
+        command = spec.get("command") if isinstance(spec, dict) else spec
+        if not isinstance(command, str) or not command.strip():
+            raise RuntimeContractError("runtime.probe must contain a command")
+        rc, _out, err = session.exec(command, timeout=60)
+        if rc:
+            raise RuntimeContractError(
+                f"process runtime probe failed with exit {rc}: {err[-500:]}"
+            )

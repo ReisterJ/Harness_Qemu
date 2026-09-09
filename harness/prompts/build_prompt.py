@@ -163,6 +163,9 @@ Write these files below `/work/out`:
   runtime profile: `process`, `service`, or `qemu`; use `custom` only when a
   runtime plugin is explicitly available. The manifest must describe the
   artifact, lifecycle, external capabilities, detectors, and PoC replay mode.
+  For process targets, add a short non-mutating `runtime.probe.command` when
+  the artifact has a safe smoke-test invocation; do not use a command that
+  waits for attacker input.
 - `build-plan.json` — a concise machine-readable explanation with keys
   `kind`, `base_image`, `build_steps`, `entrypoint`, `runtime_dependencies`,
   and `notes`.

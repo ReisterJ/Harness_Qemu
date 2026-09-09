@@ -109,7 +109,7 @@ def validate_manifest(
 
     start = _mapping(runtime.get("start", {}), "runtime.start")
     _command(start.get("command"), "runtime.start.command", required=profile != "custom")
-    for section in ("ready", "reset", "stop", "exec", "replay", "collect"):
+    for section in ("probe", "ready", "reset", "stop", "exec", "replay", "collect"):
         value = runtime.get(section)
         if value is None:
             continue

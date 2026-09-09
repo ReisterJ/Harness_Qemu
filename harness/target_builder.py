@@ -499,10 +499,10 @@ def _probe_target(target: TargetConfig) -> None:
     """Run the minimum runtime-specific contract probe."""
     name = f"build_probe_{target.name}_{uuid.uuid4().hex[:8]}"
     manifest = target.manifest
-    profile = "legacy"
+    adapter = None
     if manifest is not None:
-        profile = manifest["runtime"]["profile"]
-        adapter_for(profile).validate(manifest)
+        adapter = adapter_for(manifest["runtime"]["profile"])
+        adapter.validate(manifest)
     try:
         docker_ops.run(
             target.image_tag,
@@ -513,13 +513,10 @@ def _probe_target(target: TargetConfig) -> None:
             network=target.agent_network or "none",
             devices=target.devices,
         )
-        paths = [(target.source_root, False)]
-        if profile in {"legacy", "process"}:
-            artifact_path = target.binary_path
-            if manifest is not None:
-                artifact_path = manifest["runtime"]["artifact"].get("path")
-            if artifact_path:
-                paths.append((artifact_path, True))
+        if adapter is None:
+            paths = [(target.source_root, False), (target.binary_path, True)]
+        else:
+            paths = adapter.required_paths(manifest)
         for path, executable in paths:
             test = "test -x" if executable else "test -e"
             rc, _out, err = docker_ops.exec_sh(name, f"{test} {shlex.quote(path)}")
@@ -528,16 +525,16 @@ def _probe_target(target: TargetConfig) -> None:
                 raise BuildError(
                     f"built image does not contain {adjective} path {path!r}: {err.strip()[:300]}"
                 )
-        if profile in {"service", "qemu"}:
-            session = RuntimeSession(name, profile, manifest)
+        if adapter is not None:
+            session = RuntimeSession(name, adapter.profile, manifest)
             try:
-                session.start()
+                adapter.probe(session)
             except RuntimeContractError as exc:
-                raise BuildError(f"{profile} runtime contract probe failed: {exc}") from exc
+                raise BuildError(
+                    f"{adapter.profile} runtime contract probe failed: {exc}"
+                ) from exc
             finally:
                 session.stop()
-        elif profile == "custom":
-            raise BuildError("custom runtime requires a runtime plugin before it can be probed")
     finally:
         docker_ops.rm(name)
 
