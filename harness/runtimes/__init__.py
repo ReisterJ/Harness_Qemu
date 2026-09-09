@@ -3,6 +3,7 @@
 """Runtime adapters selected by target-manifest.yaml."""
 
 from .base import RuntimeAdapter, RuntimeContractError
+from .custom import register_custom_runtime, unregister_custom_runtime
 from .registry import adapter_for, profiles
 from .session import RuntimeSession, open_runtime_session
 
@@ -13,4 +14,6 @@ __all__ = [
     "adapter_for",
     "open_runtime_session",
     "profiles",
+    "register_custom_runtime",
+    "unregister_custom_runtime",
 ]

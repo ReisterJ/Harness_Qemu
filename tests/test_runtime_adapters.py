@@ -5,7 +5,11 @@ from __future__ import annotations
 
 import pytest
 
-from harness.runtimes import adapter_for
+from harness.runtimes import (
+    adapter_for,
+    register_custom_runtime,
+    unregister_custom_runtime,
+)
 from harness.runtimes.base import RuntimeContractError
 
 
@@ -43,5 +47,43 @@ def test_qemu_adapter_reports_kernel_and_rootfs_paths():
 
 
 def test_custom_probe_is_an_explicit_blocker():
-    with pytest.raises(RuntimeContractError, match="plugin is not registered"):
-        adapter_for("custom").probe(object())
+    with pytest.raises(RuntimeContractError, match="not registered"):
+        adapter_for("custom").probe(
+            type(
+                "Session",
+                (),
+                {"manifest": {"runtime": {"plugin": "missing"}}},
+            )()
+        )
+
+
+def test_custom_plugin_is_host_registered_and_used():
+    calls: list[str] = []
+
+    class Plugin:
+        def validate(self, manifest):
+            calls.append("validate")
+
+        def required_paths(self, manifest):
+            calls.append("paths")
+            return [("/work/custom-artifact", False)]
+
+        def probe(self, session):
+            calls.append("probe")
+
+    manifest = {
+        "runtime": {
+            "profile": "custom",
+            "plugin": "example",
+            "start": {},
+        }
+    }
+    register_custom_runtime("example", Plugin())
+    try:
+        adapter = adapter_for("custom")
+        adapter.validate_profile(manifest)
+        assert adapter.required_paths(manifest) == [("/work/custom-artifact", False)]
+        adapter.probe(type("Session", (), {"manifest": manifest})())
+    finally:
+        unregister_custom_runtime("example")
+    assert calls == ["validate", "paths", "probe"]

@@ -14,6 +14,9 @@ from dataclasses import dataclass, field, asdict
 from typing import Any
 
 
+POC_KINDS = frozenset({"file", "command", "request", "program", "bundle"})
+
+
 @dataclass(frozen=True)
 class CrashArtifact:
     """A crash the find-agent claims to have produced. Not yet verified."""
@@ -24,14 +27,20 @@ class CrashArtifact:
     crash_output: str          # ASAN trace / stderr, truncated to 10K chars
     exit_code: int             # e.g. 134 (SIGABRT from ASAN)
     dup_check: str | None = None  # agent's reasoning that this isn't a known dup
+    poc_kind: str = "file"    # file, command, request, program, or bundle
 
     def to_dict(self) -> dict[str, Any]:
+        if self.poc_kind not in POC_KINDS:
+            raise ValueError(f"unsupported PoC kind: {self.poc_kind!r}")
         d = asdict(self)
         d["poc_bytes"] = base64.b64encode(self.poc_bytes).decode("ascii")
         return d
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> CrashArtifact:
+        poc_kind = d.get("poc_kind", "file")
+        if poc_kind not in POC_KINDS:
+            raise ValueError(f"unsupported PoC kind: {poc_kind!r}")
         return cls(
             poc_path=d["poc_path"],
             poc_bytes=base64.b64decode(d["poc_bytes"]),
@@ -40,6 +49,7 @@ class CrashArtifact:
             crash_output=d["crash_output"],
             exit_code=d["exit_code"],
             dup_check=d.get("dup_check"),
+            poc_kind=poc_kind,
         )
 
 

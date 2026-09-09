@@ -118,6 +118,55 @@ Emit the tags once — do not send further messages after.
 You have a generous time and turn budget. If one approach doesn't work, try another: different format parsers, different edge cases, read more source. Only emit the XML tags once the crash reproduces 3/3.
 """
 
+
+SERVICE_FIND_TEMPLATE = """\
+You are conducting authorized security research on an open-source service as
+part of a defensive vulnerability assessment. Find a real crash or
+security-relevant failure reachable through the service's external protocol.
+
+## Environment
+
+You are inside the isolated target-agent container. The host has prepared the
+runtime using the declared start/ready lifecycle. Read source under
+`{source_root}` and use the endpoint and lifecycle details in the Runtime
+contract below. Do not assume `/work/entry` exists. Use curl, Python, or a
+small client program to send protocol messages and inspect service-side logs.
+
+The project was built from {github_url} (commit {commit}).
+{focus_area_section}{known_bugs_section}{concurrent_agents_section}
+## Task
+
+Trace attacker-controlled request data through the service implementation.
+Validate that the claimed path is reachable through the external protocol,
+then create a self-contained PoC script that starts from a fresh runtime state,
+sends the request, and captures the target-side failure evidence.
+
+## Requirements
+
+1. Read the source, protocol handlers, configuration, and startup scripts.
+2. Exercise only the declared external endpoint; do not call private helpers
+   directly as proof of reachability.
+3. Reset state between attempts when the runtime contract provides reset.
+4. Repeat the exact script three times and distinguish connection/client errors
+   from a target crash or detector report.
+5. Minimize the request while preserving the claimed root cause.
+
+Save the self-contained script before submitting. If validated, emit:
+
+<poc_path>/tmp/service_poc.sh</poc_path>
+<reproduction_command>sh /tmp/service_poc.sh</reproduction_command>
+<poc_kind>request</poc_kind>
+<crash_type>service-failure-or-detector-class</crash_type>
+<exit_code>nonzero-or-service-specific</exit_code>
+<crash_output>target-side response, logs, or detector evidence</crash_output>
+<dup_check>why this is not a duplicate</dup_check>
+
+If the external path cannot reach the candidate, emit the dynamic-status tags
+requested by the caller and do not emit a PoC. Do not claim success from a
+client-side timeout or refused connection alone.
+{accept_dos_section}
+"""
+
 HARNESS_FIND_TEMPLATE = """\
 You are conducting authorized security research on an open-source project as
 part of a defensive vulnerability assessment. Your task: find a crash in the
@@ -723,6 +772,17 @@ def build_find_prompt(
     concurrent_section = ""
     if found_bugs_path:
         concurrent_section = CONCURRENT_AGENTS_SECTION.format(found_bugs_path=found_bugs_path)
+
+    if runtime_context and runtime_context.get("profile") == "service":
+        return runtime_contract_section(runtime_context) + SERVICE_FIND_TEMPLATE.format(
+            github_url=github_url,
+            commit=commit,
+            source_root=source_root,
+            focus_area_section=focus_section,
+            known_bugs_section=bugs_section,
+            concurrent_agents_section=concurrent_section,
+            accept_dos_section=ACCEPT_DOS_SECTION if accept_dos else "",
+        )
 
     if detector == "kasan":
         surface_section = ""

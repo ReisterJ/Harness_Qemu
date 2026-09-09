@@ -140,6 +140,39 @@ def test_find_prompt_without_known_bugs_has_no_blocks():
     assert "<untrusted_data" not in p
 
 
+def test_service_find_prompt_uses_endpoint_workflow():
+    p = build_find_prompt(
+        "https://github.com/x/y",
+        "abc123",
+        "/work/src",
+        "/bin/true",
+        runtime_context={
+            "profile": "service",
+            "endpoint": {"scheme": "http", "host": "127.0.0.1", "port": 8080},
+            "lifecycle": {"start": {"command": "/work/start"}},
+        },
+    )
+    assert "service" in p.lower()
+    assert "Do not assume `/work/entry`" in p
+    assert "<poc_kind>request</poc_kind>" in p
+
+
+def test_service_grade_prompt_is_not_process_only():
+    p = build_grade_prompt(
+        image_tag="img",
+        reproduction_command="sh /tmp/service_poc.sh",
+        reproduction_command_adapted="sh /tmp/poc.bin",
+        crash_type="service-failure",
+        exit_code=1,
+        source_root="/work/src",
+        workspace_poc="/tmp/poc.bin",
+        poc_kind="request",
+        runtime_context={"profile": "service", "endpoint": {"port": 8080}},
+    )
+    assert "strict grader verifying a PoC for a service target" in p
+    assert "PoC kind: request" in p
+
+
 def test_grade_prompt_wraps_find_claims_in_nonce_block():
     p = build_grade_prompt(
         image_tag="img",

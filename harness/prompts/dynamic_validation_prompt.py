@@ -85,7 +85,11 @@ they do not replace the existing PoC XML contract when a crash is found.
 
 If a crash is validated, include `<candidate_id>{safe_candidate_id}</candidate_id>`
 alongside the existing `<poc_path>`, `<reproduction_command>`, `<crash_type>`,
-`<exit_code>`, `<crash_output>`, and required `<dup_check>` tags. The final
+`<exit_code>`, `<crash_output>`, and required `<dup_check>` tags. Also include
+`<poc_kind>` with one of `file`, `command`, `request`, `program`, or `bundle`.
+Use `file` for a raw input, `request` for a service request represented by a
+self-contained script, `program` for a guest/userspace reproducer, and
+`bundle` for a multi-file archive. The final
 grader will independently verify the PoC, so never claim success without a
 saved, non-empty PoC and an exact reproduction command.
 """

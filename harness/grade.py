@@ -72,6 +72,7 @@ async def run_grade(
             reproduction_command_adapted=adapted_cmd,
             crash_type=crash.crash_type,
             exit_code=crash.exit_code,
+            poc_kind=crash.poc_kind,
             source_root=target.source_root,
             workspace_poc="/tmp/poc.bin",
             attack_surface=target.attack_surface,

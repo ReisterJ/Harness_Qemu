@@ -19,6 +19,19 @@ def test_crash_artifact_roundtrip():
     assert restored.poc_bytes == orig.poc_bytes  # bytes survived b64 round-trip
 
 
+def test_crash_artifact_roundtrip_preserves_request_kind():
+    orig = CrashArtifact(
+        poc_path="/tmp/service_poc.sh",
+        poc_bytes=b"#!/bin/sh\ncurl http://127.0.0.1:8080/\n",
+        reproduction_command="sh /tmp/service_poc.sh",
+        crash_type="service-failure",
+        crash_output="target log",
+        exit_code=1,
+        poc_kind="request",
+    )
+    assert CrashArtifact.from_dict(orig.to_dict()) == orig
+
+
 def test_crash_artifact_from_dict_missing_dup_check():
     # Older result.json files won't have this key
     d = CrashArtifact(

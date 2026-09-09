@@ -7,7 +7,7 @@ import time
 
 from . import docker_ops
 from .agent import AgentResult, parse_xml_tag, run_agent
-from .artifacts import CrashArtifact, DynamicValidationResult, StaticFinding
+from .artifacts import POC_KINDS, CrashArtifact, DynamicValidationResult, StaticFinding
 from .config import TargetConfig
 from .prompts.dynamic_validation_prompt import build_dynamic_validation_prompt
 from .runtimes import open_runtime_session
@@ -123,6 +123,15 @@ async def run_dynamic_validation(
             ), result, timings
 
         crash_type = parse_xml_tag(text, "crash_type") or "unknown"
+        poc_kind = parse_xml_tag(text, "poc_kind") or "file"
+        if poc_kind not in POC_KINDS:
+            return DynamicValidationResult(
+                candidate_id=selected_id,
+                status="invalid_submission",
+                reached_functions=reached,
+                reachability_evidence=reachability,
+                reason=f"unsupported poc_kind: {poc_kind}",
+            ), result, timings
         crash_output = (parse_xml_tag(text, "crash_output") or "")[:10_000]
         exit_code = _parse_exit_code(parse_xml_tag(text, "exit_code"))
         dup_check = parse_xml_tag(text, "dup_check")
@@ -134,6 +143,7 @@ async def run_dynamic_validation(
             crash_output=crash_output,
             exit_code=exit_code,
             dup_check=dup_check,
+            poc_kind=poc_kind,
         )
         return DynamicValidationResult(
             candidate_id=selected_id,
