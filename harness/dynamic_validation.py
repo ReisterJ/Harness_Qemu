@@ -64,6 +64,7 @@ async def run_dynamic_validation(
             reattack_harness=target.reattack_harness,
             attack_surface=target.attack_surface,
             detector=target.detector,
+            runtime_context=target.runtime_context(),
         )
         started = time.time()
         result = await run_agent(

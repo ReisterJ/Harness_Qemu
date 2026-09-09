@@ -74,6 +74,7 @@ async def run_grade(
             attack_surface=target.attack_surface,
             grade_reference=target.grade_reference,
             detector=target.detector,
+            runtime_context=target.runtime_context(),
         )
         t0 = time.time()
         result = await run_agent(

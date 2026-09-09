@@ -32,6 +32,7 @@ import yaml
 from . import agent_image, docker_ops, sandbox
 from .agent import AgentResult, run_agent
 from .config import TargetConfig
+from .manifest import MANIFEST_FILENAME, ManifestError, load_manifest
 from .prompts.build_prompt import BUILD_AGENT_SYSTEM_PROMPT, build_plan_prompt
 
 
@@ -336,17 +337,44 @@ def _normalize_config(context_dir: Path, lock: SourceLock, name: str) -> dict:
     return config
 
 
+def _normalize_manifest(context_dir: Path, lock: SourceLock, name: str) -> dict:
+    path = context_dir / MANIFEST_FILENAME
+    try:
+        manifest = load_manifest(path, require_identity=False)
+    except ManifestError as exc:
+        raise BuildError(f"invalid generated {MANIFEST_FILENAME}: {exc}") from exc
+    identity = manifest.setdefault("identity", {})
+    if not isinstance(identity, dict):
+        raise BuildError(f"generated {MANIFEST_FILENAME} identity must be a mapping")
+    # Repository identity is authoritative on the host, just like config.yaml.
+    identity.update({"name": name, "repository": lock.repo, "commit": lock.commit})
+    _yaml_write(path, manifest)
+    return manifest
+
+
 def validate_generated_context(context_dir: Path, *, name: str, lock: SourceLock) -> dict:
     """Validate model output before giving it to Docker."""
     dockerfile = context_dir / "Dockerfile"
     config_path = context_dir / "config.yaml"
     plan_path = context_dir / "build-plan.json"
+    manifest_path = context_dir / MANIFEST_FILENAME
     if not dockerfile.is_file():
         raise BuildError("generated context is missing Dockerfile")
     if not config_path.is_file():
         raise BuildError("generated context is missing config.yaml")
     if not plan_path.is_file():
         raise BuildError("generated context is missing build-plan.json")
+    try:
+        manifest = load_manifest(manifest_path, require_identity=True)
+    except ManifestError as exc:
+        raise BuildError(f"generated context has invalid {MANIFEST_FILENAME}: {exc}") from exc
+    identity = manifest["identity"]
+    if identity["name"] != name:
+        raise BuildError(f"generated {MANIFEST_FILENAME} has incorrect identity.name")
+    if identity["repository"] != lock.repo:
+        raise BuildError(f"generated {MANIFEST_FILENAME} has incorrect identity.repository")
+    if identity["commit"] != lock.commit:
+        raise BuildError(f"generated {MANIFEST_FILENAME} has incorrect identity.commit")
     dockerfile_text = dockerfile.read_text(errors="replace")
     if not _COPY_SOURCE_RE.search(dockerfile_text):
         raise BuildError("Dockerfile must COPY source/ into the image")
@@ -520,6 +548,7 @@ async def build_target(options: BuildOptions, auth: dict[str, str]) -> BuildResu
             raise BuildError(f"planner agent failed: {planner_result.error}")
         _write_agent_outputs(context_dir, outputs)
         _normalize_config(context_dir, lock, options.name)
+        _normalize_manifest(context_dir, lock, options.name)
         config = validate_generated_context(context_dir, name=options.name, lock=lock)
 
         build_attempts = 0
@@ -554,6 +583,7 @@ async def build_target(options: BuildOptions, auth: dict[str, str]) -> BuildResu
                     raise BuildError(f"repair agent failed: {repair_result.error}")
                 _write_agent_outputs(context_dir, outputs)
                 _normalize_config(context_dir, lock, options.name)
+                _normalize_manifest(context_dir, lock, options.name)
                 config = validate_generated_context(context_dir, name=options.name, lock=lock)
 
             build_attempts += 1

@@ -58,6 +58,30 @@ def _generated_context(tmp_path: Path, repo: str, commit: str) -> Path:
         '{"kind":"cli","base_image":"gcc:14","build_steps":[],'
         '"entrypoint":"/work/entry","runtime_dependencies":[],"notes":[]}'
     )
+    (context / "target-manifest.yaml").write_text(
+        "schema_version: 1\n"
+        "identity:\n"
+        "  name: demo\n"
+        f"  repository: {repo}\n"
+        f"  commit: {commit}\n"
+        "build:\n"
+        "  build_steps: []\n"
+        "runtime:\n"
+        "  profile: process\n"
+        "  source_root: /work/src\n"
+        "  artifact:\n"
+        "    kind: executable\n"
+        "    path: /work/entry\n"
+        "  start:\n"
+        "    command: /work/entry\n"
+        "  capabilities: [file_input, stdout, stderr, exit_code]\n"
+        "workflow:\n"
+        "  static_analysis: source\n"
+        "  dynamic_validation: process\n"
+        "  grade: process_replay\n"
+        "resources:\n"
+        "  devices: []\n"
+    )
     return context
 
 
@@ -147,6 +171,30 @@ def test_build_target_publishes_only_after_build_and_probe(tmp_path, monkeypatch
         Path("build-plan.json"): (
             b'{"kind":"cli","base_image":"gcc:14","build_steps":[],'
             b'"entrypoint":"/work/entry","runtime_dependencies":[],"notes":[]}'
+        ),
+        Path("target-manifest.yaml"): (
+            b"schema_version: 1\n"
+            b"identity:\n"
+            b"  name: demo\n"
+            b"  repository: https://example.invalid/demo.git\n"
+            b"  commit: abcdef1234567890\n"
+            b"build:\n"
+            b"  build_steps: []\n"
+            b"runtime:\n"
+            b"  profile: process\n"
+            b"  source_root: /work/src\n"
+            b"  artifact:\n"
+            b"    kind: executable\n"
+            b"    path: /work/entry\n"
+            b"  start:\n"
+            b"    command: /work/entry\n"
+            b"  capabilities: [file_input, stdout, stderr, exit_code]\n"
+            b"workflow:\n"
+            b"  static_analysis: source\n"
+            b"  dynamic_validation: process\n"
+            b"  grade: process_replay\n"
+            b"resources:\n"
+            b"  devices: []\n"
         ),
     }
 

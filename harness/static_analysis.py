@@ -92,6 +92,7 @@ async def run_static_analysis(
             focus_area=focus_area,
             known_bugs=known_bugs if known_bugs is not None else target.known_bugs,
             attack_surface=target.attack_surface,
+            runtime_context=target.runtime_context(),
         )
         started = time.time()
         result = await run_agent(

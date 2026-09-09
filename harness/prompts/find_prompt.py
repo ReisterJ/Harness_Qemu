@@ -8,6 +8,7 @@ in this prompt are local — no docker indirection.
 """
 
 from .untrusted import make_nonce, untrusted_block
+from .runtime_context import runtime_contract_section
 
 FIND_PROMPT_TEMPLATE = """\
 You are conducting authorized security research on an open-source project as
@@ -704,6 +705,7 @@ def build_find_prompt(
     reattack_harness: str | None = None,
     attack_surface: str | None = None,
     detector: str = "asan",
+    runtime_context: dict | None = None,
 ) -> str:
     focus_section = ""
     if focus_area:
@@ -726,7 +728,7 @@ def build_find_prompt(
         surface_section = ""
         if attack_surface:
             surface_section = ATTACK_SURFACE_SECTION.format(attack_surface=attack_surface)
-        return KERNEL_FIND_TEMPLATE.format(
+        return runtime_contract_section(runtime_context) + KERNEL_FIND_TEMPLATE.format(
             github_url=github_url,
             commit=commit,
             source_root=source_root,
@@ -742,7 +744,7 @@ def build_find_prompt(
         surface_section = ""
         if attack_surface:
             surface_section = ATTACK_SURFACE_SECTION.format(attack_surface=attack_surface)
-        return LITEOS_M_FIND_TEMPLATE.format(
+        return runtime_contract_section(runtime_context) + LITEOS_M_FIND_TEMPLATE.format(
             github_url=github_url,
             commit=commit,
             source_root=source_root,
@@ -757,7 +759,7 @@ def build_find_prompt(
         surface_section = ""
         if attack_surface:
             surface_section = ATTACK_SURFACE_SECTION.format(attack_surface=attack_surface)
-        return QEMU_ASAN_FIND_TEMPLATE.format(
+        return runtime_contract_section(runtime_context) + QEMU_ASAN_FIND_TEMPLATE.format(
             github_url=github_url,
             commit=commit,
             source_root=source_root,
@@ -769,7 +771,7 @@ def build_find_prompt(
         )
 
     if reattack_harness:
-        return HARNESS_FIND_TEMPLATE.format(
+        return runtime_contract_section(runtime_context) + HARNESS_FIND_TEMPLATE.format(
             github_url=github_url,
             commit=commit,
             source_root=source_root,
@@ -780,7 +782,7 @@ def build_find_prompt(
             concurrent_agents_section=concurrent_section,
             accept_dos_section=ACCEPT_DOS_SECTION if accept_dos else "",
         )
-    return FIND_PROMPT_TEMPLATE.format(
+    return runtime_contract_section(runtime_context) + FIND_PROMPT_TEMPLATE.format(
         github_url=github_url,
         commit=commit,
         source_root=source_root,

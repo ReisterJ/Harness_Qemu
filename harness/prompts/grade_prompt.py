@@ -7,6 +7,7 @@ never touched. Only the PoC bytes crossed the boundary.
 """
 
 from .untrusted import make_nonce, untrusted_block
+from .runtime_context import runtime_contract_section
 
 GRADE_PROMPT_TEMPLATE = """\
 You are a strict grader verifying a crash PoC.
@@ -266,10 +267,11 @@ def build_grade_prompt(
     attack_surface: str | None = None,
     grade_reference: str | None = None,
     detector: str = "asan",
+    runtime_context: dict | None = None,
 ) -> str:
     nonce = make_nonce()
     if detector == "kasan":
-        return KERNEL_GRADE_PROMPT_TEMPLATE.format(
+        return runtime_contract_section(runtime_context) + KERNEL_GRADE_PROMPT_TEMPLATE.format(
             reproduction_command_adapted=reproduction_command_adapted,
             find_claims_block=untrusted_block(
                 f"type={crash_type}, exit_code={exit_code}", nonce
@@ -280,7 +282,7 @@ def build_grade_prompt(
             nonce=nonce,
         )
     if detector == "qemu-asan":
-        return QEMU_ASAN_GRADE_PROMPT_TEMPLATE.format(
+        return runtime_contract_section(runtime_context) + QEMU_ASAN_GRADE_PROMPT_TEMPLATE.format(
             reproduction_command_adapted=reproduction_command_adapted,
             find_claims_block=untrusted_block(
                 f"type={crash_type}, exit_code={exit_code}", nonce
@@ -291,7 +293,7 @@ def build_grade_prompt(
             workspace_poc=workspace_poc,
             nonce=nonce,
         )
-    return GRADE_PROMPT_TEMPLATE.format(
+    return runtime_contract_section(runtime_context) + GRADE_PROMPT_TEMPLATE.format(
         image_tag=image_tag,
         reproduction_command=reproduction_command,
         reproduction_command_adapted=reproduction_command_adapted,

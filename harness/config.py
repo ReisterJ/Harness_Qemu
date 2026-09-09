@@ -13,8 +13,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import yaml
+
+from .manifest import MANIFEST_FILENAME, ManifestError, load_manifest
 
 
 @dataclass(frozen=True)
@@ -40,6 +43,7 @@ class TargetConfig:
     shm_size: str | None = None       # docker --shm-size
     memory_limit: str = "4g"          # docker --memory
     reattack_harness: str | None = None  # in-image script that runs every /poc/* and exits 1 on crash
+    manifest: dict[str, Any] | None = field(default=None, repr=False)
 
     @classmethod
     def load(cls, target_dir: str | Path) -> TargetConfig:
@@ -50,6 +54,14 @@ class TargetConfig:
 
         with open(config_path) as f:
             cfg = yaml.safe_load(f)
+
+        manifest = None
+        manifest_path = target_dir / MANIFEST_FILENAME
+        if manifest_path.exists():
+            try:
+                manifest = load_manifest(manifest_path, require_identity=False)
+            except ManifestError as exc:
+                raise ValueError(f"invalid {MANIFEST_FILENAME}: {exc}") from exc
 
         if cfg.get("kind") == "dnr":
             raise ValueError(
@@ -80,4 +92,32 @@ class TargetConfig:
             shm_size=cfg.get("shm_size"),
             memory_limit=cfg.get("memory_limit", "4g"),
             reattack_harness=cfg.get("reattack_harness"),
+            manifest=manifest,
         )
+
+    def runtime_context(self) -> dict[str, Any]:
+        """Return the validated runtime view used by agent prompts.
+
+        Existing hand-authored targets do not have a manifest yet. Their
+        legacy fields are projected into a conservative view so the prompt
+        migration does not change their execution behavior.
+        """
+        if self.manifest is not None:
+            from .runtimes import adapter_for
+
+            return adapter_for(self.manifest["runtime"]["profile"]).prompt_context(
+                self.manifest
+            )
+        return {
+            "profile": "legacy",
+            "source_root": self.source_root,
+            "artifact": {"kind": "executable", "path": self.binary_path},
+            "start": {"command": self.binary_path},
+            "capabilities": ["stdout", "stderr", "exit_code"],
+            "detection": {"detectors": [self.detector]},
+            "workflow": {
+                "static_analysis": "source",
+                "dynamic_validation": self.detector,
+                "grade": f"{self.detector}_replay",
+            },
+        }

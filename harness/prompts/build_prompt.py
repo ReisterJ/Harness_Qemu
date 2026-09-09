@@ -31,9 +31,10 @@ Rules:
    contain a COPY of `source/` into the image, normally as `/work/src/`; it
    must not use `git clone` or download a fresh copy of the target source.
 5. Keep the target usable by the existing vuln-pipeline contract. Put the
-   source and all analysis artifacts under `/work`, expose one executable at
-   `/work/entry` whenever the target is a CLI or library harness, and make the
-   configured `source_root` point at the source inside the image.
+   source and all analysis artifacts under `/work`. Choose the runtime profile
+   (`process`, `service`, or `qemu`) from the actual repository and express the
+   complete lifecycle in `target-manifest.yaml`; do not force every target into
+   `/work/entry`.
 6. Do not edit upstream source files to make them compile. If a library has no
    obvious executable entry point, create a small consumer harness under
    /work/out (for example `entry.c` or `entry.cpp`) and explain its API choice
@@ -74,6 +75,12 @@ Write these files below `/work/out`:
   `source_root`. Include a useful `build_command` when an in-container rebuild
   is possible, and include `focus_areas`/`attack_surface` when they can be
   inferred from the source.
+- `target-manifest.yaml` — the runtime contract consumed by later
+  find/dynamic-validation/grade stages. It must contain `schema_version: 1`,
+  `identity`, `build`, `runtime`, `workflow`, and `resources`. Select one
+  runtime profile: `process`, `service`, or `qemu`; use `custom` only when a
+  runtime plugin is explicitly available. The manifest must describe the
+  artifact, lifecycle, external capabilities, detectors, and PoC replay mode.
 - `build-plan.json` — a concise machine-readable explanation with keys
   `kind`, `base_image`, `build_steps`, `entrypoint`, `runtime_dependencies`,
   and `notes`.
@@ -87,12 +94,15 @@ like `COPY source/ /work/src/` and then build from `/work/src`.
 ## Required process
 
 1. Read the repository's documentation and build metadata.
-2. Inspect the real source/build files and identify the smallest supported
-   command that proves the compiled artifact can start.
-3. Generate all required files under `/work/out`.
-4. Re-read every generated file and check paths, shell quoting, and consistency
-   between `Dockerfile` and `config.yaml`.
-5. Write exactly one final response containing a `<build_summary>` tag with a
+2. Classify the target's build system and runtime shape. Languages are not
+   runtime profiles: Java, Go, Rust, Python, C and C++ can all use `process`,
+   while a web server uses `service` and a kernel uses `qemu`.
+3. Inspect the real source/build files and identify the smallest supported
+   command or lifecycle that proves the target can start and be interacted with.
+4. Generate all required files under `/work/out`.
+5. Re-read every generated file and check paths, shell quoting, and consistency
+   between `Dockerfile`, `config.yaml`, and `target-manifest.yaml`.
+6. Write exactly one final response containing a `<build_summary>` tag with a
    short summary. The files in `/work/out` are authoritative.
 
 {repair_instructions}

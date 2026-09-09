@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from .untrusted import make_nonce, untrusted_block
+from .runtime_context import runtime_contract_section
 
 
 STATIC_ANALYSIS_PROMPT = """\
@@ -102,6 +103,7 @@ def build_static_analysis_prompt(
     focus_area: str | None = None,
     known_bugs: list[str] | None = None,
     attack_surface: str | None = None,
+    runtime_context: dict | None = None,
 ) -> str:
     """Build the source-only prompt, isolating model-authored hints."""
     focus_section = (
@@ -137,4 +139,4 @@ def build_static_analysis_prompt(
         focus_section=focus_section,
         hints_section=hints_section,
         known_bugs_section=known_bugs_section,
-    )
+    ) + runtime_contract_section(runtime_context)

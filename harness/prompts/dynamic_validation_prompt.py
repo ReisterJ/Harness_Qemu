@@ -25,6 +25,7 @@ def build_dynamic_validation_prompt(
     reattack_harness: str | None = None,
     attack_surface: str | None = None,
     detector: str = "asan",
+    runtime_context: dict | None = None,
 ) -> str:
     """Reuse detector-specific runtime instructions and narrow them to a finding."""
     base = build_find_prompt(
@@ -39,6 +40,7 @@ def build_dynamic_validation_prompt(
         reattack_harness=reattack_harness,
         attack_surface=attack_surface,
         detector=detector,
+        runtime_context=runtime_context,
     )
     nonce = make_nonce()
     safe_candidate_id = re.sub(
