@@ -40,7 +40,9 @@ bin/vp-sandboxed run <name> --model <model>
 ```text
 获取并锁定源码
         ↓
-构建规划 agent 生成 Dockerfile/config/entry
+分类 agent 生成 target-classification.json
+        ↓
+构建规划 agent 读取分类结果并生成 Dockerfile/manifest/config/entry
         ↓
 宿主机执行 docker build
         ↓
@@ -56,6 +58,28 @@ bin/vp-sandboxed run <name> --model <model>
         ↓
 使用原始 run/find/grade 流程
 ```
+
+在正式构建前，可以只执行分类阶段：
+
+```bash
+vuln-pipeline inspect <name> \
+  --repo <url> \
+  [--branch <branch> | --ref <tag-or-commit>] \
+  --model <model>
+```
+
+分类结果和源码锁定信息保存在 `results/builds/<name>/<job-id>/`，包括：
+
+```text
+target-classification.json
+source.lock.yaml
+classification_transcript.jsonl
+status.json
+```
+
+正式 `build` 会重新获取并锁定一次仓库，以确保 Dockerfile 对应当前请求时的
+最新 commit；构建结果中的 `target-classification.json` 和 `build.json` 会保留
+这次分类决策。
 
 规划 agent 不直接访问 Docker daemon。Docker build 由宿主机调度；agent 与
 Docker build 之间通过任务目录、构建日志和结构化输出衔接。
@@ -236,6 +260,7 @@ targets/<name>/
 ├── support/
 ├── source/
 ├── source.lock.yaml
+├── target-classification.json
 └── build.json
 ```
 

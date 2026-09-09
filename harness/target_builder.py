@@ -90,6 +90,27 @@ class BuildOptions:
 
 
 @dataclass(frozen=True)
+class InspectOptions:
+    name: str
+    repo: str
+    branch: str | None
+    ref: str | None
+    model: str
+    builds_dir: Path
+    max_turns: int = BUILD_MAX_TURNS
+    git_timeout_s: int = 900
+
+
+@dataclass(frozen=True)
+class ClassificationResult:
+    name: str
+    job_id: str
+    job_dir: Path
+    source_lock: SourceLock
+    classification: dict
+
+
+@dataclass(frozen=True)
 class BuildResult:
     name: str
     job_id: str
@@ -314,6 +335,54 @@ async def _run_build_agent(
         )
         outputs = _collect_agent_outputs(container)
     return outputs, result
+
+
+async def _run_classification(
+    *,
+    name: str,
+    source_dir: Path,
+    output_dir: Path,
+    auth: dict[str, str],
+    model: str,
+    repo: str,
+    branch: str,
+    commit: str,
+    kind: str,
+    transcript_path: Path,
+    max_turns: int,
+    progress_prefix: str,
+) -> dict:
+    outputs, result = await _run_build_agent(
+        name=name,
+        source_dir=source_dir,
+        context_dir=None,
+        auth=auth,
+        model=model,
+        prompt=build_classification_prompt(
+            repo=repo,
+            branch=branch,
+            commit=commit,
+            kind=kind,
+        ),
+        transcript_path=transcript_path,
+        max_turns=max_turns,
+        progress_prefix=progress_prefix,
+        tools=["Read", "Write"],
+    )
+    if result.error:
+        raise BuildError(f"classification agent failed: {result.error}")
+    expected = {Path(CLASSIFICATION_FILENAME)}
+    if set(outputs) != expected:
+        produced = ", ".join(str(path) for path in sorted(outputs))
+        raise BuildError(
+            "classification agent must produce only "
+            f"{CLASSIFICATION_FILENAME}; got {produced or '(nothing)'}"
+        )
+    _write_agent_outputs(output_dir, outputs)
+    try:
+        return load_classification(output_dir / CLASSIFICATION_FILENAME)
+    except ClassificationError as exc:
+        raise BuildError(f"invalid {CLASSIFICATION_FILENAME}: {exc}") from exc
 
 
 def _write_agent_outputs(
@@ -581,6 +650,63 @@ def _publish(
         raise
 
 
+async def inspect_repository(
+    options: InspectOptions, auth: dict[str, str]
+) -> ClassificationResult:
+    """Materialize a repository and run only the classification phase."""
+    validate_target_name(options.name)
+    if options.max_turns <= 0:
+        raise BuildError("classification max turns must be positive")
+    job_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+    job_dir = (options.builds_dir / options.name / job_id).resolve()
+    source_dir = job_dir / "source"
+    status_path = job_dir / "status.json"
+    job_dir.mkdir(parents=True, exist_ok=False)
+    _status(status_path, "cloning", name=options.name, repo=options.repo)
+    try:
+        lock = materialize_source(
+            options.repo,
+            source_dir,
+            branch=options.branch,
+            ref=options.ref,
+            timeout=options.git_timeout_s,
+        )
+        _yaml_write(job_dir / "source.lock.yaml", lock.to_dict())
+        _status(status_path, "classifying", commit=lock.commit)
+        classification = await _run_classification(
+            name=options.name,
+            source_dir=source_dir,
+            output_dir=job_dir,
+            auth=auth,
+            model=options.model,
+            repo=lock.repo,
+            branch=lock.branch or options.branch or "",
+            commit=lock.commit,
+            kind="auto",
+            transcript_path=job_dir / "classification_transcript.jsonl",
+            max_turns=options.max_turns,
+            progress_prefix=f"[inspect:{options.name}]",
+        )
+        _status(
+            status_path,
+            "succeeded",
+            commit=lock.commit,
+            runtime_profile=classification["runtime"]["profile"],
+        )
+        return ClassificationResult(
+            name=options.name,
+            job_id=job_id,
+            job_dir=job_dir,
+            source_lock=lock,
+            classification=classification,
+        )
+    except Exception as exc:
+        _status(status_path, "failed", error=f"{type(exc).__name__}: {exc}")
+        if isinstance(exc, BuildError):
+            raise
+        raise BuildError(f"repository inspection failed: {type(exc).__name__}: {exc}") from exc
+
+
 async def build_target(options: BuildOptions, auth: dict[str, str]) -> BuildResult:
     """Run the complete host/agent/host build workflow."""
     validate_target_name(options.name)
@@ -621,37 +747,20 @@ async def build_target(options: BuildOptions, auth: dict[str, str]) -> BuildResu
         image_tag = image_tag_for(options.name, lock.commit)
         _status(status_path, "classifying", commit=lock.commit, image_tag=image_tag)
 
-        classification_outputs, classification_result = await _run_build_agent(
+        classification = await _run_classification(
             name=options.name,
             source_dir=source_dir,
-            context_dir=None,
+            output_dir=context_dir,
             auth=auth,
             model=options.model,
-            prompt=build_classification_prompt(
-                repo=lock.repo,
-                branch=lock.branch or options.branch or "",
-                commit=lock.commit,
-                kind=options.kind,
-            ),
+            repo=lock.repo,
+            branch=lock.branch or options.branch or "",
+            commit=lock.commit,
+            kind=options.kind,
             transcript_path=job_dir / "classification_transcript.jsonl",
             max_turns=options.max_turns,
             progress_prefix=f"[build:{options.name}:classify]",
-            tools=["Read", "Write"],
         )
-        if classification_result.error:
-            raise BuildError(f"classification agent failed: {classification_result.error}")
-        expected_classification = {Path(CLASSIFICATION_FILENAME)}
-        if set(classification_outputs) != expected_classification:
-            produced = ", ".join(str(path) for path in sorted(classification_outputs))
-            raise BuildError(
-                "classification agent must produce only "
-                f"{CLASSIFICATION_FILENAME}; got {produced or '(nothing)'}"
-            )
-        _write_agent_outputs(context_dir, classification_outputs)
-        try:
-            classification = load_classification(context_dir / CLASSIFICATION_FILENAME)
-        except ClassificationError as exc:
-            raise BuildError(f"invalid {CLASSIFICATION_FILENAME}: {exc}") from exc
         _status(
             status_path,
             "planning",
@@ -777,6 +886,7 @@ async def build_target(options: BuildOptions, auth: dict[str, str]) -> BuildResu
             "image_tag": image_tag,
             "agent_image_tag": agent_tag,
             "kind": options.kind,
+            "classification": classification,
             "build_attempts": build_attempts,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }

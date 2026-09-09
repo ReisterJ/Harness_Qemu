@@ -11,9 +11,11 @@ import pytest
 from harness.target_builder import (
     BuildError,
     BuildOptions,
+    InspectOptions,
     SourceLock,
     _write_agent_outputs,
     build_target,
+    inspect_repository,
     image_tag_for,
     materialize_source,
     tree_sha256,
@@ -280,3 +282,50 @@ def test_build_target_publishes_only_after_build_and_probe(tmp_path, monkeypatch
     assert json.loads((result.target_dir / "build.json").read_text())["commit"] == lock.commit
     assert json.loads((result.job_dir / "status.json").read_text())["status"] == "succeeded"
     assert result.job_dir.is_absolute()
+
+
+def test_inspect_repository_stops_after_classification(tmp_path, monkeypatch):
+    lock = SourceLock(
+        repo="https://example.invalid/demo.git",
+        branch="main",
+        ref=None,
+        commit="abcdef1234567890",
+        snapshot_sha256="0" * 64,
+    )
+
+    def fake_materialize(_repo, destination, **_kwargs):
+        destination.mkdir(parents=True)
+        (destination / "README.md").write_text("snapshot\n")
+        return lock
+
+    classification = (
+        b'{"schema_version":1,"project":{"kind":"service",'
+        b'"languages":["python"],"build_system":"pip",'
+        b'"rationale":"README documents an HTTP server"},'
+        b'"runtime":{"profile":"service","artifact_kind":"service",'
+        b'"rationale":"HTTP entry point"},"detection":{"detectors":["asan"]},'
+        b'"confidence":0.8,"evidence":["README.md"],"blockers":[]}'
+    )
+
+    async def fake_agent(**kwargs):
+        from harness.agent import AgentResult
+        assert kwargs["context_dir"] is None
+        return {Path("target-classification.json"): classification}, AgentResult()
+
+    monkeypatch.setattr("harness.target_builder.materialize_source", fake_materialize)
+    monkeypatch.setattr("harness.target_builder._run_build_agent", fake_agent)
+    result = asyncio.run(inspect_repository(
+        InspectOptions(
+            name="demo",
+            repo=lock.repo,
+            branch="main",
+            ref=None,
+            model="test-model",
+            builds_dir=tmp_path / "results" / "builds",
+        ),
+        {"ANTHROPIC_API_KEY": "test"},
+    ))
+
+    assert result.classification["runtime"]["profile"] == "service"
+    assert (result.job_dir / "target-classification.json").exists()
+    assert (result.job_dir / "status.json").read_text().find('"succeeded"') >= 0
