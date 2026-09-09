@@ -63,6 +63,20 @@ class TargetConfig:
             except ManifestError as exc:
                 raise ValueError(f"invalid {MANIFEST_FILENAME}: {exc}") from exc
 
+        manifest_runtime = (manifest or {}).get("runtime", {})
+        manifest_detection = (manifest or {}).get("detection", {})
+        manifest_resources = (manifest or {}).get("resources", {})
+        manifest_detectors = manifest_detection.get("detectors", [])
+        manifest_detector = (
+            manifest_detectors[0]
+            if isinstance(manifest_detectors, list) and manifest_detectors
+            else None
+        )
+        manifest_artifact = manifest_runtime.get("artifact") or {}
+        manifest_agent_prebuilt = (manifest.get("build", {}) if manifest else {}).get(
+            "agent_prebuilt", False
+        )
+
         if cfg.get("kind") == "dnr":
             raise ValueError(
                 f"target '{target_dir.name}' is a detection & response target "
@@ -76,21 +90,31 @@ class TargetConfig:
             image_tag=cfg["image_tag"],
             github_url=cfg["github_url"],
             commit=cfg["commit"],
-            binary_path=cfg["binary_path"],
-            source_root=cfg["source_root"],
+            binary_path=(
+                cfg.get("binary_path")
+                or manifest_artifact.get("path")
+                or "/bin/true"
+            ),
+            source_root=(
+                cfg.get("source_root")
+                or manifest_runtime.get("source_root")
+                or "/work"
+            ),
             focus_areas=cfg.get("focus_areas") or [],
             known_bugs=cfg.get("known_bugs") or [],
             attack_surface=cfg.get("attack_surface"),
-            detector=cfg.get("detector", "asan"),
-            devices=cfg.get("devices") or [],
+            detector=cfg.get("detector") or manifest_detector or "asan",
+            devices=cfg.get("devices") or manifest_resources.get("devices") or [],
             grade_reference=cfg.get("grade_reference"),
-            agent_prebuilt=bool(cfg.get("agent_prebuilt", False)),
+            agent_prebuilt=bool(cfg.get("agent_prebuilt", manifest_agent_prebuilt)),
             agent_network=cfg.get("agent_network"),
             build_command=cfg.get("build_command"),
             test_command=cfg.get("test_command"),
             build_timeout_s=cfg.get("build_timeout_s", 1800),
-            shm_size=cfg.get("shm_size"),
-            memory_limit=cfg.get("memory_limit", "4g"),
+            shm_size=cfg.get("shm_size") or manifest_resources.get("shm_size"),
+            memory_limit=cfg.get("memory_limit") or manifest_resources.get(
+                "memory", "4g"
+            ),
             reattack_harness=cfg.get("reattack_harness"),
             manifest=manifest,
         )

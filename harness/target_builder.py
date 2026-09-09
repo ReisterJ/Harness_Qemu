@@ -34,6 +34,9 @@ from .agent import AgentResult, run_agent
 from .config import TargetConfig
 from .manifest import MANIFEST_FILENAME, ManifestError, load_manifest
 from .prompts.build_prompt import BUILD_AGENT_SYSTEM_PROMPT, build_plan_prompt
+from .runtimes import adapter_for
+from .runtimes.base import RuntimeContractError
+from .runtimes.session import RuntimeSession
 
 
 BUILD_MAX_TURNS = 180
@@ -323,16 +326,41 @@ def _load_config(path: Path) -> dict:
 def _normalize_config(context_dir: Path, lock: SourceLock, name: str) -> dict:
     path = context_dir / "config.yaml"
     config = _load_config(path)
+    try:
+        manifest = load_manifest(context_dir / MANIFEST_FILENAME)
+    except ManifestError as exc:
+        raise BuildError(f"cannot normalize config without valid {MANIFEST_FILENAME}: {exc}") from exc
+    profile = manifest["runtime"]["profile"]
+    runtime = manifest["runtime"]
+    detection = manifest.get("detection") or {}
+    resources = manifest.get("resources") or {}
+    detectors = detection.get("detectors") or []
     # These values come from the host-side checkout, not from model output.
     # This prevents a planner from accidentally publishing a stale commit or
     # pointing the later workflow at a different repository.
     config["image_tag"] = image_tag_for(name, lock.commit)
     config["github_url"] = lock.repo
     config["commit"] = lock.commit
-    if not config.get("binary_path"):
-        raise BuildError("generated config.yaml is missing binary_path")
     if not config.get("source_root"):
-        raise BuildError("generated config.yaml is missing source_root")
+        config["source_root"] = runtime.get("source_root", "/work")
+    if not config.get("binary_path"):
+        artifact = runtime.get("artifact") or {}
+        if profile == "process" and not artifact.get("path"):
+            raise BuildError("process target is missing binary_path and runtime artifact.path")
+        config["binary_path"] = artifact.get("path", "/bin/true")
+    if detectors:
+        # The manifest is the authoritative classification. Rewrite the
+        # legacy projection so an agent typo cannot select the wrong prompt
+        # family for the later workflow.
+        config["detector"] = detectors[0]
+    if "devices" in resources:
+        config["devices"] = resources["devices"]
+    if "memory" in resources:
+        config["memory_limit"] = resources["memory"]
+    if "shm_size" in resources:
+        config["shm_size"] = resources["shm_size"]
+    if "agent_prebuilt" in manifest.get("build", {}):
+        config["agent_prebuilt"] = manifest["build"]["agent_prebuilt"]
     _yaml_write(path, config)
     return config
 
@@ -368,6 +396,10 @@ def validate_generated_context(context_dir: Path, *, name: str, lock: SourceLock
         manifest = load_manifest(manifest_path, require_identity=True)
     except ManifestError as exc:
         raise BuildError(f"generated context has invalid {MANIFEST_FILENAME}: {exc}") from exc
+    try:
+        adapter_for(manifest["runtime"]["profile"]).validate(manifest)
+    except RuntimeContractError as exc:
+        raise BuildError(f"generated runtime contract is invalid: {exc}") from exc
     identity = manifest["identity"]
     if identity["name"] != name:
         raise BuildError(f"generated {MANIFEST_FILENAME} has incorrect identity.name")
@@ -395,13 +427,31 @@ def validate_generated_context(context_dir: Path, *, name: str, lock: SourceLock
         value = config.get(key)
         if not isinstance(value, str) or not value.startswith("/"):
             raise BuildError(f"generated config.yaml {key!r} must be an absolute container path")
+    profile = manifest["runtime"]["profile"]
     if not bool(config.get("agent_prebuilt", False)):
-        for key in ("binary_path", "source_root"):
-            if not config[key].startswith("/work/"):
-                raise BuildError(
-                    f"generated config.yaml {key!r} must be under /work/ "
-                    "so the target-agent image can inherit it"
-                )
+        if not config["source_root"].startswith("/work/"):
+            raise BuildError(
+                "generated config.yaml 'source_root' must be under /work/ "
+                "so the target-agent image can inherit it"
+            )
+        if profile == "process" and not config["binary_path"].startswith("/work/"):
+            raise BuildError(
+                "generated process target config.yaml 'binary_path' must be under /work/ "
+                "so the target-agent image can inherit it"
+            )
+    runtime = manifest["runtime"]
+    manifest_source_root = runtime.get("source_root")
+    if manifest_source_root and config["source_root"] != manifest_source_root:
+        raise BuildError(
+            "config.yaml source_root disagrees with target-manifest.yaml runtime.source_root"
+        )
+    artifact = runtime.get("artifact") or {}
+    manifest_artifact_path = artifact.get("path")
+    if profile == "process" and manifest_artifact_path:
+        if config["binary_path"] != manifest_artifact_path:
+            raise BuildError(
+                "config.yaml binary_path disagrees with target-manifest.yaml runtime.artifact.path"
+            )
     try:
         plan = json.loads(plan_path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
@@ -421,18 +471,31 @@ def validate_generated_context(context_dir: Path, *, name: str, lock: SourceLock
 
 
 def _probe_target(target: TargetConfig) -> None:
-    """Check the two paths the existing agent workflow depends on."""
+    """Run the minimum runtime-specific contract probe."""
     name = f"build_probe_{target.name}_{uuid.uuid4().hex[:8]}"
+    manifest = target.manifest
+    profile = "legacy"
+    if manifest is not None:
+        profile = manifest["runtime"]["profile"]
+        adapter_for(profile).validate(manifest)
     try:
         docker_ops.run(
             target.image_tag,
             name=name,
-            network="none",
             memory=target.memory_limit,
             shell="/bin/sh",
             shm_size=target.shm_size,
+            network=target.agent_network or "none",
+            devices=target.devices,
         )
-        for path, executable in ((target.source_root, False), (target.binary_path, True)):
+        paths = [(target.source_root, False)]
+        if profile in {"legacy", "process"}:
+            artifact_path = target.binary_path
+            if manifest is not None:
+                artifact_path = manifest["runtime"]["artifact"].get("path")
+            if artifact_path:
+                paths.append((artifact_path, True))
+        for path, executable in paths:
             test = "test -x" if executable else "test -e"
             rc, _out, err = docker_ops.exec_sh(name, f"{test} {shlex.quote(path)}")
             if rc:
@@ -440,6 +503,16 @@ def _probe_target(target: TargetConfig) -> None:
                 raise BuildError(
                     f"built image does not contain {adjective} path {path!r}: {err.strip()[:300]}"
                 )
+        if profile in {"service", "qemu"}:
+            session = RuntimeSession(name, profile, manifest)
+            try:
+                session.start()
+            except RuntimeContractError as exc:
+                raise BuildError(f"{profile} runtime contract probe failed: {exc}") from exc
+            finally:
+                session.stop()
+        elif profile == "custom":
+            raise BuildError("custom runtime requires a runtime plugin before it can be probed")
     finally:
         docker_ops.rm(name)
 
@@ -547,8 +620,8 @@ async def build_target(options: BuildOptions, auth: dict[str, str]) -> BuildResu
         if planner_result.error:
             raise BuildError(f"planner agent failed: {planner_result.error}")
         _write_agent_outputs(context_dir, outputs)
-        _normalize_config(context_dir, lock, options.name)
         _normalize_manifest(context_dir, lock, options.name)
+        _normalize_config(context_dir, lock, options.name)
         config = validate_generated_context(context_dir, name=options.name, lock=lock)
 
         build_attempts = 0
@@ -582,8 +655,8 @@ async def build_target(options: BuildOptions, auth: dict[str, str]) -> BuildResu
                 if repair_result.error:
                     raise BuildError(f"repair agent failed: {repair_result.error}")
                 _write_agent_outputs(context_dir, outputs)
-                _normalize_config(context_dir, lock, options.name)
                 _normalize_manifest(context_dir, lock, options.name)
+                _normalize_config(context_dir, lock, options.name)
                 config = validate_generated_context(context_dir, name=options.name, lock=lock)
 
             build_attempts += 1

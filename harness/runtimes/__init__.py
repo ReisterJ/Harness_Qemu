@@ -4,5 +4,13 @@
 
 from .base import RuntimeAdapter, RuntimeContractError
 from .registry import adapter_for, profiles
+from .session import RuntimeSession, open_runtime_session
 
-__all__ = ["RuntimeAdapter", "RuntimeContractError", "adapter_for", "profiles"]
+__all__ = [
+    "RuntimeAdapter",
+    "RuntimeContractError",
+    "RuntimeSession",
+    "adapter_for",
+    "open_runtime_session",
+    "profiles",
+]

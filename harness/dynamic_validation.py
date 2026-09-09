@@ -5,11 +5,12 @@ from __future__ import annotations
 
 import time
 
-from . import docker_ops, sandbox
+from . import docker_ops
 from .agent import AgentResult, parse_xml_tag, run_agent
 from .artifacts import CrashArtifact, DynamicValidationResult, StaticFinding
 from .config import TargetConfig
 from .prompts.dynamic_validation_prompt import build_dynamic_validation_prompt
+from .runtimes import open_runtime_session
 
 _DYNAMIC_STATUSES = {
     "not_reached",
@@ -40,17 +41,13 @@ async def run_dynamic_validation(
     """Try to produce a ``CrashArtifact`` for one static candidate."""
     timings: dict[str, float] = {}
     mounts = [(str(found_bugs_path), "/tmp/found_bugs.jsonl")] if found_bugs_path else None
-    with sandbox.agent_container(
-        target.image_tag,
-        container_name,
-        agent_env,
-        memory=target.memory_limit,
-        shm_size=target.shm_size,
+    with open_runtime_session(
+        target,
+        container_name=container_name,
+        auth=agent_env,
         mounts=mounts,
-        network=target.agent_network,
-        devices=target.devices,
-        prebuilt=target.agent_prebuilt,
-    ) as container:
+    ) as session:
+        container = session.container
         prompt = build_dynamic_validation_prompt(
             candidate=candidate,
             github_url=target.github_url,

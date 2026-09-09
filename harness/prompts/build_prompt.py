@@ -71,10 +71,12 @@ Write these files below `/work/out`:
 - `Dockerfile` — builds from the supplied `source/` directory. It must not
   clone the repository or depend on files outside the Docker build context.
 - `config.yaml` — must contain `image_tag: {image_tag}`,
-  `github_url: {repo_yaml}`, `commit: {commit_yaml}`, `binary_path`, and
-  `source_root`. Include a useful `build_command` when an in-container rebuild
-  is possible, and include `focus_areas`/`attack_surface` when they can be
-  inferred from the source.
+  `github_url: {repo_yaml}`, `commit: {commit_yaml}`, and `source_root`.
+  Include `binary_path` when the selected runtime has a process artifact;
+  service and qemu targets must not invent a business binary just to satisfy
+  the legacy config. Include a useful `build_command` when an in-container
+  rebuild is possible, and include `focus_areas`/`attack_surface` when they
+  can be inferred from the source.
 - `target-manifest.yaml` — the runtime contract consumed by later
   find/dynamic-validation/grade stages. It must contain `schema_version: 1`,
   `identity`, `build`, `runtime`, `workflow`, and `resources`. Select one

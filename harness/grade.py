@@ -13,11 +13,12 @@ from __future__ import annotations
 import os
 import time
 
-from . import docker_ops, sandbox
+from . import docker_ops
 from .agent import run_agent, parse_xml_tag, AgentResult
 from .artifacts import CrashArtifact, GraderVerdict
 from .config import TargetConfig
 from .prompts.grade_prompt import build_grade_prompt
+from .runtimes import open_runtime_session
 
 
 GRADE_MAX_TURNS = 50
@@ -49,10 +50,12 @@ async def run_grade(
         )
 
     # Fresh agent container from the SAME image — find-agent never touched it.
-    with sandbox.agent_container(target.image_tag, container_name, agent_env,
-                                 network=target.agent_network,
-                                 devices=target.devices,
-                                 prebuilt=target.agent_prebuilt) as container:
+    with open_runtime_session(
+        target,
+        container_name=container_name,
+        auth=agent_env,
+    ) as session:
+        container = session.container
         # Only the PoC bytes cross the boundary. Substitute the path: the
         # find-agent saved to some arbitrary path; we write to a fixed one.
         docker_ops.write_file(container, "/tmp/poc.bin", crash.poc_bytes)

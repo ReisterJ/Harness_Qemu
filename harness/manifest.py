@@ -81,6 +81,8 @@ def validate_manifest(
         raise ManifestError("build.build_steps must be a list")
     if "generated_files" in build and not isinstance(build["generated_files"], list):
         raise ManifestError("build.generated_files must be a list")
+    if "agent_prebuilt" in build and not isinstance(build["agent_prebuilt"], bool):
+        raise ManifestError("build.agent_prebuilt must be a boolean")
 
     runtime = _mapping(manifest.get("runtime"), "runtime")
     profile = _string(runtime.get("profile"), "runtime.profile")
@@ -114,13 +116,29 @@ def validate_manifest(
         if isinstance(value, dict):
             if "command" in value:
                 _command(value["command"], f"runtime.{section}.command")
-            elif section in {"ready", "collect"}:
+            else:
+                if "path" in value:
+                    _absolute_path(value["path"], f"runtime.{section}.path")
+                if "signal" in value:
+                    _string(value["signal"], f"runtime.{section}.signal")
+                    if section == "ready" and "path" not in value:
+                        raise ManifestError(
+                            "runtime.ready.signal requires runtime.ready.path"
+                        )
+                if "port" in value:
+                    port = value["port"]
+                    if not isinstance(port, int) or not 1 <= port <= 65535:
+                        raise ManifestError(
+                            f"runtime.{section}.port must be an integer in 1..65535"
+                        )
+            if section in {"ready", "collect"} and not any(
+                key in value for key in ("command", "signal", "path", "port")
+            ):
                 # These sections may use a declarative signal/path instead of
                 # a shell command, especially for QEMU serial output.
-                if not any(key in value for key in ("signal", "path", "port")):
-                    raise ManifestError(
-                        f"runtime.{section} must define command, signal, path, or port"
-                    )
+                raise ManifestError(
+                    f"runtime.{section} must define command, signal, path, or port"
+                )
         else:
             _command(value, f"runtime.{section}")
 
@@ -133,9 +151,22 @@ def validate_manifest(
         if not isinstance(port, int) or not 1 <= port <= 65535:
             raise ManifestError("runtime.endpoint.port must be an integer in 1..65535")
 
+    detection = _mapping(manifest.get("detection", {}), "detection")
+    detectors = detection.get("detectors", [])
+    if not isinstance(detectors, list) or not all(
+        isinstance(x, str) and x.strip() for x in detectors
+    ):
+        raise ManifestError("detection.detectors must be a list of non-empty strings")
+
     capabilities = runtime.get("capabilities", [])
     if not isinstance(capabilities, list) or not all(isinstance(x, str) for x in capabilities):
         raise ManifestError("runtime.capabilities must be a list of strings")
+
+    ready_timeout = runtime.get("ready_timeout_s")
+    if ready_timeout is not None and (
+        not isinstance(ready_timeout, (int, float)) or ready_timeout <= 0
+    ):
+        raise ManifestError("runtime.ready_timeout_s must be positive")
 
     workflow = _mapping(manifest.get("workflow"), "workflow")
     for key in ("static_analysis", "dynamic_validation", "grade"):
@@ -145,6 +176,9 @@ def validate_manifest(
     devices = resources.get("devices", [])
     if not isinstance(devices, list) or not all(isinstance(x, str) for x in devices):
         raise ManifestError("resources.devices must be a list of strings")
+    for key in ("memory", "shm_size"):
+        if key in resources:
+            _string(resources[key], f"resources.{key}")
 
     return manifest
 

@@ -136,6 +136,33 @@ def test_validate_generated_context_rejects_wrong_commit(tmp_path):
         validate_generated_context(context, name="demo", lock=lock)
 
 
+def test_validate_generated_context_allows_service_compatibility_binary(tmp_path):
+    repo, commit = _local_repo(tmp_path)
+    context = _generated_context(tmp_path, str(repo), commit)
+    manifest_path = context / "target-manifest.yaml"
+    text = manifest_path.read_text()
+    text = text.replace("profile: process", "profile: service")
+    text = text.replace(
+        "  artifact:\n    kind: executable\n    path: /work/entry\n",
+        "  artifact:\n    kind: service\n",
+    )
+    text = text.replace(
+        "  start:\n    command: /work/entry\n",
+        "  start:\n    command: /work/start\n  ready:\n    command: /work/ready\n  reset:\n    command: /work/reset\n  endpoint:\n    scheme: http\n    host: 127.0.0.1\n    port: 8080\n",
+    )
+    text = text.replace("dynamic_validation: process", "dynamic_validation: service")
+    text = text.replace("grade: process_replay", "grade: service_replay")
+    manifest_path.write_text(text)
+    (context / "config.yaml").write_text(
+        f"image_tag: vuln-pipeline-demo:{commit[:12]}\n"
+        f"github_url: {repo}\ncommit: {commit}\n"
+        "binary_path: /bin/true\nsource_root: /work/src\n"
+    )
+    lock = type("Lock", (), {"repo": str(repo), "commit": commit})()
+    config = validate_generated_context(context, name="demo", lock=lock)
+    assert config["binary_path"] == "/bin/true"
+
+
 def test_agent_output_cannot_escape_context(tmp_path):
     with pytest.raises(BuildError, match="unsafe output path"):
         _write_agent_outputs(tmp_path, {Path("../Dockerfile"): b"bad"})

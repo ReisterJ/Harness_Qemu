@@ -44,8 +44,14 @@ class RuntimeAdapter(ABC):
             "profile": self.profile,
             "source_root": runtime.get("source_root"),
             "artifact": runtime.get("artifact", {}),
-            "start": runtime.get("start", {}),
+            "lifecycle": {
+                key: runtime[key]
+                for key in ("start", "ready", "exec", "reset", "replay", "collect", "stop")
+                if key in runtime
+            },
+            "endpoint": runtime.get("endpoint"),
             "capabilities": runtime.get("capabilities", []),
             "detection": manifest.get("detection", {}),
             "workflow": manifest.get("workflow", {}),
+            "resources": manifest.get("resources", {}),
         }
