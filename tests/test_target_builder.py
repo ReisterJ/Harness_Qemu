@@ -224,9 +224,24 @@ def test_build_target_publishes_only_after_build_and_probe(tmp_path, monkeypatch
             b"  devices: []\n"
         ),
     }
+    classification_outputs = {
+        Path("target-classification.json"): (
+            b'{"schema_version":1,"project":{"kind":"cli",'
+            b'"languages":["c"],"build_system":"make",'
+            b'"rationale":"README and Makefile define a CLI"},'
+            b'"runtime":{"profile":"process","artifact_kind":"executable",'
+            b'"rationale":"the project builds a command-line entry point"},'
+            b'"detection":{"detectors":["asan"]},"confidence":0.9,'
+            b'"evidence":["Makefile"],"blockers":[]}'
+        )
+    }
+    agent_calls = []
 
-    async def fake_agent(**_kwargs):
+    async def fake_agent(**kwargs):
         from harness.agent import AgentResult
+        agent_calls.append(kwargs)
+        if kwargs.get("tools") == ["Read", "Write"]:
+            return classification_outputs, AgentResult()
         return outputs, AgentResult()
 
     built = []
@@ -258,6 +273,9 @@ def test_build_target_publishes_only_after_build_and_probe(tmp_path, monkeypatch
     assert result.target_dir.is_dir()
     assert built and built[0][1] == "vuln-pipeline-demo:abcdef123456"
     assert (result.target_dir / "source" / "README.md").exists()
+    assert (result.target_dir / "target-classification.json").exists()
+    assert len(agent_calls) == 2
+    assert agent_calls[1]["context_dir"] is not None
     assert (result.target_dir / "source.lock.yaml").exists()
     assert json.loads((result.target_dir / "build.json").read_text())["commit"] == lock.commit
     assert json.loads((result.job_dir / "status.json").read_text())["status"] == "succeeded"

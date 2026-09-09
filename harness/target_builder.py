@@ -31,9 +31,19 @@ import yaml
 
 from . import agent_image, docker_ops, sandbox
 from .agent import AgentResult, run_agent
+from .classification import (
+    CLASSIFICATION_FILENAME,
+    ClassificationError,
+    load_classification,
+)
 from .config import TargetConfig
 from .manifest import MANIFEST_FILENAME, ManifestError, load_manifest
-from .prompts.build_prompt import BUILD_AGENT_SYSTEM_PROMPT, build_plan_prompt
+from .prompts.build_prompt import (
+    BUILD_AGENT_SYSTEM_PROMPT,
+    CLASSIFIER_AGENT_SYSTEM_PROMPT,
+    build_classification_prompt,
+    build_plan_prompt,
+)
 from .runtimes import adapter_for
 from .runtimes.base import RuntimeContractError
 from .runtimes.session import RuntimeSession
@@ -262,6 +272,7 @@ async def _run_build_agent(
     transcript_path: Path,
     max_turns: int,
     progress_prefix: str,
+    tools: list[str] | None = None,
 ) -> tuple[dict[Path, bytes], AgentResult]:
     """Run planner/repair agent and copy only /work/out back to the host."""
     image = agent_image.ensure_base()
@@ -293,20 +304,34 @@ async def _run_build_agent(
             model=model,
             transcript_path=str(transcript_path),
             progress_prefix=progress_prefix,
-            tools=["Read", "Write", "Bash"],
-            system_prompt=BUILD_AGENT_SYSTEM_PROMPT,
+            tools=tools or ["Read", "Write", "Bash"],
+            system_prompt=(
+                CLASSIFIER_AGENT_SYSTEM_PROMPT
+                if tools == ["Read", "Write"]
+                else BUILD_AGENT_SYSTEM_PROMPT
+            ),
             max_resume_attempts=5,
         )
         outputs = _collect_agent_outputs(container)
     return outputs, result
 
 
-def _write_agent_outputs(context_dir: Path, outputs: dict[Path, bytes]) -> None:
+def _write_agent_outputs(
+    context_dir: Path,
+    outputs: dict[Path, bytes],
+    *,
+    protected_paths: set[str] | None = None,
+) -> None:
     if not outputs:
         raise BuildError("build agent produced no files under /work/out")
     for relative, content in outputs.items():
         relative = _safe_output_path(relative.as_posix())
-        if relative.parts[0] in {"source", "source.lock.yaml", "build.log"}:
+        if relative.parts[0] in {
+            "source",
+            "source.lock.yaml",
+            "build.log",
+            *(protected_paths or set()),
+        }:
             raise BuildError(f"agent attempted to overwrite protected build input: {relative}")
         destination = context_dir / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -597,7 +622,47 @@ async def build_target(options: BuildOptions, auth: dict[str, str]) -> BuildResu
         _copy_source_to_context(source_dir, context_dir)
         _yaml_write(context_dir / "source.lock.yaml", lock.to_dict())
         image_tag = image_tag_for(options.name, lock.commit)
-        _status(status_path, "planning", commit=lock.commit, image_tag=image_tag)
+        _status(status_path, "classifying", commit=lock.commit, image_tag=image_tag)
+
+        classification_outputs, classification_result = await _run_build_agent(
+            name=options.name,
+            source_dir=source_dir,
+            context_dir=None,
+            auth=auth,
+            model=options.model,
+            prompt=build_classification_prompt(
+                repo=lock.repo,
+                branch=lock.branch or options.branch or "",
+                commit=lock.commit,
+                kind=options.kind,
+            ),
+            transcript_path=job_dir / "classification_transcript.jsonl",
+            max_turns=options.max_turns,
+            progress_prefix=f"[build:{options.name}:classify]",
+            tools=["Read", "Write"],
+        )
+        if classification_result.error:
+            raise BuildError(f"classification agent failed: {classification_result.error}")
+        expected_classification = {Path(CLASSIFICATION_FILENAME)}
+        if set(classification_outputs) != expected_classification:
+            produced = ", ".join(str(path) for path in sorted(classification_outputs))
+            raise BuildError(
+                "classification agent must produce only "
+                f"{CLASSIFICATION_FILENAME}; got {produced or '(nothing)'}"
+            )
+        _write_agent_outputs(context_dir, classification_outputs)
+        try:
+            classification = load_classification(context_dir / CLASSIFICATION_FILENAME)
+        except ClassificationError as exc:
+            raise BuildError(f"invalid {CLASSIFICATION_FILENAME}: {exc}") from exc
+        _status(
+            status_path,
+            "planning",
+            commit=lock.commit,
+            image_tag=image_tag,
+            project_kind=classification["project"]["kind"],
+            runtime_profile=classification["runtime"]["profile"],
+        )
 
         prompt = build_plan_prompt(
             repo=lock.repo,
@@ -605,11 +670,12 @@ async def build_target(options: BuildOptions, auth: dict[str, str]) -> BuildResu
             commit=lock.commit,
             kind=options.kind,
             image_tag=image_tag,
+            classification_path=f"/input/{CLASSIFICATION_FILENAME}",
         )
         outputs, planner_result = await _run_build_agent(
             name=options.name,
             source_dir=source_dir,
-            context_dir=None,
+            context_dir=context_dir,
             auth=auth,
             model=options.model,
             prompt=prompt,
@@ -619,7 +685,11 @@ async def build_target(options: BuildOptions, auth: dict[str, str]) -> BuildResu
         )
         if planner_result.error:
             raise BuildError(f"planner agent failed: {planner_result.error}")
-        _write_agent_outputs(context_dir, outputs)
+        _write_agent_outputs(
+            context_dir,
+            outputs,
+            protected_paths={CLASSIFICATION_FILENAME},
+        )
         _normalize_manifest(context_dir, lock, options.name)
         _normalize_config(context_dir, lock, options.name)
         config = validate_generated_context(context_dir, name=options.name, lock=lock)
@@ -640,6 +710,7 @@ async def build_target(options: BuildOptions, auth: dict[str, str]) -> BuildResu
                     kind=options.kind,
                     image_tag=image_tag,
                     repair_log=str(log_path),
+                    classification_path=f"/input/{CLASSIFICATION_FILENAME}",
                 )
                 outputs, repair_result = await _run_build_agent(
                     name=options.name,
@@ -654,7 +725,11 @@ async def build_target(options: BuildOptions, auth: dict[str, str]) -> BuildResu
                 )
                 if repair_result.error:
                     raise BuildError(f"repair agent failed: {repair_result.error}")
-                _write_agent_outputs(context_dir, outputs)
+                _write_agent_outputs(
+                    context_dir,
+                    outputs,
+                    protected_paths={CLASSIFICATION_FILENAME},
+                )
                 _normalize_manifest(context_dir, lock, options.name)
                 _normalize_config(context_dir, lock, options.name)
                 config = validate_generated_context(context_dir, name=options.name, lock=lock)
