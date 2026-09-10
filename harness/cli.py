@@ -66,6 +66,7 @@ from .target_builder import (
     build_target,
     InspectOptions,
     inspect_repository,
+    prepare_target_image,
 )
 from .auth import (  # noqa: F401
     resolve_auth_env as _resolve_auth_env,
@@ -717,7 +718,7 @@ async def _run_all(
     print(color(f"[build] Building {target.image_tag} from {target.dockerfile_dir} ...", "dim"))
     t0 = time.time()
     try:
-        docker_ops.build(target.dockerfile_dir, target.image_tag)
+        prepare_target_image(target, rebuild=True)
     except Exception as e:
         results_root.mkdir(parents=True, exist_ok=True)
         err = RunResult(
@@ -938,6 +939,10 @@ def main() -> int:
                          help="Where to publish the generated target (default: ./targets)")
     p_build.add_argument("--builds-dir", type=Path, default=Path("results/builds"),
                          help="Where to keep source, logs, and transcripts (default: ./results/builds)")
+    p_build.add_argument(
+        "--docker-params", type=Path, default=None, metavar="PATH",
+        help="Structured Docker build/run parameters (default: none; copied into the target)",
+    )
     p_build.add_argument("--force", action="store_true",
                          help="Replace an existing target only after the new build passes")
     p_build.add_argument("--dangerously-no-sandbox", dest="dangerously_no_sandbox",
@@ -958,6 +963,10 @@ def main() -> int:
     p_run.add_argument("--model", default=os.environ.get("VULN_PIPELINE_MODEL"),
                        help="Model string (required; or set VULN_PIPELINE_MODEL)")
     p_run.add_argument("--results-dir", default="./results", help="Output root")
+    p_run.add_argument(
+        "--docker-params", type=Path, default=None, metavar="PATH",
+        help="Override the target's docker-params.yaml for this run",
+    )
     p_run.add_argument("--resume", type=Path, default=None, metavar="DIR",
                        help="Resume a partially-completed batch dir (results/<target>/<ts>/). "
                             "Runs whose result.json reached a terminal status are skipped; "
@@ -1159,6 +1168,7 @@ def _cmd_build(args) -> int:
                 retries=args.build_retries,
                 timeout_s=args.build_timeout,
                 force=args.force,
+                docker_params_path=args.docker_params,
             ),
             agent_env,
         ))
@@ -1176,7 +1186,10 @@ def _cmd_build(args) -> int:
     print(f"  image:      {result.image_tag}")
     if result.agent_image_tag:
         print(f"  agent image: {result.agent_image_tag}")
-    print(f"  build log:  {result.job_dir}/build-{result.build_attempts}.log")
+    if result.build_attempts:
+        print(f"  build log:  {result.job_dir}/build-{result.build_attempts}.log")
+    else:
+        print("  build log:  prebuilt image (Docker build skipped)")
     print(f"  next:       vuln-pipeline run {args.name} --model {args.model}")
     return 0
 
@@ -1185,7 +1198,7 @@ def _cmd_run(args) -> int:
     # Resolve target
     try:
         target_dir = resolve_target_dir(args.target)
-        target = TargetConfig.load(target_dir)
+        target = TargetConfig.load(target_dir, docker_params_path=args.docker_params)
     except Exception as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -1273,7 +1286,7 @@ def _cmd_recon(args) -> int:
 
     print(color(f"[build] Building {target.image_tag} ...", "dim", sys.stderr), file=sys.stderr)
     try:
-        docker_ops.build(target.dockerfile_dir, target.image_tag)
+        prepare_target_image(target, rebuild=True)
     except Exception as e:
         print(f"error: build failed: {e}", file=sys.stderr)
         return 1
@@ -1481,9 +1494,14 @@ def _cmd_report(args) -> int:
 
     # Build if missing — we're likely on a host that already ran find+grade,
     # but `report` may run standalone against a copied results dir.
-    if not docker_ops.image_exists(target.image_tag):
+    if not (target.docker_params and target.docker_params.image_mode == "prebuilt") \
+            and not docker_ops.image_exists(target.image_tag):
         print(f"[build] Building {target.image_tag} ...")
-        docker_ops.build(target.dockerfile_dir, target.image_tag)
+    try:
+        prepare_target_image(target, rebuild=False)
+    except Exception as e:
+        print(f"error: target image unavailable: {e}", file=sys.stderr)
+        return 1
 
     reports_root = root / "reports"
     checkpoints: dict[int, dict] = {}
@@ -1572,9 +1590,14 @@ def _cmd_patch(args) -> int:
     global _current_target_name
     _current_target_name = target.name
 
-    if not docker_ops.image_exists(target.image_tag):
+    if not (target.docker_params and target.docker_params.image_mode == "prebuilt") \
+            and not docker_ops.image_exists(target.image_tag):
         print(f"[build] Building {target.image_tag} ...")
-        docker_ops.build(target.dockerfile_dir, target.image_tag)
+    try:
+        prepare_target_image(target, rebuild=False)
+    except Exception as e:
+        print(f"error: target image unavailable: {e}", file=sys.stderr)
+        return 1
 
     reports_root = root / "reports"
     system_prompt = build_system_prompt(args.engagement_context)

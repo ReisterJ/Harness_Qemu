@@ -34,10 +34,12 @@ async def run_recon(
     failed to emit a parseable <focus_areas> tag.
     """
     container_name = f"recon_{target.name}"
-    with sandbox.agent_container(target.image_tag, container_name, agent_env,
+    with sandbox.agent_container(target.runtime_image_tag, container_name, agent_env,
                                  network=target.agent_network,
                                  devices=target.devices,
-                                 prebuilt=target.agent_prebuilt) as container:
+                                 prebuilt=target.agent_prebuilt,
+                                 run_params=target.docker_run_params("recon"),
+                                 image_pull=target.runtime_image_pull) as container:
         prompt = build_recon_prompt(
             github_url=target.github_url,
             commit=target.commit,

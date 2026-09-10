@@ -176,6 +176,68 @@ The host copies the checked-out source snapshot into the build context as
 `source/` after this task. Therefore a normal Dockerfile should contain a line
 like `COPY source/ /work/src/` and then build from `/work/src`.
 
+## Manifest contract (mandatory)
+
+The host validates `target-manifest.yaml` before it runs Docker. Use the exact
+field names below; do not invent aliases such as `runtime.kernel`,
+`runtime.initrd`, or an un-nested `runtime.lifecycle` object:
+
+- Every non-custom profile needs `runtime.start.command`.
+- `process` needs `runtime.artifact.path`; `service` needs `runtime.endpoint`,
+  `runtime.ready`, and `runtime.reset`.
+- `qemu` needs `runtime.artifact.kernel` and `runtime.artifact.rootfs`, plus
+  `runtime.ready`, `runtime.reset`, and `runtime.collect`. `rootfs` may point
+  to a generated initramfs when that is the guest root filesystem.
+- `runtime.ready`, `runtime.reset`, and `runtime.collect` must each contain a
+  command or a supported declarative path/signal/port check. A QEMU helper
+  command must be executable inside the target container and must use the
+  exact paths declared in `runtime.artifact`.
+- `runtime.start.command` must be a real lifecycle command, not prose. If it
+  launches a long-running service or emulator, it must daemonize or otherwise
+  return control so the host can run the ready check. A finite smoke command
+  belongs in `runtime.probe.command`, not in `runtime.start.command`.
+
+Before finishing, mentally validate the manifest against these rules and
+ensure every declared path is created by the Dockerfile. The host will reject
+the whole context when any required field is absent or malformed.
+
+Use this minimal YAML shape as the field-name reference (fill in the values
+from the repository; do not copy the placeholder paths blindly):
+
+```yaml
+schema_version: 1
+identity:
+  name: target-name
+  repository: "{repo_yaml}"
+  commit: "{commit_yaml}"
+build:
+  agent_prebuilt: false
+runtime:
+  profile: process
+  source_root: /work/src
+  artifact:
+    kind: executable
+    path: /work/entry
+  start:
+    command: /work/entry
+workflow:
+  static_analysis: source
+  dynamic_validation: process
+  grade: process_replay
+resources:
+  devices: []
+```
+
+For `service` and `qemu`, replace the process artifact and add the lifecycle
+sections required above, but preserve the exact top-level names
+`identity.repository`, `detection.detectors`, `workflow.static_analysis`,
+`workflow.dynamic_validation`, and `workflow.grade`.
+
+When assembling a BusyBox initramfs, keep the copied `/bin/busybox` as a
+regular executable and skip the `busybox` item when creating applet symlinks;
+otherwise `/bin/busybox` becomes a self-referential symlink and the kernel
+cannot execute `/init`.
+
 ## Required process
 
 1. Read `/input/target-classification.json` and treat its runtime profile as

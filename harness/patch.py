@@ -69,8 +69,12 @@ async def run_patch(
     timings: dict[str, float] = {}
 
     with sandbox.agent_container(
-        target.image_tag, container_name, agent_env,
+        target.runtime_image_tag, container_name, agent_env,
         memory=target.memory_limit, shm_size=target.shm_size,
+        devices=target.devices,
+        prebuilt=target.agent_prebuilt,
+        run_params=target.docker_run_params("patch"),
+        image_pull=target.runtime_image_pull,
     ) as container:
         await asyncio.to_thread(
             docker_ops.write_file, container, "/tmp/poc.bin", crash.poc_bytes

@@ -37,6 +37,7 @@ from .classification import (
     load_classification,
 )
 from .config import TargetConfig
+from .docker_params import DockerParamsError, load_docker_params
 from .manifest import MANIFEST_FILENAME, ManifestError, load_manifest
 from .prompts.build_prompt import (
     BUILD_AGENT_SYSTEM_PROMPT,
@@ -87,6 +88,7 @@ class BuildOptions:
     timeout_s: int = DEFAULT_BUILD_TIMEOUT_S
     force: bool = False
     git_timeout_s: int = 900
+    docker_params_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -134,6 +136,45 @@ def image_tag_for(name: str, commit: str) -> str:
     """Return the immutable image tag recorded in generated config.yaml."""
     validate_target_name(name)
     return f"vuln-pipeline-{name}:{commit[:12]}"
+
+
+def prepare_target_image(
+    target: TargetConfig,
+    *,
+    rebuild: bool,
+    log_path: str | None = None,
+    timeout: int | None = None,
+) -> str:
+    """Build a generated target or validate/pull its supplied image.
+
+    This is the single entry point used by the run/recon/report/patch CLI
+    paths.  In particular, a ``prebuilt`` Docker parameter file must not cause
+    the workflow to rebuild an unrelated generated Dockerfile before using
+    the supplied QEMU or hardware image.
+    """
+    if target.docker_params and target.docker_params.image_mode == "prebuilt":
+        image = target.runtime_image_tag
+        _ensure_prebuilt_image(image, pull=target.runtime_image_pull)
+        return image
+    if rebuild or not docker_ops.image_exists(target.image_tag):
+        docker_ops.build(
+            target.dockerfile_dir,
+            target.image_tag,
+            log_path=log_path,
+            timeout=timeout,
+            build_params=target.docker_build_params(),
+        )
+    return target.image_tag
+
+
+def _ensure_prebuilt_image(image: str, *, pull: bool) -> None:
+    if pull and not docker_ops.image_exists(image):
+        docker_ops.pull(image)
+    if not docker_ops.image_exists(image):
+        raise BuildError(
+            f"prebuilt runtime image is not available locally: {image!r}; "
+            "set image.pull: true or pull it before running"
+        )
 
 
 def _git(
@@ -572,15 +613,18 @@ def _probe_target(target: TargetConfig) -> None:
     if manifest is not None:
         adapter = adapter_for(manifest["runtime"]["profile"])
         adapter.validate(manifest)
+    if target.runtime_image_pull and not docker_ops.image_exists(target.runtime_image_tag):
+        docker_ops.pull(target.runtime_image_tag)
     try:
         docker_ops.run(
-            target.image_tag,
+            target.runtime_image_tag,
             name=name,
             memory=target.memory_limit,
             shell="/bin/sh",
             shm_size=target.shm_size,
             network=target.agent_network or "none",
             devices=target.devices,
+            run_params=target.docker_run_params("probe"),
         )
         if adapter is None:
             paths = [(target.source_root, False), (target.binary_path, True)]
@@ -620,6 +664,7 @@ def _publish(
     source_lock: SourceLock,
     build_json: dict,
     force: bool,
+    docker_params_path: Path | None = None,
 ) -> None:
     if target_dir.exists() and not force:
         raise BuildError(
@@ -635,6 +680,8 @@ def _publish(
         ignore=shutil.ignore_patterns("build.log"),
     )
     _yaml_write(staging / "source.lock.yaml", source_lock.to_dict())
+    if docker_params_path is not None:
+        shutil.copy2(docker_params_path, staging / "docker-params.yaml")
     (staging / "build.json").write_text(
         json.dumps(build_json, indent=2, ensure_ascii=False) + "\n"
     )
@@ -714,6 +761,15 @@ async def build_target(options: BuildOptions, auth: dict[str, str]) -> BuildResu
         raise BuildError("build retries cannot be negative")
     if options.timeout_s <= 0:
         raise BuildError("build timeout must be positive")
+    docker_params = None
+    if options.docker_params_path is not None:
+        params_path = options.docker_params_path.resolve()
+        try:
+            docker_params = load_docker_params(params_path)
+        except DockerParamsError as exc:
+            raise BuildError(f"invalid Docker parameter file: {exc}") from exc
+    else:
+        params_path = None
     target_dir = (options.targets_dir / options.name).resolve()
     if target_dir.exists() and not options.force:
         raise BuildError(
@@ -800,9 +856,20 @@ async def build_target(options: BuildOptions, auth: dict[str, str]) -> BuildResu
         _normalize_config(context_dir, lock, options.name)
         config = validate_generated_context(context_dir, name=options.name, lock=lock)
 
+        skip_docker_build = bool(
+            docker_params and docker_params.image_mode == "prebuilt"
+        )
+        if skip_docker_build:
+            assert docker_params is not None
+            assert docker_params.image_reference is not None
+            _ensure_prebuilt_image(
+                docker_params.image_reference,
+                pull=docker_params.image_pull,
+            )
+
         build_attempts = 0
         last_error: str | None = None
-        while build_attempts <= options.retries:
+        while build_attempts <= options.retries and not skip_docker_build:
             if build_attempts:
                 repair_number = build_attempts
                 log_path = job_dir / f"build-{repair_number}.log"
@@ -850,6 +917,7 @@ async def build_target(options: BuildOptions, auth: dict[str, str]) -> BuildResu
                     image_tag,
                     log_path=str(log_path),
                     timeout=options.timeout_s,
+                    build_params=docker_params.build if docker_params else None,
                 )
                 last_error = None
                 break
@@ -865,15 +933,25 @@ async def build_target(options: BuildOptions, auth: dict[str, str]) -> BuildResu
                     f"see {job_dir / f'build-{build_attempts}.log'}"
                 )
 
-        if not docker_ops.image_exists(image_tag):
-            raise BuildError(f"Docker build reported success but image is missing: {image_tag}")
+        runtime_image = (
+            docker_params.image_reference
+            if docker_params and docker_params.image_mode == "prebuilt"
+            else image_tag
+        )
+        if not docker_ops.image_exists(runtime_image):
+            raise BuildError(
+                f"target image is missing after preparation: {runtime_image}"
+            )
         # Load once more after repair so probe settings reflect the final config.
-        target = TargetConfig.load(context_dir)
+        target = TargetConfig.load(
+            context_dir,
+            docker_params_path=params_path,
+        )
         _probe_target(target)
         agent_tag: str | None = None
         if not target.agent_prebuilt:
             _status(status_path, "building_agent_image", image_tag=image_tag)
-            agent_tag = agent_image.ensure(target.image_tag)
+            agent_tag = agent_image.ensure(target.runtime_image_tag)
 
         build_json = {
             "name": options.name,
@@ -890,6 +968,11 @@ async def build_target(options: BuildOptions, auth: dict[str, str]) -> BuildResu
             "build_attempts": build_attempts,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
+        if params_path is not None:
+            build_json["docker_params"] = {
+                "source": str(params_path),
+                "sha256": hashlib.sha256(params_path.read_bytes()).hexdigest(),
+            }
         (job_dir / "build.json").write_text(
             json.dumps(build_json, indent=2, ensure_ascii=False) + "\n"
         )
@@ -901,6 +984,7 @@ async def build_target(options: BuildOptions, auth: dict[str, str]) -> BuildResu
             source_lock=lock,
             build_json=build_json,
             force=options.force,
+            docker_params_path=params_path,
         )
         _status(status_path, "succeeded", target_dir=str(target_dir), image_tag=image_tag)
         return BuildResult(

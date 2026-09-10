@@ -1,0 +1,18 @@
+schema_version: 1
+
+image:
+  mode: generated
+
+build:
+  network: host
+  platform: linux/amd64
+  pull: false
+
+run:
+  network: none
+  memory: 2g
+  shm_size: 128m
+
+phases:
+  probe:
+    memory: 512m

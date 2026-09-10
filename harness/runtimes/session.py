@@ -158,7 +158,7 @@ def open_runtime_session(
         # bridge namespace. Keep the sandboxed default unchanged.
         agent_network = "host"
     with sandbox.agent_container(
-        target.image_tag,
+        target.runtime_image_tag,
         container_name,
         auth,
         memory=target.memory_limit,
@@ -167,6 +167,8 @@ def open_runtime_session(
         network=agent_network,
         devices=target.devices,
         prebuilt=target.agent_prebuilt,
+        run_params=target.docker_run_params("agent"),
+        image_pull=target.runtime_image_pull,
     ) as container:
         session = RuntimeSession(container, profile, manifest)
         try:

@@ -74,7 +74,7 @@ async def run_static_analysis(
     """
     timings: dict[str, float] = {}
     with sandbox.agent_container(
-        target.image_tag,
+        target.runtime_image_tag,
         container_name,
         agent_env,
         memory=target.memory_limit,
@@ -82,6 +82,8 @@ async def run_static_analysis(
         network=target.agent_network,
         devices=target.devices,
         prebuilt=target.agent_prebuilt,
+        run_params=target.docker_run_params("static"),
+        image_pull=target.runtime_image_pull,
     ) as container:
         prompt = build_static_analysis_prompt(
             github_url=target.github_url,

@@ -88,12 +88,16 @@ async def grade_patch(
         # The re-attack and style-judge stages spawn their own containers with
         # agent_env + network where they need it.
         with sandbox.agent_container(
-            target.image_tag,
+            target.runtime_image_tag,
             container_name,
             None,
             memory=target.memory_limit,
             shm_size=target.shm_size,
             network="none",
+            devices=target.devices,
+            prebuilt=target.agent_prebuilt,
+            run_params=target.docker_run_params("patch-grade"),
+            image_pull=target.runtime_image_pull,
         ) as container:
             # ── T0: apply + build ────────────────────────────────────────────────
             s = time.time()

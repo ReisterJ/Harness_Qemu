@@ -13,6 +13,8 @@ import selectors
 import subprocess
 import time
 
+from .docker_params import DockerBuildParams, DockerMount, DockerRunParams
+
 
 def build_network_args() -> list[str]:
     """`--network` args for docker build, driven by
@@ -34,6 +36,7 @@ def build(
     *,
     log_path: str | None = None,
     timeout: int | None = None,
+    build_params: DockerBuildParams | None = None,
 ) -> str:
     """Build a docker image from a directory containing a Dockerfile.
 
@@ -42,7 +45,22 @@ def build(
     streamed to the terminal and persisted, while a hung build is terminated
     after the requested number of seconds.
     """
-    cmd = ["docker", "build", *build_network_args(), "-t", tag, dockerfile_dir]
+    params = build_params or DockerBuildParams()
+    network = params.network
+    cmd = ["docker", "build"]
+    if network:
+        cmd += ["--network", network]
+    else:
+        cmd += build_network_args()
+    if params.platform:
+        cmd += ["--platform", params.platform]
+    if params.pull:
+        cmd.append("--pull")
+    for key, value in (params.build_args or ()):
+        cmd += ["--build-arg", f"{key}={value}"]
+    if params.target:
+        cmd += ["--target", params.target]
+    cmd += ["-t", tag, dockerfile_dir]
     if log_path is None and timeout is None:
         subprocess.run(cmd, check=True)
         return tag
@@ -105,6 +123,7 @@ def run(
     env: dict[str, str] | None = None,
     mounts: list[tuple[str, str]] | None = None,
     devices: list[str] | None = None,
+    run_params: DockerRunParams | None = None,
 ) -> str:
     """Start a container, detached, interactive. Cleans up any existing
     container with the same name first (clean slate).
@@ -115,29 +134,83 @@ def run(
     ``devices`` passes host devices through (e.g. ``["/dev/kvm"]`` for
     targets that boot QEMU accelerators)."""
     subprocess.run(["docker", "rm", "-f", name], capture_output=True)
-    runtime = runtime or os.environ.get("VULN_PIPELINE_DOCKER_RUNTIME")
+    params = run_params or DockerRunParams()
+    effective_network = params.network or network
+    effective_memory = params.memory or memory
+    effective_shm_size = params.shm_size or shm_size
+    effective_runtime = params.runtime or runtime or os.environ.get(
+        "VULN_PIPELINE_DOCKER_RUNTIME"
+    )
     extra: list[str] = []
-    if runtime:
-        extra += ["--runtime", runtime]
-    if shm_size:
-        extra += ["--shm-size", shm_size]
-    for dev in (devices or []):
+    if effective_runtime:
+        extra += ["--runtime", effective_runtime]
+    if effective_shm_size:
+        extra += ["--shm-size", effective_shm_size]
+    if params.cpus:
+        extra += ["--cpus", params.cpus]
+    if params.privileged:
+        extra.append("--privileged")
+    for cap in (params.cap_add or ()):
+        extra += ["--cap-add", cap]
+    for cap in (params.cap_drop or ()):
+        extra += ["--cap-drop", cap]
+    for option in (params.security_opt or ()):
+        extra += ["--security-opt", option]
+
+    all_devices: list[str] = []
+    for dev in [*(devices or []), *(params.devices or ())]:
+        if dev not in all_devices:
+            all_devices.append(dev)
+    for dev in all_devices:
         extra += ["--device", dev]
-    for k, v in (env or {}).items():
+
+    merged_env = params.env_dict()
+    # Authentication and proxy variables supplied by the harness are
+    # authoritative; user variables fill in project-specific settings.
+    merged_env.update(env or {})
+    for k, v in merged_env.items():
         # Prefer ``-e KEY`` (value read from this process's env) so secrets don't
         # appear in argv / host ps output. Fall back to ``-e KEY=VAL`` for
         # computed values (e.g. HTTPS_PROXY) that aren't in our env.
         extra += ["-e", k] if os.environ.get(k) == v else ["-e", f"{k}={v}"]
-    for src, dst in (mounts or []):
-        extra += ["-v", f"{src}:{dst}:ro"]
+
+    all_mounts: list[DockerMount] = [
+        DockerMount(source=src, target=dst, read_only=True)
+        for src, dst in (mounts or [])
+    ]
+    for mount in (params.mounts or ()):
+        # A user-supplied mount for the same container path intentionally
+        # replaces the harness's default read-only source.
+        all_mounts = [m for m in all_mounts if m.target != mount.target]
+        all_mounts.append(mount)
+    for mount in all_mounts:
+        if not os.path.exists(mount.source):
+            raise RuntimeError(
+                f"docker run mount source does not exist: {mount.source}"
+            )
+        spec = f"type=bind,src={mount.source},dst={mount.target}"
+        if mount.read_only:
+            spec += ",readonly"
+        extra += ["--mount", spec]
+    if params.workdir:
+        extra += ["--workdir", params.workdir]
+    if params.user:
+        extra += ["--user", params.user]
+    if params.ipc:
+        extra += ["--ipc", params.ipc]
+    if params.pid:
+        extra += ["--pid", params.pid]
+    if params.entrypoint:
+        extra += ["--entrypoint", params.entrypoint[0]]
+    command = list(params.command) if params.command else [shell]
     r = subprocess.run(
         [
             "docker", "run", "-dit",
             *extra,
             "--name", name,
-            "--network", network,
-            "--memory", memory,
-            image_tag, shell,
+            "--network", effective_network,
+            "--memory", effective_memory,
+            image_tag, *command,
         ],
         check=False,
         capture_output=True,
@@ -156,9 +229,9 @@ def run(
         raise RuntimeError(
             f"container {name} has wrong image: requested {image_tag!r}, got {actual_image!r}"
         )
-    if runtime and actual_runtime != runtime:
+    if effective_runtime and actual_runtime != effective_runtime:
         raise RuntimeError(
-            f"container {name} runtime mismatch: requested {runtime!r}, "
+            f"container {name} runtime mismatch: requested {effective_runtime!r}, "
             f"docker reports {actual_runtime!r}"
         )
     return name
@@ -201,6 +274,12 @@ def image_exists(tag: str) -> bool:
         capture_output=True,
     )
     return r.returncode == 0
+
+
+def pull(tag: str) -> str:
+    """Pull a user-selected pre-built image and return its reference."""
+    subprocess.run(["docker", "pull", tag], check=True)
+    return tag
 
 
 def exec_sh(

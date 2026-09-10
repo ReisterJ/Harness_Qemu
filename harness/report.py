@@ -62,10 +62,12 @@ async def run_report(
             f"{crash.reproduction_command!r}"
         )
 
-    with sandbox.agent_container(target.image_tag, container_name, agent_env,
+    with sandbox.agent_container(target.runtime_image_tag, container_name, agent_env,
                                  network=target.agent_network,
                                  devices=target.devices,
-                                 prebuilt=target.agent_prebuilt) as container:
+                                 prebuilt=target.agent_prebuilt,
+                                 run_params=target.docker_run_params("report"),
+                                 image_pull=target.runtime_image_pull) as container:
         docker_ops.write_file(container, "/tmp/poc.bin", crash.poc_bytes)
         adapted_cmd = crash.reproduction_command.replace(crash.poc_path, "/tmp/poc.bin")
 

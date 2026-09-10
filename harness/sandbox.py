@@ -18,6 +18,7 @@ import subprocess
 from typing import Iterator
 
 from . import agent_image, docker_ops
+from .docker_params import DockerRunParams
 
 RUNTIME_ENV = "VULN_PIPELINE_AGENT_RUNTIME"
 PROXY_ENV = "VULN_PIPELINE_EGRESS_PROXY"
@@ -68,6 +69,8 @@ def agent_container(
     devices: list[str] | None = None,
     *,
     prebuilt: bool = False,
+    run_params: DockerRunParams | None = None,
+    image_pull: bool = False,
 ) -> Iterator[str]:
     """Spawn the per-phase agent container and tear it down on exit.
 
@@ -90,6 +93,22 @@ def agent_container(
     (already carrying the CLI) instead of a vuln target to layer onto the
     base — used by harnesses that build their own agent image, e.g. the DNR
     hunt image or a kernel target whose Dockerfile installs the CLI itself."""
+    params = run_params or DockerRunParams()
+    requested_devices = list(devices or []) + list(params.devices or ())
+    if runtime() and (requested_devices or params.privileged):
+        raise RuntimeError(
+            "Docker parameters request host devices or privileged mode, but the "
+            f"agent sandbox uses {runtime()!r}; rerun with "
+            "--dangerously-no-sandbox for hardware-backed targets"
+        )
+    if runtime() and params.runtime and params.runtime != runtime():
+        raise RuntimeError(
+            f"docker-params runtime {params.runtime!r} conflicts with the "
+            f"configured agent sandbox runtime {runtime()!r}"
+        )
+
+    if image_pull and not docker_ops.image_exists(target_tag):
+        docker_ops.pull(target_tag)
     img = target_tag if prebuilt else agent_image.ensure(target_tag)
     container = docker_ops.run(
         img,
@@ -101,6 +120,7 @@ def agent_container(
         env=container_env(auth),
         mounts=list(mounts or []),
         devices=list(devices or []),
+        run_params=params,
     )
     try:
         yield container

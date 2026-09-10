@@ -17,6 +17,14 @@ from typing import Any
 
 import yaml
 
+from .docker_params import (
+    DOCKER_PARAMS_FILENAME,
+    DockerBuildParams,
+    DockerParams,
+    DockerParamsError,
+    DockerRunParams,
+    load_docker_params,
+)
 from .manifest import MANIFEST_FILENAME, ManifestError, load_manifest
 
 
@@ -44,9 +52,15 @@ class TargetConfig:
     memory_limit: str = "4g"          # docker --memory
     reattack_harness: str | None = None  # in-image script that runs every /poc/* and exits 1 on crash
     manifest: dict[str, Any] | None = field(default=None, repr=False)
+    docker_params: DockerParams | None = field(default=None, repr=False)
 
     @classmethod
-    def load(cls, target_dir: str | Path) -> TargetConfig:
+    def load(
+        cls,
+        target_dir: str | Path,
+        *,
+        docker_params_path: str | Path | None = None,
+    ) -> TargetConfig:
         target_dir = Path(target_dir).resolve()
         config_path = target_dir / "config.yaml"
         if not config_path.exists():
@@ -76,6 +90,20 @@ class TargetConfig:
         manifest_agent_prebuilt = (manifest.get("build", {}) if manifest else {}).get(
             "agent_prebuilt", False
         )
+
+        params_file = (
+            Path(docker_params_path).resolve()
+            if docker_params_path is not None
+            else target_dir / DOCKER_PARAMS_FILENAME
+        )
+        docker_params = None
+        if docker_params_path is not None and not params_file.exists():
+            raise FileNotFoundError(f"Docker parameter file not found: {params_file}")
+        if params_file.exists():
+            try:
+                docker_params = load_docker_params(params_file)
+            except DockerParamsError as exc:
+                raise ValueError(f"invalid {params_file.name}: {exc}") from exc
 
         if cfg.get("kind") == "dnr":
             raise ValueError(
@@ -117,7 +145,32 @@ class TargetConfig:
             ),
             reattack_harness=cfg.get("reattack_harness"),
             manifest=manifest,
+            docker_params=docker_params,
         )
+
+    @property
+    def runtime_image_tag(self) -> str:
+        """Image used for target containers.
+
+        A normal target uses the image built from its Dockerfile.  A target
+        with ``image.mode: prebuilt`` can point the runtime at a supplied
+        QEMU/firmware image while retaining the same manifest and pipeline
+        metadata.
+        """
+        if self.docker_params and self.docker_params.image_mode == "prebuilt":
+            assert self.docker_params.image_reference is not None
+            return self.docker_params.image_reference
+        return self.image_tag
+
+    def docker_run_params(self, phase: str) -> DockerRunParams:
+        return self.docker_params.for_phase(phase) if self.docker_params else DockerRunParams()
+
+    def docker_build_params(self) -> DockerBuildParams:
+        return self.docker_params.build if self.docker_params else DockerBuildParams()
+
+    @property
+    def runtime_image_pull(self) -> bool:
+        return bool(self.docker_params and self.docker_params.image_pull)
 
     def runtime_context(self) -> dict[str, Any]:
         """Return the validated runtime view used by agent prompts.
