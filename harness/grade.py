@@ -15,7 +15,7 @@ import time
 
 from . import docker_ops
 from .agent import run_agent, parse_xml_tag, AgentResult
-from .artifacts import CrashArtifact, GraderVerdict
+from .artifacts import CrashArtifact, GraderVerdict, LogicArtifact, StaticFinding
 from .config import TargetConfig
 from .prompts.grade_prompt import build_grade_prompt
 from .runtimes import open_runtime_session
@@ -25,7 +25,7 @@ GRADE_MAX_TURNS = 50
 
 
 async def run_grade(
-    crash: CrashArtifact,
+    crash: CrashArtifact | LogicArtifact,
     target: TargetConfig,
     model: str,
     workspace_dir: str,
@@ -34,8 +34,9 @@ async def run_grade(
     transcript_path: str | None = None,
     progress_prefix: str | None = None,
     system_prompt: str | None = None,
+    static_finding: StaticFinding | None = None,
 ) -> tuple[GraderVerdict, AgentResult, float]:
-    """Verify a CrashArtifact in a fresh container.
+    """Verify a crash or semantic-logic artifact in a fresh container.
 
     workspace_dir: host-side results dir where we also persist poc.bin so
     it survives the container teardown.
@@ -70,7 +71,7 @@ async def run_grade(
             image_tag=target.image_tag,
             reproduction_command=crash.reproduction_command,
             reproduction_command_adapted=adapted_cmd,
-            crash_type=crash.crash_type,
+            crash_type=(crash.crash_type if isinstance(crash, CrashArtifact) else crash.logic_type),
             exit_code=crash.exit_code,
             poc_kind=crash.poc_kind,
             source_root=target.source_root,
@@ -79,6 +80,17 @@ async def run_grade(
             grade_reference=target.grade_reference,
             detector=target.detector,
             runtime_context=target.runtime_context(),
+            logic_type=(crash.logic_type if isinstance(crash, LogicArtifact) else None),
+            expected_behavior=(
+                crash.expected_behavior if isinstance(crash, LogicArtifact) else None
+            ),
+            observed_behavior=(
+                crash.observed_behavior if isinstance(crash, LogicArtifact) else None
+            ),
+            logic_evidence=(
+                crash.logic_evidence if isinstance(crash, LogicArtifact) else None
+            ),
+            static_candidate=static_finding.to_dict() if static_finding else None,
         )
         t0 = time.time()
         result = await run_agent(
@@ -107,7 +119,18 @@ async def run_grade(
             evidence = (evidence + f"\nroot_cause={root_cause.strip()}").strip()
 
         verdict = GraderVerdict(
-            passed=(overall is not None and overall.upper().startswith("PASS")),
+            passed=(
+                overall is not None
+                and overall.upper().startswith("PASS")
+                and (
+                    not isinstance(crash, LogicArtifact)
+                    or (
+                        root_cause is not None
+                        and root_cause.strip().upper() == "CONFIRMED"
+                        and criteria.get("criterion_6", False)
+                    )
+                )
+            ),
             score=_parse_score(score_str),
             criteria=criteria,
             evidence=evidence,

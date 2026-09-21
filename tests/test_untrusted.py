@@ -173,6 +173,27 @@ def test_service_grade_prompt_is_not_process_only():
     assert "PoC kind: request" in p
 
 
+def test_logic_grade_prompt_wraps_all_agent_claims():
+    p = build_grade_prompt(
+        image_tag="img",
+        reproduction_command="sh /tmp/poc.bin",
+        reproduction_command_adapted="sh /tmp/poc.bin",
+        crash_type="integer-truncation",
+        exit_code=0,
+        source_root="/work/src",
+        workspace_poc="/tmp/poc.bin",
+        detector="logic",
+        logic_type="integer-truncation",
+        expected_behavior=BREAKOUT,
+        observed_behavior=BREAKOUT,
+        logic_evidence=BREAKOUT,
+        static_candidate={"root_cause": BREAKOUT},
+    )
+    assert not _bare_close_tags(p)
+    assert "integer-truncation" in p
+    assert p.count("<untrusted_data id=") >= 5
+
+
 def test_grade_prompt_wraps_find_claims_in_nonce_block():
     p = build_grade_prompt(
         image_tag="img",

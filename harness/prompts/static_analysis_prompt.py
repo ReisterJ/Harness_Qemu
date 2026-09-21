@@ -82,6 +82,10 @@ Each candidate must contain these keys:
   "required_conditions": "specific format, state, flags, or privilege assumptions",
   "root_cause": "why validation or lifetime handling is insufficient",
   "verification_plan": "concrete dynamic steps the next agent should try",
+  "observability_targets": [
+    {{"file": "src/parser.c", "function": "parse_chunk", "line": 123,
+     "why": "candidate sink or reachability checkpoint"}}
+  ],
   "confidence": 0.0,
   "related_candidates": []
 }}
@@ -130,7 +134,7 @@ def build_static_analysis_prompt(
             f"{untrusted_block(known, nonce)}\n"
         )
 
-    return STATIC_ANALYSIS_PROMPT.format(
+    prompt = STATIC_ANALYSIS_PROMPT.format(
         github_url=github_url,
         commit=commit,
         source_root=source_root,
@@ -140,3 +144,18 @@ def build_static_analysis_prompt(
         hints_section=hints_section,
         known_bugs_section=known_bugs_section,
     ) + runtime_contract_section(runtime_context)
+    if detector == "logic":
+        prompt += """
+
+## Logic-detector guidance
+
+The detector for this target is `logic`. Prioritize semantic defects that can
+complete normally but return the wrong result: integer truncation, incorrect
+length/encoding handling, state-machine confusion, validation bypass,
+silent data loss, or inconsistent control/data behavior. For every candidate,
+state the correct invariant or control result and the observable wrong result
+that a later dynamic agent can check. Do not downgrade a candidate merely
+because it cannot trigger ASAN or a non-zero exit; do downgrade it when there
+is no externally reachable oracle.
+"""
+    return prompt

@@ -1,7 +1,7 @@
 # Copyright 2026 Anthropic PBC
 # SPDX-License-Identifier: Apache-2.0
 """Round-trip serialization tests for artifact dataclasses."""
-from harness.artifacts import CrashArtifact, GraderVerdict, RunResult
+from harness.artifacts import CrashArtifact, GraderVerdict, LogicArtifact, RunResult
 
 
 def test_crash_artifact_roundtrip():
@@ -40,6 +40,23 @@ def test_crash_artifact_from_dict_missing_dup_check():
     ).to_dict()
     del d["dup_check"]
     assert CrashArtifact.from_dict(d).dup_check is None
+
+
+def test_logic_artifact_roundtrip_and_discriminator():
+    orig = LogicArtifact(
+        poc_path="/tmp/xinclude.sh",
+        poc_bytes=b"#!/bin/sh\necho oracle\n",
+        reproduction_command="sh /tmp/xinclude.sh",
+        logic_type="integer-truncation",
+        expected_behavior="included text remains present",
+        observed_behavior="included text is silently dropped",
+        logic_evidence="3/3 runs: xinclude-text-present=0",
+        exit_code=0,
+        dup_check="distinct XInclude path",
+    )
+    data = orig.to_dict()
+    assert data["artifact_type"] == "logic"
+    assert LogicArtifact.from_dict(data) == orig
 
 
 def test_grader_verdict_roundtrip():
@@ -98,3 +115,27 @@ def test_run_result_no_crash():
     assert restored.crash is None
     assert restored.verdict is None
     assert restored.status == "no_crash_found"
+
+
+def test_run_result_logic_roundtrip():
+    logic = LogicArtifact(
+        poc_path="/tmp/poc.sh",
+        poc_bytes=b"echo wrong",
+        reproduction_command="sh /tmp/poc.sh",
+        logic_type="incorrect-validation",
+        expected_behavior="reject",
+        observed_behavior="accepted",
+        logic_evidence="control comparison",
+        exit_code=0,
+        dup_check="not a duplicate",
+    )
+    orig = RunResult(
+        target="libxml2",
+        status="logic_found",
+        crash=None,
+        verdict=GraderVerdict(True, 1.0, {}, "confirmed"),
+        logic=logic,
+    )
+    restored = RunResult.from_json(orig.to_json())
+    assert restored.logic == logic
+    assert restored.crash is None

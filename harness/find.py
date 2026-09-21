@@ -14,13 +14,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .agent import AgentResult
-from .artifacts import CrashArtifact, DynamicValidationResult, StaticFinding
+from .artifacts import CrashArtifact, DynamicValidationResult, LogicArtifact, StaticFinding
 from .config import TargetConfig
 from .dynamic_validation import run_dynamic_validation
 from .static_analysis import run_static_analysis
 
 
 DEFAULT_FIND_MAX_TURNS = 2000
+# Dynamic validation needs a high step ceiling so its wall-clock watchdog,
+# rather than the agent step counter, is the effective bound for long PoC
+# searches. The standalone `dynamic` CLI uses this value; the static phase and
+# combined `run` command retain DEFAULT_FIND_MAX_TURNS.
+DEFAULT_DYNAMIC_MAX_TURNS = 20000
+DEFAULT_DYNAMIC_MAX_ITERATIONS = 8
 
 
 @dataclass
@@ -30,8 +36,11 @@ class FindPhaseResult:
     crash: CrashArtifact | None
     agent_result: AgentResult
     timings: dict[str, float]
+    logic: LogicArtifact | None = None
     static_findings: list[StaticFinding] = field(default_factory=list)
     dynamic_result: DynamicValidationResult | None = None
+    instrumentation: dict | None = None
+    symbolic_execution: dict | None = None
     static_parse_error: str | None = None
 
     def __iter__(self):
@@ -58,6 +67,11 @@ async def run_find(
     static_transcript_path: str | None = None,
     static_result_path: str | None = None,
     dynamic_result_path: str | None = None,
+    instrumentation: str | None = None,
+    instrumentation_result_path: str | None = None,
+    symbolic_execution: str | None = None,
+    symbolic_execution_result_path: str | None = None,
+    max_iterations: int = DEFAULT_DYNAMIC_MAX_ITERATIONS,
 ) -> FindPhaseResult:
     """Run static analysis followed by dynamic validation.
 
@@ -100,6 +114,10 @@ async def run_find(
             static_result_path,
             {
                 "phase": "static_analysis",
+                "target": target.name,
+                "repository": target.github_url,
+                "commit": target.commit,
+                "source_root": target.source_root,
                 "status": (
                     "agent_failed" if static_agent.error else
                     "parse_error" if parse_error and not findings else
@@ -119,6 +137,7 @@ async def run_find(
             _write_transcript(transcript_path, static_agent.transcript())
         return FindPhaseResult(
             crash=None,
+            logic=None,
             agent_result=static_agent,
             timings=timings,
             static_findings=[],
@@ -144,6 +163,15 @@ async def run_find(
         accept_dos=accept_dos,
         system_prompt=system_prompt,
         max_resume_attempts=max_resume_attempts,
+        instrumentation=instrumentation,
+        instrumentation_result_path=instrumentation_result_path,
+        symbolic_execution=symbolic_execution,
+        symbolic_execution_result_path=symbolic_execution_result_path,
+        crash_result_path=(
+            str(Path(dynamic_result_path).with_name("crash-result.xml"))
+            if dynamic_result_path else None
+        ),
+        max_iterations=max_iterations,
     )
     timings.update(dynamic_timings)
     timings["find"] = timings.get("static_analysis", 0.0) + timings.get(
@@ -166,10 +194,13 @@ async def run_find(
         _write_transcript(transcript_path, combined.transcript())
     return FindPhaseResult(
         crash=dynamic_result.crash,
+        logic=dynamic_result.logic,
         agent_result=combined,
         timings=timings,
         static_findings=findings,
         dynamic_result=dynamic_result,
+        instrumentation=dynamic_result.instrumentation,
+        symbolic_execution=dynamic_result.symbolic_execution,
         static_parse_error=parse_error,
     )
 
@@ -182,6 +213,13 @@ def _combine_agent_results(static: AgentResult, dynamic: AgentResult) -> AgentRe
         session_id=dynamic.session_id or static.session_id,
         error=dynamic.error or static.error,
         resume_count=static.resume_count + dynamic.resume_count,
+        tool_call_count=static.tool_call_count + dynamic.tool_call_count,
+        assistant_message_count=(
+            static.assistant_message_count + dynamic.assistant_message_count
+        ),
+        started_at=static.started_at,
+        finished_at=dynamic.finished_at or static.finished_at,
+        first_poc_at=dynamic.first_poc_at or static.first_poc_at,
     )
 
 

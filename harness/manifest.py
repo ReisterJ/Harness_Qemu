@@ -180,6 +180,39 @@ def validate_manifest(
         if key in resources:
             _string(resources[key], f"resources.{key}")
 
+    instrumentation = _mapping(
+        manifest.get("instrumentation", {}), "instrumentation"
+    )
+    providers = instrumentation.get("providers", [])
+    if not isinstance(providers, list) or not all(
+        isinstance(x, str) and x.strip() for x in providers
+    ):
+        raise ManifestError(
+            "instrumentation.providers must be a list of non-empty strings"
+        )
+    default = instrumentation.get("default", "auto")
+    # PyYAML follows YAML 1.1 boolean spellings, so an unquoted `off` is
+    # loaded as False. Accept that common authoring form as the explicit
+    # disabled mode while keeping the normalized contract string-based.
+    if default is False:
+        default = "off"
+    if not isinstance(default, str) or not default.strip():
+        raise ManifestError("instrumentation.default must be a non-empty string")
+    allowed_defaults = {"off", "auto", *[str(x) for x in providers]}
+    if default not in allowed_defaults:
+        raise ManifestError(
+            "instrumentation.default must be off, auto, or one of instrumentation.providers"
+        )
+    # Keep the returned manifest canonical as well as accepting YAML 1.1's
+    # boolean spelling. TargetConfig and prompt consumers should not need to
+    # know whether the author quoted `off`.
+    instrumentation["default"] = default
+    for key in ("max_events", "max_output_bytes"):
+        if key in instrumentation and (
+            not isinstance(instrumentation[key], int) or instrumentation[key] <= 0
+        ):
+            raise ManifestError(f"instrumentation.{key} must be a positive integer")
+
     return manifest
 
 

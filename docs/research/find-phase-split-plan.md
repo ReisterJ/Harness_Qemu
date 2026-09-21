@@ -24,7 +24,7 @@ recon（可选）
 静态分析
     ↓ StaticFinding
 动态验证
-    ↓ CrashArtifact
+    ↓ CrashArtifact / LogicArtifact
 现有 grade
     ↓
 现有 judge → report → patch
@@ -58,9 +58,9 @@ run_find()
   ├─ run_static_analysis()
   │    └─ 输出 StaticFinding
   └─ run_dynamic_validation(StaticFinding)
-       └─ 成功时输出现有 CrashArtifact
+       └─ 成功时输出 CrashArtifact 或 LogicArtifact
             ↓
-       现有 run_grade(CrashArtifact)
+       现有 run_grade(artifact)
 ```
 
 以下部分应保持不变：
@@ -235,6 +235,23 @@ grade 仍然只关注 PoC，不负责评估整个静态分析过程。它继续�
 静态候选和动态验证结果可以作为结果目录中的审计信息保存，但不改变 grade 对 PoC 的最终判断。
 
 只有 grade 通过的 `CrashArtifact` 才进入后续的 judge、report 和 patch 流程。
+
+### 5.1 逻辑漏洞检测
+
+对于整数截断、错误状态转换、校验绕过、静默丢数据等不会触发 ASAN 的
+问题，目标可声明 `detector: logic`。动态阶段仍然必须生成可复制的 PoC，
+但 PoC 可以以 0 退出，并通过有限输出、控制样例或项目不变量给出语义
+oracle。此时输出 `LogicArtifact`，包含：
+
+- `logic_type`；
+- `expected_behavior` 与 `observed_behavior`；
+- `logic_evidence`（入口、命令、控制对比和重复运行结果）；
+- 与崩溃 PoC 相同的路径、复现命令、字节和 `dup_check`。
+
+`grade` 仍是最终裁决者：它在全新容器中重新执行 PoC，确认外部入口确实
+到达目标函数、排除 OOM/超时/启动失败，并确认语义差异至少在 2/3 次运行
+中复现。逻辑 artifact 不进入 ASAN 的 judge/report/patch 下游，避免把
+“正确性错误”误当作内存破坏；但结果和 transcript 会保留在 run 目录中。
 
 ## 6. `find` 调度改造
 

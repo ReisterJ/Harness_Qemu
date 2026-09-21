@@ -23,6 +23,8 @@
 
 - [research/find-phase-split-plan.md](research/find-phase-split-plan.md) — find 阶段静态分析与动态验证拆分方案
 - [research/experimental-target-selection.md](research/experimental-target-selection.md) — C/Rust 和 sanitizer 实验目标选择
+- [research/experiment-audits/curl-socks5-instrumentation-audit.md](research/experiment-audits/curl-socks5-instrumentation-audit.md) — curl SOCKS5 插桩对照实验审计记录
+- [research/iterative-dynamic-validation.md](research/iterative-dynamic-validation.md) — 内存与逻辑漏洞通用的动态验证迭代设计
 - [research/triage.md](research/triage.md) — 发现分组、排序和人工分诊
 - [research/patching.md](research/patching.md) — 生成、验证和重新攻击补丁
 - [guides/other-use-cases.md](guides/other-use-cases.md) — 二进制、嵌入式和其他使用场景

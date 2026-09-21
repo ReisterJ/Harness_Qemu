@@ -248,6 +248,47 @@ def read_file(container: str, path: str) -> bytes:
     return r.stdout if r.returncode == 0 else b""
 
 
+def process_snapshot(container: str) -> list[str]:
+    """Return process command lines currently running in ``container``.
+
+    This is used only by the agent watchdog.  A model request normally leaves
+    only the shell and opencode process alive; a long-running Bash tool leaves
+    an additional child (for example a test server).  Keeping this probe
+    separate from ``exec_sh`` avoids introducing another command into the
+    agent's workspace or trusting agent-created files.
+    """
+    try:
+        r = subprocess.run(
+            ["docker", "top", container, "-eo", "pid,ppid,stat,cmd"],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if r.returncode != 0:
+        return []
+    lines = r.stdout.splitlines()
+    # The first line is the header.  Filter the container's init shell and
+    # opencode itself; everything else represents an active tool command or
+    # a process it started.
+    result: list[str] = []
+    for line in lines[1:]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        fields = stripped.split(None, 3)
+        command = fields[3] if len(fields) == 4 else stripped
+        # The init shell is not a tool child.  Keep other shells (for example
+        # ``bash -c make``) because they indicate that a Bash tool is still
+        # active and should prevent the model-idle watchdog from firing.
+        if command in {"/bin/bash", "/bin/sh"} or "opencode" in command:
+            continue
+        result.append(stripped)
+    return result
+
+
 def write_file(container: str, path: str, content: bytes) -> None:
     """Write bytes to a path inside a container.
 
@@ -274,6 +315,32 @@ def image_exists(tag: str) -> bool:
         capture_output=True,
     )
     return r.returncode == 0
+
+
+def image_id(tag: str) -> str | None:
+    """Return an image's immutable ID, or None when it is not local."""
+    r = subprocess.run(
+        ["docker", "image", "inspect", "--format", "{{.Id}}", tag],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        return None
+    value = r.stdout.strip()
+    return value or None
+
+
+def image_label(tag: str, label: str) -> str | None:
+    """Read one image label without treating a missing label as an error."""
+    r = subprocess.run(
+        ["docker", "image", "inspect", "--format", f"{{{{index .Config.Labels \"{label}\"}}}}", tag],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        return None
+    value = r.stdout.strip()
+    return value if value and value != "<no value>" else None
 
 
 def pull(tag: str) -> str:

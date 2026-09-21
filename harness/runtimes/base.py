@@ -79,4 +79,7 @@ class RuntimeAdapter(ABC):
             "detection": manifest.get("detection", {}),
             "workflow": manifest.get("workflow", {}),
             "resources": manifest.get("resources", {}),
+            "instrumentation": manifest.get(
+                "instrumentation", {"default": "auto", "providers": []}
+            ),
         }

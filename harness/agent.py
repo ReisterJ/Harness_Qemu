@@ -25,9 +25,11 @@ Messages are stored as raw opencode JSON events (`step_start` / `text` /
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 
 from . import docker_ops
@@ -166,6 +168,11 @@ class AgentResult:
     session_id: str | None = None                       # for resume on transient failure
     error: str | None = None                            # if the agent loop died
     resume_count: int = 0                               # how many times we auto-resumed
+    tool_call_count: int = 0                            # observational metric
+    assistant_message_count: int = 0                   # observational metric
+    started_at: float | None = None                    # wall-clock epoch
+    finished_at: float | None = None
+    first_poc_at: float | None = None                   # first emitted <poc_path>
 
     def find_tagged_message(self, tag: str) -> str:
         """Return the most-recent assistant message text containing <tag>.
@@ -195,6 +202,128 @@ class AgentResult:
     def transcript(self) -> list[dict]:
         """JSON-serializable transcript for persistence (truncated events)."""
         return [_truncate_event(m) for m in self.messages]
+
+
+def _is_unbounded_helper_process(line: str) -> bool:
+    """Whether a process line looks like an ad-hoc local test service.
+
+    This is deliberately conservative: QEMU and the target executable are
+    not classified as helpers.  The prompt still provides the primary
+    lifecycle guidance; this guard prevents a forgotten foreground Python/
+    netcat server from consuming the whole 30-minute agent budget.
+    """
+    fields = line.split(None, 3)
+    command = fields[3] if len(fields) == 4 else line
+    executable = command.split(None, 1)[0].rsplit("/", 1)[-1]
+    if executable in {"timeout", "gtimeout"}:
+        return False
+    if executable in {"bash", "sh"} and "timeout " in command.lower():
+        return False
+    lower = command.lower()
+    # Match command-like executable names, not arbitrary substrings. In
+    # particular, mruby's target binary `mruby_fuzzer` contains "ruby" but
+    # is a bounded fuzzing target, not a forgotten Ruby helper service.
+    return bool(
+        re.search(
+            r"(?<![a-z0-9_.-])(?:python(?:[0-9]+(?:\.[0-9]+)*)?|ruby|"
+            r"node(?:js)?|ncat|nc|socat)(?![a-z0-9_.-])",
+            lower,
+        )
+    )
+
+
+def _unbounded_helper_processes(processes: list[str]) -> list[str]:
+    """Find helper processes not already bounded by a `timeout` ancestor.
+
+    `docker top` reports the timeout wrapper and its child as separate rows.
+    Classifying only each command line incorrectly treats `timeout 900
+    python3 ...` as an unbounded Python helper and kills legitimate long
+    bounded commands at the shorter helper deadline.
+    """
+    rows: dict[str, tuple[str, str]] = {}
+    for line in processes:
+        fields = line.split(None, 3)
+        if len(fields) == 4 and fields[0].isdigit() and fields[1].isdigit():
+            rows[fields[0]] = (fields[1], fields[3])
+
+    bounded_descendants: set[str] = set()
+    for pid, (parent, _command) in rows.items():
+        seen: set[str] = set()
+        ancestor = parent
+        while ancestor in rows and ancestor not in seen:
+            seen.add(ancestor)
+            _grandparent, command = rows[ancestor]
+            executable = command.split(None, 1)[0].rsplit("/", 1)[-1]
+            if executable in {"timeout", "gtimeout"}:
+                bounded_descendants.add(pid)
+                break
+            ancestor = _grandparent
+
+    return [
+        line for line in processes
+        if _is_unbounded_helper_process(line)
+        and (not line.split(None, 1)[0].isdigit()
+             or line.split(None, 1)[0] not in bounded_descendants)
+    ]
+
+
+async def _agent_watchdog(
+    container: str,
+    proc,
+    activity: dict[str, float],
+    state: dict[str, str | None],
+    *,
+    phase_timeout_s: float,
+    idle_timeout_s: float,
+    helper_timeout_s: float,
+    interval_s: float,
+) -> None:
+    """Kill an opencode attempt that can no longer make progress.
+
+    ``opencode`` does not expose a model-request timeout.  The stream watcher
+    therefore distinguishes a quiet model request (no child tool process) from
+    a quiet Bash command by probing the container process table.  Unbounded
+    ad-hoc helper servers get a shorter dedicated deadline, while a bounded
+    command can use the full 1800-second phase budget.
+    """
+    helper_since: float | None = None
+    while proc.returncode is None:
+        await asyncio.sleep(max(0.05, interval_s))
+        now = time.monotonic()
+        if now - activity["started"] > phase_timeout_s:
+            state["error"] = (
+                f"agent/model_blocked: phase exceeded {phase_timeout_s:.0f}s"
+            )
+        else:
+            # ``docker top`` is a short, bounded host-side probe.  Keep it
+            # synchronous here: this runtime does not reliably deliver
+            # ``asyncio.to_thread`` completions back to the event loop, which
+            # would make the watchdog itself hang while the agent is blocked.
+            processes = docker_ops.process_snapshot(container)
+            helpers = _unbounded_helper_processes(processes)
+            if helpers:
+                helper_since = helper_since or now
+                if now - helper_since > helper_timeout_s:
+                    state["error"] = (
+                        "agent/helper_blocked: unbounded helper process exceeded "
+                        f"{helper_timeout_s:.0f}s"
+                    )
+            elif processes:
+                # A normal target command (for example a bounded curl or
+                # QEMU invocation) is still active.  It may legitimately be
+                # quiet for a while; the phase deadline remains the bound.
+                helper_since = None
+            else:
+                helper_since = None
+                if now - activity["last_event"] > idle_timeout_s:
+                    state["error"] = (
+                        "agent/model_blocked: no streamed agent event and no active "
+                        f"tool process for {idle_timeout_s:.0f}s"
+                    )
+        if state["error"]:
+            if proc.returncode is None:
+                proc.kill()
+            return
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -272,6 +401,40 @@ def _build_agent_file(
     )
 
 
+def _model_config(model: str) -> bytes | None:
+    """Return a project-local opencode config for provider aliases missing
+    from the pinned Models.dev catalog.
+
+    DeepSeek renamed the flash model to ``deepseek-flash`` before the pinned
+    opencode release learned that ID.  The provider API itself supports it,
+    so declare only this explicit alias and let all other models use the
+    normal built-in catalog.  The config is written under /tmp and selected
+    only for the corresponding ``docker exec`` invocation.
+    """
+    if model != "deepseek/deepseek-flash":
+        return None
+    return json.dumps(
+        {
+            "$schema": "https://opencode.ai/config.json",
+            "provider": {
+                "deepseek": {
+                    "models": {
+                        "deepseek-flash": {
+                            "name": "DeepSeek Flash",
+                            "limit": {"context": 128000, "output": 32000},
+                        }
+                    }
+                }
+            },
+        }
+    ).encode()
+
+
+def _opencode_model(model: str) -> str:
+    """Accept the documented short DeepSeek model name as a convenience."""
+    return "deepseek/deepseek-flash" if model == "deepseek-flash" else model
+
+
 async def run_agent(
     prompt: str,
     *,
@@ -284,6 +447,13 @@ async def run_agent(
     progress_prefix: str | None = None,
     tools: list[str] | None = None,
     system_prompt: str | None = None,
+    phase_timeout_s: float = 1800.0,
+    # A quiet model request may legitimately take as long as the phase.  The
+    # separate helper deadline still prevents an unbounded local server from
+    # consuming that entire budget.
+    idle_timeout_s: float = 1800.0,
+    helper_timeout_s: float = 120.0,
+    watchdog_interval_s: float = 5.0,
 ) -> AgentResult:
     """Run an opencode agent session inside ``container``.
 
@@ -311,9 +481,18 @@ async def run_agent(
         _build_agent_file(agent_name, system_prompt, max_turns, tools).encode(),
     )
 
-    cli_argv = ["docker", "exec", "-i", "-w", "/work", "--",
-                container, "opencode", "run"]
+    opencode_model = _opencode_model(model)
+    model_config = _model_config(opencode_model)
+    config_path = "/tmp/vuln-pipeline-opencode.json"
+    if model_config is not None:
+        docker_ops.write_file(container, config_path, model_config)
+    cli_argv = ["docker", "exec", "-i"]
+    if model_config is not None:
+        cli_argv += ["-e", f"OPENCODE_CONFIG={config_path}"]
+    cli_argv += ["-w", "/work", "--", container, "opencode", "run"]
     result = AgentResult()
+    result.started_at = time.time()
+    watchdog_started = time.monotonic()
     attempt = 0
     assistant_count = 0
     tool_call_count = 0
@@ -328,7 +507,7 @@ async def run_agent(
             cmd = [
                 *cli_argv,
                 "--format", "json",
-                "--model", model,
+                "--model", opencode_model,
                 "--agent", agent_name,
                 "--auto",
             ]
@@ -351,6 +530,24 @@ async def run_agent(
             )
             assert proc.stdout
 
+            watchdog_activity = {
+                "started": watchdog_started,
+                "last_event": time.monotonic(),
+            }
+            watchdog_state: dict[str, str | None] = {"error": None}
+            watchdog_task = asyncio.create_task(
+                _agent_watchdog(
+                    container,
+                    proc,
+                    watchdog_activity,
+                    watchdog_state,
+                    phase_timeout_s=phase_timeout_s,
+                    idle_timeout_s=idle_timeout_s,
+                    helper_timeout_s=helper_timeout_s,
+                    interval_s=watchdog_interval_s,
+                )
+            )
+
             try:
                 fatal_error: str | None = None
                 last_event: dict | None = None
@@ -360,6 +557,7 @@ async def run_agent(
                     line = raw.decode("utf-8", errors="replace").strip()
                     if not line:
                         continue
+                    watchdog_activity["last_event"] = time.monotonic()
                     try:
                         ev = json.loads(line)
                     except json.JSONDecodeError:
@@ -378,6 +576,13 @@ async def run_agent(
                     if etype == "text" or part.get("type") == "text":
                         assistant_count += 1
                         attempt_assistant_count += 1
+                        if (
+                            result.first_poc_at is None
+                            and "<poc_path>" in str(part.get("text") or "")
+                        ):
+                            result.first_poc_at = time.time()
+                    result.tool_call_count = tool_call_count
+                    result.assistant_message_count = assistant_count
                     if etype == "error":
                         fatal_error = _error_text(ev)
 
@@ -396,6 +601,9 @@ async def run_agent(
                 rc = await proc.wait()
                 if result.messages:
                     result.result_message = last_event
+
+                if watchdog_state["error"]:
+                    raise RuntimeError(watchdog_state["error"])
 
                 if fatal_error:
                     last_error = fatal_error
@@ -437,6 +645,9 @@ async def run_agent(
                 return result
 
             except Exception as e:
+                if watchdog_state["error"]:
+                    result.error = watchdog_state["error"]
+                    return result
                 if proc.returncode is None:
                     proc.terminate()
                     await proc.wait()
@@ -459,6 +670,11 @@ async def run_agent(
                 )
                 result.resume_count = attempt
                 await asyncio.sleep(backoff)
+            finally:
+                watchdog_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await watchdog_task
     finally:
+        result.finished_at = time.time()
         if transcript_file:
             transcript_file.close()

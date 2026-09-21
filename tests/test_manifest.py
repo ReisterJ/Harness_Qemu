@@ -41,6 +41,12 @@ def test_manifest_accepts_process_profile():
     assert context["resources"]["devices"] == []
 
 
+def test_manifest_normalizes_unquoted_yaml_off():
+    manifest = _process_manifest()
+    manifest["instrumentation"] = {"default": False, "providers": []}
+    assert validate_manifest(manifest)["instrumentation"]["default"] == "off"
+
+
 def test_manifest_rejects_host_path_and_unknown_profile():
     manifest = _process_manifest()
     manifest["runtime"]["source_root"] = "../src"
@@ -125,3 +131,20 @@ def test_target_config_projects_manifest_runtime_metadata(tmp_path):
     assert target.devices == ["/dev/kvm"]
     assert target.memory_limit == "8g"
     assert target.binary_path == "/bin/true"
+
+
+def test_target_config_normalizes_list_attack_surface(tmp_path):
+    target_dir = tmp_path / "list-surface"
+    target_dir.mkdir()
+    (target_dir / "config.yaml").write_text(
+        "image_tag: demo:latest\n"
+        "github_url: local\n"
+        "commit: abc\n"
+        "attack_surface:\n"
+        "  - CLI input\n"
+        "  - network parser\n"
+    )
+
+    target = TargetConfig.load(target_dir)
+
+    assert target.attack_surface == "- CLI input\n- network parser"

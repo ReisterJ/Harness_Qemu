@@ -45,6 +45,24 @@ def test_agent_tag_distinguishes_committed_snapshots():
     assert agent_tag("canary:v1") != agent_tag("canary:patched-abc123")
 
 
+def test_agent_image_cache_tracks_target_image_id(monkeypatch):
+    from harness import agent_image
+
+    builds: list[tuple[str, str]] = []
+    monkeypatch.setattr(agent_image.docker_ops, "image_id", lambda _tag: "sha256:new")
+    monkeypatch.setattr(agent_image.docker_ops, "image_exists", lambda _tag: True)
+    monkeypatch.setattr(agent_image.docker_ops, "image_label", lambda _tag, _label: "sha256:old")
+    monkeypatch.setattr(agent_image, "ensure_base", lambda: agent_image.BASE_TAG)
+    monkeypatch.setattr(
+        agent_image, "build", lambda dockerfile, tag, context=None: builds.append((dockerfile, tag))
+    )
+    monkeypatch.setattr(agent_image.subprocess, "run", lambda *args, **kwargs: None)
+
+    result = agent_image.ensure("vuln-pipeline-demo:abc")
+    assert result == agent_image.agent_tag("vuln-pipeline-demo:abc")
+    assert builds and 'io.vuln-pipeline.target-image-id="sha256:new"' in builds[0][0]
+
+
 def test_permission_mode_tracks_runtime(monkeypatch):
     monkeypatch.delenv(sandbox.RUNTIME_ENV, raising=False)
     assert sandbox.permission_mode() == "auto"
@@ -108,6 +126,11 @@ def test_agent_container_network_default_tracks_sandbox(monkeypatch):
     with sandbox.agent_container("img:v1", "c", None):
         pass
     assert captured["network"] == "bridge"
+
+    monkeypatch.setenv(sandbox.NETWORK_ENV, "host")
+    with sandbox.agent_container("img:v1", "c", None):
+        pass
+    assert captured["network"] == "host"
 
 
 def test_agent_container_prebuilt_skips_ensure(monkeypatch):

@@ -28,6 +28,25 @@ from .docker_params import (
 from .manifest import MANIFEST_FILENAME, ManifestError, load_manifest
 
 
+def _load_attack_surface(value: Any) -> str | None:
+    """Normalize YAML's convenient string/list forms for prompt consumers.
+
+    Hand-authored targets commonly describe an attack surface as a YAML list,
+    while the prompt isolation helpers intentionally accept text.  Convert
+    the list at the configuration boundary so every workflow phase sees the
+    same safe, deterministic representation.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, list):
+        if not all(isinstance(item, str) and item.strip() for item in value):
+            raise ValueError("attack_surface must be a string or list of non-empty strings")
+        return "\n".join(f"- {item.strip()}" for item in value)
+    raise ValueError("attack_surface must be a string or list of non-empty strings")
+
+
 @dataclass(frozen=True)
 class TargetConfig:
     name: str
@@ -40,7 +59,7 @@ class TargetConfig:
     focus_areas: list[str] = field(default_factory=list)
     known_bugs: list[str] = field(default_factory=list)
     attack_surface: str | None = None
-    detector: str = "asan"            # "asan" (userspace), "kasan" (Linux kernel), "lms" (LiteOS-M kernel), or "qemu-asan" (userspace ASAN inside a QEMU guest)
+    detector: str = "asan"            # "asan" (userspace), "logic" (semantic oracle), "kasan" (Linux kernel), "lms" (LiteOS-M kernel), or "qemu-asan" (userspace ASAN inside a QEMU guest)
     devices: list[str] = field(default_factory=list)  # --device passthrough (e.g. /dev/kvm)
     grade_reference: str | None = None  # grade-only ground truth (official crash signature); never shown to find
     agent_prebuilt: bool = False      # image already carries the agent CLI (no agent_image.ensure layering)
@@ -51,6 +70,8 @@ class TargetConfig:
     shm_size: str | None = None       # docker --shm-size
     memory_limit: str = "4g"          # docker --memory
     reattack_harness: str | None = None  # in-image script that runs every /poc/* and exits 1 on crash
+    instrumentation: dict[str, Any] | None = field(default=None, repr=False)
+    symbolic_execution: dict[str, Any] | None = field(default=None, repr=False)
     manifest: dict[str, Any] | None = field(default=None, repr=False)
     docker_params: DockerParams | None = field(default=None, repr=False)
 
@@ -105,6 +126,29 @@ class TargetConfig:
             except DockerParamsError as exc:
                 raise ValueError(f"invalid {params_file.name}: {exc}") from exc
 
+        instrumentation = (
+            (manifest or {}).get("instrumentation")
+            or cfg.get("instrumentation")
+            or {"default": "auto", "providers": []}
+        )
+        if isinstance(instrumentation, dict):
+            # Keep legacy/config.yaml targets consistent with validated
+            # manifests. PyYAML loads an unquoted YAML 1.1 `off` as False.
+            instrumentation = dict(instrumentation)
+            if instrumentation.get("default") is False:
+                instrumentation["default"] = "off"
+
+        symbolic_execution = cfg.get(
+            "symbolic_execution", {"default": "off", "providers": ["klee"]}
+        )
+        if symbolic_execution is False:
+            symbolic_execution = {"default": "off", "providers": []}
+        if not isinstance(symbolic_execution, dict):
+            raise ValueError("symbolic_execution must be a mapping")
+        symbolic_execution = dict(symbolic_execution)
+        if symbolic_execution.get("default") is False:
+            symbolic_execution["default"] = "off"
+
         if cfg.get("kind") == "dnr":
             raise ValueError(
                 f"target '{target_dir.name}' is a detection & response target "
@@ -130,7 +174,7 @@ class TargetConfig:
             ),
             focus_areas=cfg.get("focus_areas") or [],
             known_bugs=cfg.get("known_bugs") or [],
-            attack_surface=cfg.get("attack_surface"),
+            attack_surface=_load_attack_surface(cfg.get("attack_surface")),
             detector=cfg.get("detector") or manifest_detector or "asan",
             devices=cfg.get("devices") or manifest_resources.get("devices") or [],
             grade_reference=cfg.get("grade_reference"),
@@ -144,6 +188,8 @@ class TargetConfig:
                 "memory", "4g"
             ),
             reattack_harness=cfg.get("reattack_harness"),
+            instrumentation=instrumentation,
+            symbolic_execution=symbolic_execution,
             manifest=manifest,
             docker_params=docker_params,
         )
@@ -182,9 +228,13 @@ class TargetConfig:
         if self.manifest is not None:
             from .runtimes import adapter_for
 
-            return adapter_for(self.manifest["runtime"]["profile"]).prompt_context(
+            context = adapter_for(self.manifest["runtime"]["profile"]).prompt_context(
                 self.manifest
             )
+            context["instrumentation"] = self.instrumentation or {
+                "default": "auto", "providers": []
+            }
+            return context
         return {
             "profile": "legacy",
             "source_root": self.source_root,
@@ -196,5 +246,8 @@ class TargetConfig:
                 "static_analysis": "source",
                 "dynamic_validation": self.detector,
                 "grade": f"{self.detector}_replay",
+            },
+            "instrumentation": self.instrumentation or {
+                "default": "auto", "providers": []
             },
         }

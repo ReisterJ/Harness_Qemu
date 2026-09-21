@@ -166,6 +166,10 @@ Write these files below `/work/out`:
   For process targets, add a short non-mutating `runtime.probe.command` when
   the artifact has a safe smoke-test invocation; do not use a command that
   waits for attacker input.
+  Optionally add `instrumentation: {{default: auto|off|llvm, providers: [...]}}`.
+  This declares observation providers only; it does not change the detector or
+  the final grade contract. Use `llvm` only when the image contains clang,
+  llvm-profdata, and llvm-cov (versioned tool names are acceptable).
 - `build-plan.json` — a concise machine-readable explanation with keys
   `kind`, `base_image`, `build_steps`, `entrypoint`, `runtime_dependencies`,
   and `notes`.
@@ -188,6 +192,10 @@ field names below; do not invent aliases such as `runtime.kernel`,
 - `qemu` needs `runtime.artifact.kernel` and `runtime.artifact.rootfs`, plus
   `runtime.ready`, `runtime.reset`, and `runtime.collect`. `rootfs` may point
   to a generated initramfs when that is the guest root filesystem.
+- Every `runtime.artifact` mapping must contain a non-empty `kind`. For QEMU,
+  use a concrete kind such as `kernel-image` for a bootable kernel or
+  `firmware-image` for firmware; do not omit `kind` even when the artifact has
+  multiple paths.
 - `runtime.ready`, `runtime.reset`, and `runtime.collect` must each contain a
   command or a supported declarative path/signal/port check. A QEMU helper
   command must be executable inside the target container and must use the
@@ -226,6 +234,9 @@ workflow:
   grade: process_replay
 resources:
   devices: []
+instrumentation:
+  default: auto
+  providers: []
 ```
 
 For `service` and `qemu`, replace the process artifact and add the lifecycle

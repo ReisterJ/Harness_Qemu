@@ -35,6 +35,7 @@ AUTH_VARS = (
     "OPENCODE_DISABLE_AUTOUPDATE",
     "OPENCODE_DISABLE_CLAUDE_CODE",
     "OPENCODE_DISABLE_MODELS_FETCH",
+    "OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS",
 )
 
 
@@ -54,6 +55,7 @@ def test_deepseek_key(monkeypatch):
     assert env["OPENCODE_DISABLE_AUTOUPDATE"] == "1"
     assert env["OPENCODE_DISABLE_CLAUDE_CODE"] == "1"
     assert env["OPENCODE_DISABLE_MODELS_FETCH"] == "1"
+    assert env["OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS"] == "1800000"
 
 
 def test_openai_key(monkeypatch):

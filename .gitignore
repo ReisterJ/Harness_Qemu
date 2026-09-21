@@ -6,6 +6,9 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 results/
+# Large generated mruby/arvo SymCC experiment artifacts; keep the audit document
+# and source changes versioned, but do not commit raw transcripts/containers.
+/results/experiments/mruby-env-write-barrier/symcc-mruby-20260920/
 build/
 dist/
 

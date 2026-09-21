@@ -16,6 +16,7 @@ import shlex
 
 from .. import docker_ops, sandbox
 from ..config import TargetConfig
+from ..docker_params import DockerMount
 from . import adapter_for
 from .base import RuntimeContractError
 
@@ -144,6 +145,7 @@ def open_runtime_session(
     container_name: str,
     auth: dict[str, str] | None,
     mounts: list[tuple[str, str]] | None = None,
+    writable_mounts: list[tuple[str, str]] | None = None,
 ) -> Iterator[RuntimeSession]:
     """Create a fresh target-agent container and prepare its runtime."""
     manifest = target.manifest
@@ -157,6 +159,17 @@ def open_runtime_session(
         # configured on the host is otherwise unreachable from Docker's
         # bridge namespace. Keep the sandboxed default unchanged.
         agent_network = "host"
+    run_params = target.docker_run_params("agent")
+    if writable_mounts:
+        merged_mounts = list(run_params.mounts or ())
+        for source, destination in writable_mounts:
+            merged_mounts = [mount for mount in merged_mounts if mount.target != destination]
+            merged_mounts.append(
+                DockerMount(source=source, target=destination, read_only=False)
+            )
+        run_params = run_params.merge(
+            type(run_params)(mounts=tuple(merged_mounts))
+        )
     with sandbox.agent_container(
         target.runtime_image_tag,
         container_name,
@@ -167,7 +180,7 @@ def open_runtime_session(
         network=agent_network,
         devices=target.devices,
         prebuilt=target.agent_prebuilt,
-        run_params=target.docker_run_params("agent"),
+        run_params=run_params,
         image_pull=target.runtime_image_pull,
     ) as container:
         session = RuntimeSession(container, profile, manifest)

@@ -1,13 +1,14 @@
 # Copyright 2026 Anthropic PBC
 # SPDX-License-Identifier: Apache-2.0
-"""Build the per-target agent image: target binary + opencode CLI.
+"""Build the per-target agent image: target runtime + opencode CLI.
 
 The agent runs *inside* its container, so the container needs the CLI. To
-avoid one node+npm install per target, ``ensure()`` builds a shared
-``vuln-pipeline-agent-base:<cli-version>`` once (gcc:14 + node + pinned
-opencode) and then layers each target's ``/work`` on top via ``COPY --from``.
-Target Dockerfiles stay unchanged (single source of truth for the binary
-build).
+avoid one node/npm install per target, ``ensure()`` builds a shared
+``vuln-pipeline-agent-base:<cli-version>`` once and copies its standalone
+opencode executable and git support into the target image. The target image
+is the final base, rather than merely a source of ``/work``: runtime packages
+installed by a target Dockerfile (for example QEMU, Java, or a service's
+native libraries) must remain available to dynamic validation and grade.
 
 The backend is the opencode CLI (``opencode-ai`` npm package): it drives the
 agentic loop (Read/Write/Bash tools), streams raw JSON events with
@@ -17,7 +18,6 @@ via provider env vars or opencode.json.
 
 from __future__ import annotations
 
-import functools
 import re
 import subprocess
 import tempfile
@@ -27,6 +27,7 @@ from . import docker_ops
 
 OPENCODE_VERSION = "1.17.18"  # bump alongside the dev-env opencode pin
 BASE_TAG = f"vuln-pipeline-agent-base:{OPENCODE_VERSION}"
+TARGET_ID_LABEL = "io.vuln-pipeline.target-image-id"
 _TAG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._/:-]*$")
 
 
@@ -80,16 +81,34 @@ def ensure_base() -> str:
     return BASE_TAG
 
 
-@functools.lru_cache(maxsize=None)
 def ensure(target_tag: str) -> str:
     """Build (if missing) and return the agent-image tag for ``target_tag``."""
     validate_tag(target_tag)
     tag = agent_tag(target_tag)
-    if docker_ops.image_exists(tag):
+    target_id = docker_ops.image_id(target_tag)
+    if target_id is None:
+        raise RuntimeError(f"target image is not available locally: {target_tag!r}")
+    if (
+        docker_ops.image_exists(tag)
+        and docker_ops.image_label(tag, TARGET_ID_LABEL) == target_id
+    ):
         return tag
     ensure_base()
     build(
-        f"FROM {BASE_TAG}\nCOPY --from={target_tag} /work /work\n",
+        # Keep the target image as the runtime base.  The old reverse layering
+        # (FROM agent-base + COPY target /work) silently discarded packages
+        # outside /work, which made QEMU/service targets impossible to run.
+        # opencode is a standalone native executable; only the executable is
+        # copied instead of the 700+ MB multi-platform npm package.  Git is
+        # needed by opencode's workspace snapshot handling.
+        f"""FROM {target_tag}
+LABEL {TARGET_ID_LABEL}="{target_id}"
+COPY --from={BASE_TAG} /usr/local/lib/node_modules/opencode-ai/bin/opencode.exe /usr/local/bin/opencode
+COPY --from={BASE_TAG} /usr/bin/git /usr/bin/git
+COPY --from={BASE_TAG} /usr/lib/git-core /usr/lib/git-core
+COPY --from={BASE_TAG} /usr/share/git-core /usr/share/git-core
+WORKDIR /work
+""",
         tag,
     )
     subprocess.run(

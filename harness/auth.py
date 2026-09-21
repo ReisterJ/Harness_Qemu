@@ -43,7 +43,15 @@ _OPENCODE_ENVS = (
     "OPENCODE_DISABLE_AUTOUPDATE",
     "OPENCODE_DISABLE_CLAUDE_CODE",
     "OPENCODE_DISABLE_MODELS_FETCH",
+    "OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS",
 )
+
+# OpenCode's built-in Bash tool otherwise stops a foreground command after
+# roughly two minutes.  Dynamic validation may legitimately need to compile
+# an observed copy or run a long-lived protocol harness, so use the same
+# 30-minute budget as the target build workflow.  A host-provided value still
+# wins, which keeps this adjustable for operators and tests.
+DEFAULT_BASH_TIMEOUT_MS = "1800000"
 
 NO_AUTH_MSG = (
     "error: no model-API auth found. Set one of these provider API keys in the "
@@ -74,6 +82,10 @@ def resolve_auth_env() -> dict[str, str] | None:
     env.setdefault("OPENCODE_DISABLE_AUTOUPDATE", "1")
     env.setdefault("OPENCODE_DISABLE_CLAUDE_CODE", "1")
     env.setdefault("OPENCODE_DISABLE_MODELS_FETCH", "1")
+    env.setdefault(
+        "OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS",
+        DEFAULT_BASH_TIMEOUT_MS,
+    )
     return env
 
 

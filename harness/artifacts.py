@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Data contracts for the find→grade pipeline.
 
-CrashArtifact is the pivot: find emits it, grade consumes it.
+``CrashArtifact`` and ``LogicArtifact`` are the pivots: dynamic find emits
+one of them, and grade consumes the saved PoC in a fresh container.
 """
 from __future__ import annotations
 
@@ -53,6 +54,55 @@ class CrashArtifact:
         )
 
 
+@dataclass(frozen=True)
+class LogicArtifact:
+    """A PoC whose oracle is a semantic mismatch rather than a crash.
+
+    Logic bugs commonly complete with exit code 0 and produce no sanitizer
+    output.  They still cross the same trust boundary as ``CrashArtifact``:
+    only the saved PoC bytes are copied into a fresh grade container.  The
+    expected/observed fields are the find-agent's claims; grade must rerun the
+    PoC and independently establish the oracle.
+    """
+
+    poc_path: str
+    poc_bytes: bytes
+    reproduction_command: str
+    logic_type: str
+    expected_behavior: str
+    observed_behavior: str
+    logic_evidence: str
+    exit_code: int
+    dup_check: str | None = None
+    poc_kind: str = "file"
+
+    def to_dict(self) -> dict[str, Any]:
+        if self.poc_kind not in POC_KINDS:
+            raise ValueError(f"unsupported PoC kind: {self.poc_kind!r}")
+        d = asdict(self)
+        d["poc_bytes"] = base64.b64encode(self.poc_bytes).decode("ascii")
+        d["artifact_type"] = "logic"
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> LogicArtifact:
+        poc_kind = d.get("poc_kind", "file")
+        if poc_kind not in POC_KINDS:
+            raise ValueError(f"unsupported poc_kind: {poc_kind!r}")
+        return cls(
+            poc_path=d["poc_path"],
+            poc_bytes=base64.b64decode(d["poc_bytes"]),
+            reproduction_command=d["reproduction_command"],
+            logic_type=str(d.get("logic_type") or "logic-error"),
+            expected_behavior=str(d.get("expected_behavior") or ""),
+            observed_behavior=str(d.get("observed_behavior") or ""),
+            logic_evidence=str(d.get("logic_evidence") or ""),
+            exit_code=d.get("exit_code", -1),
+            dup_check=d.get("dup_check"),
+            poc_kind=poc_kind,
+        )
+
+
 @dataclass
 class StaticFinding:
     """A source-level hypothesis produced by the static find phase.
@@ -74,6 +124,7 @@ class StaticFinding:
     verification_plan: str
     confidence: float
     related_candidates: list[str] = field(default_factory=list)
+    observability_targets: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -99,6 +150,10 @@ class StaticFinding:
             related = [related]
         if not isinstance(related, list):
             related = []
+        observability = d.get("observability_targets", [])
+        if not isinstance(observability, list):
+            observability = []
+        observability = [item for item in observability[:50] if isinstance(item, dict)]
         candidate_id = str(d.get("candidate_id") or "candidate_unnamed").strip()
         candidate_id = re.sub(r"[^A-Za-z0-9_.-]", "_", candidate_id)[:80]
         return cls(
@@ -114,6 +169,7 @@ class StaticFinding:
             verification_plan=str(d.get("verification_plan") or ""),
             confidence=confidence,
             related_candidates=[str(x) for x in related],
+            observability_targets=observability,
         )
 
 
@@ -122,16 +178,23 @@ class DynamicValidationResult:
     """Result of trying to turn one static finding into a PoC."""
 
     candidate_id: str
-    status: str  # validated, not_reached, reached_no_crash, wrong_path,
-                 # environment_blocked, invalid_submission, agent_failed
+    status: str  # validated, not_reached, reached_no_crash, reached_no_effect,
+                 # wrong_path, environment_blocked, invalid_submission,
+                 # agent_failed, false_positive, iteration_exhausted
     reached_functions: list[str] = field(default_factory=list)
     reachability_evidence: str = ""
     reason: str = ""
     crash: CrashArtifact | None = None
+    logic: LogicArtifact | None = None
+    instrumentation: dict[str, Any] | None = None
+    symbolic_execution: dict[str, Any] | None = None
+    iterations: list[dict[str, Any]] = field(default_factory=list)
+    iteration_errors: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["crash"] = self.crash.to_dict() if self.crash else None
+        d["logic"] = self.logic.to_dict() if self.logic else None
         return d
 
     @classmethod
@@ -146,6 +209,19 @@ class DynamicValidationResult:
             reachability_evidence=str(d.get("reachability_evidence") or ""),
             reason=str(d.get("reason") or ""),
             crash=CrashArtifact.from_dict(d["crash"]) if d.get("crash") else None,
+            logic=LogicArtifact.from_dict(d["logic"]) if d.get("logic") else None,
+            instrumentation=d.get("instrumentation"),
+            symbolic_execution=d.get("symbolic_execution"),
+            iterations=(
+                [item for item in d.get("iterations", []) if isinstance(item, dict)]
+                if isinstance(d.get("iterations", []), list)
+                else []
+            ),
+            iteration_errors=(
+                [str(item) for item in d.get("iteration_errors", [])]
+                if isinstance(d.get("iteration_errors", []), list)
+                else []
+            ),
         )
 
 
@@ -259,24 +335,32 @@ class ReportVerdict:
 class RunResult:
     """One end-to-end run's outcome."""
     target: str
-    status: str                     # crash_found, no_crash_found, crash_rejected, agent_failed, build_failed, error
+    status: str                     # crash_found, logic_found, no_crash_found,
+                                    # crash_rejected, logic_rejected, agent_failed,
+                                    # build_failed, error
     crash: CrashArtifact | None
     verdict: GraderVerdict | None
+    logic: LogicArtifact | None = None
     find_transcript: list[dict] = field(default_factory=list)
     grade_transcript: list[dict] = field(default_factory=list)
     timings: dict[str, float] = field(default_factory=dict)
     error: str | None = None
+    instrumentation: dict[str, Any] | None = None
+    symbolic_execution: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "target": self.target,
             "status": self.status,
             "crash": self.crash.to_dict() if self.crash else None,
+            "logic": self.logic.to_dict() if self.logic else None,
             "verdict": self.verdict.to_dict() if self.verdict else None,
             "find_transcript": self.find_transcript,
             "grade_transcript": self.grade_transcript,
             "timings": self.timings,
             "error": self.error,
+            "instrumentation": self.instrumentation,
+            "symbolic_execution": self.symbolic_execution,
         }
 
     @classmethod
@@ -286,10 +370,13 @@ class RunResult:
             status=d["status"],
             crash=CrashArtifact.from_dict(d["crash"]) if d.get("crash") else None,
             verdict=GraderVerdict.from_dict(d["verdict"]) if d.get("verdict") else None,
+            logic=LogicArtifact.from_dict(d["logic"]) if d.get("logic") else None,
             find_transcript=d.get("find_transcript", []),
             grade_transcript=d.get("grade_transcript", []),
             timings=d.get("timings", {}),
             error=d.get("error"),
+            instrumentation=d.get("instrumentation"),
+            symbolic_execution=d.get("symbolic_execution"),
         )
 
     def to_json(self) -> str:

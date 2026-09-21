@@ -56,19 +56,18 @@ in the target's `config.yaml`.
 static-analysis agent in its own network-isolated container. It reads the
 source and emits ranked `StaticFinding` candidates with an external entry
 point, call chain, reachability evidence, and a dynamic verification plan. A
-separate dynamic-validation agent consumes the highest-ranked candidate,
-crafts and runs the PoC, and emits the existing `CrashArtifact` only when it
-has a non-empty reproducer. Parallel find runs share a `found_bugs.jsonl` log,
-but static candidates never enter that log; only a PoC with `<dup_check>` does.
+separate dynamic-validation agent consumes the highest-ranked candidate and
+emits a non-empty PoC artifact: `CrashArtifact` for sanitizer/crash targets or
+`LogicArtifact` for targets whose oracle is a semantic mismatch. Static
+candidates never enter `found_bugs.jsonl`; only a PoC with `<dup_check>` does.
 
-**Grade.** A separate agent in a fresh container re-runs the PoC and checks
-that the crash is real (i.e., it reproduces, it's in project code, and it
-isn't just memory exhaustion). The only thing that crosses from the dynamic
-find container to the grader is the PoC bytes, so the grader isn't influenced
-by the static reasoning or dynamic agent's explanation. Flaky-but-real crashes
-(races, heap-layout-dependent) can pass this step, though they will receive a
-lower score. Each run's verdict is written to `run_NNN/result.json` as soon as
-the grader agent finishes.
+**Grade.** A separate agent in a fresh container re-runs the PoC. Crash targets
+are checked for a real project sanitizer/crash signal; `logic` targets are
+checked for a reproducible, input-controlled semantic mismatch and are not
+required to crash or emit ASAN output. The only thing that crosses from the
+dynamic find container to the grader is the PoC bytes; the static reasoning
+and dynamic explanation are untrusted context, not proof. Each run's verdict
+is written to `run_NNN/result.json` as soon as the grader agent finishes.
 
 **Judge.** When a finding passes the grader, a short no-tools agent compares 
 the crash against the bugs already in `reports/manifest.jsonl` and decides 
@@ -133,9 +132,18 @@ bin/vp-sandboxed run    <target> --model <m>            # one find agent + grade
     [--max-turns N]                                     # find-agent turn budget
     [--find-only]                                       # skip grading (useful for prompt iteration)
     [--accept-dos]                                      # benchmark mode: DoS-class crashes count as valid finds
+    [--instrumentation off|auto|llvm]                   # default: auto; off explicitly disables feedback
     [--runs N --resume <dir>]                           # continue a killed batch (pass the batch's original --runs N)
     [--results-dir <dir>]                               # output root (default ./results)
     [--engagement-context <file>]                       # threaded into every agent prompt
+
+bin/vp-sandboxed static <target> --model <m>             # only produce static_analysis.json
+    [--results-dir <dir>]                                # default ./results
+
+bin/vp-sandboxed dynamic <target> --static-report <file> --model <m>
+    [--candidate-id <id>]                                # default: highest-confidence finding
+    [--instrumentation off|auto|llvm]                    # default: auto; dynamic observation provider
+    [--results-dir <dir>]                                # no grade is run by this command
 
 bin/vp-sandboxed dedup  results/<target>/<ts>/          # group crashes by signature (no flags; spawns no agents)
 
@@ -155,7 +163,7 @@ bin/vp-sandboxed patch  results/<target>/<ts>/ --model <m>   # propose and verif
 ```
 
 `--model` falls back to the `VULN_PIPELINE_MODEL` env var on every
-agent-spawning subcommand (`run`, `recon`, `report`, `patch` — `dedup`
+agent-spawning subcommand (`static`, `dynamic`, `run`, `recon`, `report`, `patch` — `dedup`
 spawns no agents and takes no `--model`). The agent-spawning subcommands
 also accept `--dangerously-no-sandbox`, which spawns agents under plain
 `runc` with no syscall isolation — development on a throwaway VM only (see

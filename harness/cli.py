@@ -14,6 +14,9 @@
 """CLI entrypoint.
 
   vuln-pipeline build <name> --repo <url> [--branch <branch>] --model <model>
+  vuln-pipeline static <target> --model <model>                # source-only static report
+  vuln-pipeline dynamic <target> --static-report <path> --model <model>
+                                                               # validate one static candidate
   vuln-pipeline run <target> --model <model>                   # one find + grade cycle
   vuln-pipeline run <target> --model <m> --runs 8 --parallel   # 8 concurrent, round-robin focus areas
   vuln-pipeline run <target> --model <m> --auto-focus          # recon discovers focus areas first
@@ -45,11 +48,18 @@ from pathlib import Path
 
 from . import docker_ops, sandbox
 from .agent import color
-from .artifacts import CrashArtifact, RunResult
+from .artifacts import CrashArtifact, LogicArtifact, RunResult, StaticFinding
 from .asan import asan_excerpt, crash_reason, top_frame
 from .config import TargetConfig
 from .dedup import dedup
-from .find import run_find, DEFAULT_FIND_MAX_TURNS
+from .find import (
+    DEFAULT_DYNAMIC_MAX_ITERATIONS,
+    DEFAULT_DYNAMIC_MAX_TURNS,
+    DEFAULT_FIND_MAX_TURNS,
+    run_find,
+)
+from .dynamic_validation import run_dynamic_validation
+from .static_analysis import run_static_analysis
 from .grade import run_grade
 from .judge import run_judge, run_compare
 from .novelty import upstream_log, crash_file_from_frame, NOVELTY_NOT_CHECKED
@@ -185,7 +195,10 @@ def _on_signal(signum, frame) -> None:
     signal.raise_signal(signum)
 
 
-_RUN_TERMINAL = {"crash_found", "crash_rejected", "no_crash_found"}
+_RUN_TERMINAL = {
+    "crash_found", "crash_rejected", "logic_found", "logic_rejected",
+    "no_crash_found",
+}
 
 
 def _load_run_checkpoint(out_dir: Path) -> RunResult | None:
@@ -227,9 +240,9 @@ def _write_result(out_dir: Path, result: RunResult) -> None:
     # streamed to disk by run_agent. Only poc.bin and result.json left.
 
     # PoC bytes if we have them
-    if result.crash:
+    if result.crash or result.logic:
         with open(out_dir / "poc.bin", "wb") as f:
-            f.write(result.crash.poc_bytes)
+            f.write((result.crash or result.logic).poc_bytes)
 
     # result.json — strip transcripts to keep it readable (they're in the JSONLs)
     slim = result.to_dict()
@@ -257,6 +270,9 @@ async def _run_once(
     stream_ctx: dict | None = None,
     accept_dos: bool = False,
     system_prompt: str | None = None,
+    instrumentation: str | None = None,
+    max_iterations: int = DEFAULT_DYNAMIC_MAX_ITERATIONS,
+    symbolic_execution: str | None = None,
 ) -> RunResult:
     """One find(+grade) attempt. Assumes image is already built.
 
@@ -266,11 +282,17 @@ async def _run_once(
     task to stream_ctx["report_tasks"].
     """
     timings: dict[str, float] = {}
+    instrumentation_result: dict | None = None
+    symbolic_execution_result: dict | None = None
     out_dir.mkdir(parents=True, exist_ok=True)
     find_container = f"find_{target.name}_{run_idx}"
     grade_container = f"grader_{target.name}_{run_idx}"
 
     def _done(result: RunResult) -> RunResult:
+        if result.instrumentation is None:
+            result.instrumentation = instrumentation_result
+        if result.symbolic_execution is None:
+            result.symbolic_execution = symbolic_execution_result
         _write_result(out_dir, result)
         return result
 
@@ -297,15 +319,25 @@ async def _run_once(
             progress_prefix=f"[find:{run_idx}]",
             accept_dos=accept_dos,
             system_prompt=system_prompt,
+            instrumentation=instrumentation,
+            instrumentation_result_path=str(out_dir / "instrumentation"),
+            symbolic_execution=symbolic_execution,
+            symbolic_execution_result_path=str(out_dir / "symbolic_execution"),
+            max_iterations=max_iterations,
         )
         # FindPhaseResult preserves the historical three-value iteration API;
         # tuple-returning test doubles and older integrations remain valid.
         crash, find_result, find_timings = find_outcome
+        logic = getattr(find_outcome, "logic", None)
+        static_findings = getattr(find_outcome, "static_findings", [])
+        static_finding = static_findings[0] if static_findings else None
+        instrumentation_result = getattr(find_outcome, "instrumentation", None)
+        symbolic_execution_result = getattr(find_outcome, "symbolic_execution", None)
     except Exception as e:
         traceback.print_exc()
         return _done(RunResult(
             target=target.name, status="agent_failed",
-            crash=None, verdict=None, timings=timings,
+            crash=None, verdict=None, logic=None, timings=timings,
             error=f"find agent: {type(e).__name__}: {e}",
         ))
     timings.update(find_timings)
@@ -322,43 +354,46 @@ async def _run_once(
 
     # Agent died mid-run (ProcessError, retries exhausted). Transcript preserved.
     if find_result.error:
-        if crash is None:
+        if crash is None and logic is None:
             print(f"[find:{run_idx}] Agent failed: {find_result.error}")
             return _done(RunResult(
                 target=target.name, status="agent_failed",
-                crash=None, verdict=None,
+                crash=None, verdict=None, logic=None,
                 find_transcript=find_transcript, timings=timings,
                 error=f"find agent: {find_result.error}",
             ))
         # The agent completed a <poc_path> submission before the error (e.g.
         # kept minimizing after submitting and hit --max-turns). The PoC
-        # bytes are already extracted from the container — grade the crash
+        # bytes are already extracted from the container — grade the artifact
         # instead of discarding it with the run. Recorded on the final
         # result (like dnr's hunt_error) so batch analysis can tell a
         # salvaged run from a clean finish.
         find_error = f"find agent error after submission (salvaged): {find_result.error}"
         print(f"[find:{run_idx}] Agent error after submission "
-              f"({find_result.error}) — salvaging the submitted crash.")
+              f"({find_result.error}) — salvaging the submitted PoC.")
 
-    if crash is None:
-        print(f"[find:{run_idx}] No crash artifact emitted.")
+    artifact = crash or logic
+    if artifact is None:
+        print(f"[find:{run_idx}] No PoC artifact emitted.")
         return _done(RunResult(
             target=target.name, status="no_crash_found",
-            crash=None, verdict=None,
+            crash=None, verdict=None, logic=None,
             find_transcript=find_transcript, timings=timings,
         ))
 
-    print(color(f"[find:{run_idx}] Crash claimed: {crash.crash_type} at {crash.poc_path} ({len(crash.poc_bytes)} bytes)", "red"))
+    claim_kind = "Logic behavior" if logic is not None else "Crash"
+    claim_type = logic.logic_type if logic is not None else crash.crash_type
+    print(color(f"[find:{run_idx}] {claim_kind} claimed: {claim_type} at {artifact.poc_path} ({len(artifact.poc_bytes)} bytes)", "red"))
 
     # <dup_check> is mandatory alongside <poc_path>. The agent makes the
     # judgment (it knows root cause, a regex can't), the pipeline enforces
     # that the judgment happened. Reject before jsonl write so an unchecked
     # crash doesn't pollute siblings' dedup context.
-    if crash.dup_check is None:
+    if artifact.dup_check is None:
         print(f"[find:{run_idx}] Rejected: missing <dup_check> tag.")
         return _done(RunResult(
             target=target.name, status="agent_failed",
-            crash=crash, verdict=None,
+            crash=crash, logic=logic, verdict=None,
             find_transcript=find_transcript, timings=timings,
             error="find agent: <dup_check> tag missing — submission rejected",
         ))
@@ -367,12 +402,12 @@ async def _run_once(
     # concurrent agent shouldn't spend that window re-discovering the same bug.
     # Entries are framed as "claims" in the prompt, not confirmed crashes.
     if found_bugs_path:
-        _append_found(found_bugs_path, crash, run_idx)
+        _append_found(found_bugs_path, artifact, run_idx)
 
     if find_only:
         return _done(RunResult(
             target=target.name, status="no_crash_found",  # ungraded → not confirmed
-            crash=crash, verdict=None,
+            crash=crash, logic=logic, verdict=None,
             find_transcript=find_transcript, timings=timings,
         ))
 
@@ -381,17 +416,18 @@ async def _run_once(
     workspace = out_dir / "grade_workspace"
     try:
         verdict, grade_result, grade_elapsed = await run_grade(
-            crash, target, model=model, workspace_dir=str(workspace), agent_env=agent_env,
+            artifact, target, model=model, workspace_dir=str(workspace), agent_env=agent_env,
             container_name=grade_container,
             transcript_path=str(out_dir / "grade_transcript.jsonl"),
             progress_prefix=f"[grade:{run_idx}]",
             system_prompt=system_prompt,
+            static_finding=static_finding,
         )
     except Exception as e:
         traceback.print_exc()
         return _done(RunResult(
             target=target.name, status="agent_failed",
-            crash=crash, verdict=None,
+            crash=crash, logic=logic, verdict=None,
             find_transcript=find_transcript, timings=timings,
             error=f"grade agent: {type(e).__name__}: {e}",
         ))
@@ -402,7 +438,7 @@ async def _run_once(
         print(f"[grade:{run_idx}] Agent failed: {grade_result.error}")
         return _done(RunResult(
             target=target.name, status="agent_failed",
-            crash=crash, verdict=None,
+            crash=crash, logic=logic, verdict=None,
             find_transcript=find_transcript, grade_transcript=grade_transcript,
             timings=timings, error=f"grade agent: {grade_result.error}",
         ))
@@ -410,19 +446,23 @@ async def _run_once(
     _gline = f"[grade:{run_idx}] done in {grade_elapsed:.1f}s: passed={verdict.passed}, score={verdict.score}"
     print(color(_gline, "bold") if verdict.passed else _gline)
 
-    status = "crash_found" if verdict.passed else "crash_rejected"
+    status = (
+        ("logic_found" if verdict.passed else "logic_rejected")
+        if logic is not None
+        else ("crash_found" if verdict.passed else "crash_rejected")
+    )
     result = RunResult(
         target=target.name, status=status,
-        crash=crash, verdict=verdict,
+        crash=crash, logic=logic, verdict=verdict,
         find_transcript=find_transcript, grade_transcript=grade_transcript,
-        timings=timings, error=find_error,
+        timings=timings, error=find_error, instrumentation=instrumentation_result,
     )
     _write_result(out_dir, result)
 
     # ── Streaming: judge → report dispatch ───────────────────────────────────────
     # result.json is already on disk — errors here shouldn't clobber it. The
     # find+grade result is the ground truth; judge→report is downstream polish.
-    if stream_ctx is not None:
+    if stream_ctx is not None and crash is not None:
         try:
             await _stream_dispatch(run_idx, target, model, agent_env, crash,
                                    status, verdict.score, stream_ctx)
@@ -632,15 +672,26 @@ def _seed_found_bugs(path: Path, known_bugs: list[str]) -> None:
             f.write(json.dumps({"source": "config", "summary": kb}) + "\n")
 
 
-def _append_found(path: Path, crash: CrashArtifact, run_idx: int) -> None:
-    # Raw ASAN excerpt — SUMMARY line + first stack frames. Agents parse the
-    # signature themselves; the pipeline doesn't pre-canonicalize crash_type or
-    # top_frame anymore (that was a fragility point — adjacent lines, format
-    # variance, free-text agent tags all fragmented the dedup).
-    entry = {
-        "run_idx": run_idx,
-        "asan_excerpt": asan_excerpt(crash.crash_output),
-    }
+def _append_found(
+    path: Path, artifact: CrashArtifact | LogicArtifact, run_idx: int
+) -> None:
+    # Preserve raw detector evidence. Agents parse the signature themselves;
+    # the pipeline does not pre-canonicalize free-text claims.
+    if isinstance(artifact, LogicArtifact):
+        entry = {
+            "run_idx": run_idx,
+            "artifact_type": "logic",
+            "logic_summary": (
+                f"{artifact.logic_type}: expected={artifact.expected_behavior}; "
+                f"observed={artifact.observed_behavior}"
+            ),
+        }
+    else:
+        entry = {
+            "run_idx": run_idx,
+            "artifact_type": "crash",
+            "asan_excerpt": asan_excerpt(artifact.crash_output),
+        }
     with open(path, "a") as f:
         f.write(json.dumps(entry) + "\n")
 
@@ -658,7 +709,12 @@ def _read_found_summaries(path: Path) -> list[str]:
         except json.JSONDecodeError:
             continue
         # Config-seeded entries are prose; runtime entries carry ASAN excerpts.
-        out.append(d.get("asan_excerpt") or d.get("summary") or "")
+        out.append(
+            d.get("asan_excerpt")
+            or d.get("logic_summary")
+            or d.get("summary")
+            or ""
+        )
     return [s for s in out if s]
 
 
@@ -819,7 +875,12 @@ async def _run_all(
             return _checkpointed(i)
         return _run_once(i, target, args.model, args.find_only, args.max_turns, agent_env,
                          out_dirs[i], _assigned_focus(i, focus_areas), found_bugs_path,
-                         stream_ctx, accept_dos=args.accept_dos, system_prompt=system_prompt)
+                         stream_ctx, accept_dos=args.accept_dos, system_prompt=system_prompt,
+                         instrumentation=getattr(args, "instrumentation", None),
+                         symbolic_execution=getattr(args, "symbolic_execution", None),
+                         max_iterations=getattr(
+                             args, "max_iterations", DEFAULT_DYNAMIC_MAX_ITERATIONS
+                         ))
 
     if args.parallel:
         n_live = args.runs - len(checkpoints)
@@ -948,9 +1009,66 @@ def main() -> int:
     p_build.add_argument("--dangerously-no-sandbox", dest="dangerously_no_sandbox",
                          action="store_true", help="Run the planning agent without gVisor; use only in a throwaway VM")
 
+    p_static = sub.add_parser(
+        "static", help="Run source-only static analysis and save a candidate report"
+    )
+    p_static.add_argument("target", help="Target name (under ./targets/) or path to target dir")
+    p_static.add_argument("--model", default=os.environ.get("VULN_PIPELINE_MODEL"),
+                          help="Model string (required; or set VULN_PIPELINE_MODEL)")
+    p_static.add_argument("--max-turns", type=int, default=DEFAULT_FIND_MAX_TURNS,
+                          help=f"Static-agent turn budget (default {DEFAULT_FIND_MAX_TURNS})")
+    p_static.add_argument("--results-dir", default="./results", help="Output root")
+    p_static.add_argument("--docker-params", type=Path, default=None, metavar="PATH",
+                          help="Override the target's docker-params.yaml")
+    p_static.add_argument("--dangerously-no-sandbox", dest="dangerously_no_sandbox",
+                          action="store_true", help="See `run --help`.")
+    p_static.add_argument("--engagement-context", type=Path, default=None,
+                          help="Path to an authorization/engagement-scope file")
+
+    p_dynamic = sub.add_parser(
+        "dynamic", help="Run dynamic validation from a saved static-analysis report"
+    )
+    p_dynamic.add_argument("target", help="Target name (under ./targets/) or path to target dir")
+    p_dynamic.add_argument("--static-report", type=Path, required=True, metavar="PATH",
+                           help="static_analysis.json produced by `static` or `run`")
+    p_dynamic.add_argument("--candidate-id", default=None,
+                           help="Candidate to validate; default is the highest-confidence entry")
+    p_dynamic.add_argument("--model", default=os.environ.get("VULN_PIPELINE_MODEL"),
+                           help="Model string (required; or set VULN_PIPELINE_MODEL)")
+    p_dynamic.add_argument("--max-turns", type=int, default=DEFAULT_DYNAMIC_MAX_TURNS,
+                           help=f"Dynamic-agent turn budget (default {DEFAULT_DYNAMIC_MAX_TURNS})")
+    p_dynamic.add_argument(
+        "--max-iterations", type=int, default=DEFAULT_DYNAMIC_MAX_ITERATIONS,
+        help=("Maximum adaptive dynamic-validation rounds "
+              f"(default {DEFAULT_DYNAMIC_MAX_ITERATIONS})"),
+    )
+    p_dynamic.add_argument("--results-dir", default="./results", help="Output root")
+    p_dynamic.add_argument(
+        "--instrumentation", choices=("off", "auto", "llvm"), default=None,
+        help="Dynamic observation provider: off, auto, llvm, or target-manifest default",
+    )
+    p_dynamic.add_argument(
+        "--symbolic-execution", choices=("off", "auto", "klee", "symcc"), default=None,
+        help="Dynamic symbolic-execution helper: off, auto, klee, symcc, or target default",
+    )
+    p_dynamic.add_argument("--docker-params", type=Path, default=None, metavar="PATH",
+                           help="Override the target's docker-params.yaml")
+    p_dynamic.add_argument("--dangerously-no-sandbox", dest="dangerously_no_sandbox",
+                           action="store_true", help="See `run --help`.")
+    p_dynamic.add_argument("--engagement-context", type=Path, default=None,
+                           help="Path to an authorization/engagement-scope file")
+
     p_run = sub.add_parser("run", help="Run find+grade against a target")
     p_run.add_argument("target", help="Target name (under ./targets/) or path to target dir")
     p_run.add_argument("--find-only", action="store_true", help="Skip grade stage")
+    p_run.add_argument(
+        "--instrumentation", choices=("off", "auto", "llvm"), default=None,
+        help="Dynamic observation provider: off, auto, or llvm; default uses target manifest",
+    )
+    p_run.add_argument(
+        "--symbolic-execution", choices=("off", "auto", "klee", "symcc"), default=None,
+        help="Dynamic symbolic-execution helper: off, auto, klee, symcc, or target default",
+    )
     p_run.add_argument("--runs", type=int, default=1, help="Number of independent runs")
     p_run.add_argument("--parallel", action="store_true",
                        help="Run all --runs concurrently (~1GB RAM per run)")
@@ -958,6 +1076,11 @@ def main() -> int:
                        help="Run recon agent to auto-discover focus areas (overrides config.yaml)")
     p_run.add_argument("--max-turns", type=int, default=DEFAULT_FIND_MAX_TURNS,
                        help=f"Find-agent turn budget (default {DEFAULT_FIND_MAX_TURNS})")
+    p_run.add_argument(
+        "--max-iterations", type=int, default=DEFAULT_DYNAMIC_MAX_ITERATIONS,
+        help=("Maximum adaptive dynamic-validation rounds "
+              f"(default {DEFAULT_DYNAMIC_MAX_ITERATIONS})"),
+    )
     p_run.add_argument("--recon-max-turns", type=int, default=RECON_MAX_TURNS,
                        help=f"Recon-agent turn budget for --auto-focus (default {RECON_MAX_TURNS})")
     p_run.add_argument("--model", default=os.environ.get("VULN_PIPELINE_MODEL"),
@@ -1062,7 +1185,7 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    if args.command in ("build", "inspect", "run", "recon", "report", "patch"):
+    if args.command in ("build", "inspect", "static", "dynamic", "run", "recon", "report", "patch"):
         if err := sandbox.require(args.dangerously_no_sandbox):
             print(err, file=sys.stderr)
             return 1
@@ -1071,6 +1194,10 @@ def main() -> int:
         return _cmd_build(args)
     if args.command == "inspect":
         return _cmd_inspect(args)
+    if args.command == "static":
+        return _cmd_static(args)
+    if args.command == "dynamic":
+        return _cmd_dynamic(args)
     if args.command == "run":
         return _cmd_run(args)
     if args.command == "recon":
@@ -1194,6 +1321,212 @@ def _cmd_build(args) -> int:
     return 0
 
 
+def _load_static_report(path: Path) -> tuple[dict, str | None]:
+    """Load a static report while preserving optional provenance metadata."""
+    try:
+        payload = json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}, f"static report not found: {path}"
+    except (OSError, json.JSONDecodeError) as exc:
+        return {}, f"cannot read static report {path}: {exc}"
+
+    if isinstance(payload, dict):
+        if not isinstance(payload.get("findings"), list):
+            return {}, "static report must contain a `findings` JSON array"
+        return payload, None
+    if isinstance(payload, list):
+        return {"findings": payload}, None
+    return {}, "static report must contain a `findings` JSON array"
+
+
+def _load_static_findings(path: Path) -> tuple[list[StaticFinding], str | None]:
+    """Load the bounded, agent-authored candidate list from a static report."""
+    payload, error = _load_static_report(path)
+    if error:
+        return [], error
+
+    findings: list[StaticFinding] = []
+    for item in payload["findings"][:5]:
+        if isinstance(item, dict):
+            findings.append(StaticFinding.from_dict(item))
+    findings.sort(key=lambda finding: finding.confidence, reverse=True)
+    if not findings:
+        return [], "static report contains no usable findings"
+    return findings, None
+
+
+def _cmd_static(args) -> int:
+    """Run only the source-reading phase and publish its report."""
+    try:
+        target_dir = resolve_target_dir(args.target)
+        target = TargetConfig.load(target_dir, docker_params_path=args.docker_params)
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    global _current_target_name
+    _current_target_name = target.name
+    if not args.model:
+        print("error: --model required (or set VULN_PIPELINE_MODEL)", file=sys.stderr)
+        return 1
+    agent_env = _resolve_auth_env()
+    if agent_env is None:
+        print(NO_AUTH_MSG, file=sys.stderr)
+        return 1
+    _warn_bedrock_model(args.model)
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    out_dir = Path(args.results_dir) / target.name / timestamp
+    out_dir.mkdir(parents=True, exist_ok=True)
+    static_path = out_dir / "static_analysis.json"
+    transcript_path = out_dir / "static_transcript.jsonl"
+    print(f"[static] Target: {target.name} (model={args.model})")
+    try:
+        prepare_target_image(target, rebuild=False)
+        findings, result, timings, parse_error = asyncio.run(run_static_analysis(
+            target=target,
+            model=args.model,
+            max_turns=args.max_turns,
+            agent_env=agent_env,
+            container_name=f"static_{target.name}_standalone",
+            transcript_path=str(transcript_path),
+            progress_prefix="[static]",
+            system_prompt=build_system_prompt(args.engagement_context),
+        ))
+    except Exception as exc:
+        # Keep Docker/build/runtime failures in the same user-facing contract
+        # as the other agent-spawning subcommands.
+        print(f"error: static phase failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+
+    static_path.write_text(json.dumps({
+        "phase": "static_analysis",
+        "target": target.name,
+        "repository": target.github_url,
+        "commit": target.commit,
+        "source_root": target.source_root,
+        "status": (
+            "agent_failed" if result.error else
+            "parse_error" if parse_error and not findings else
+            "candidates_found" if findings else "no_candidates"
+        ),
+        "candidate_count": len(findings),
+        "findings": [finding.to_dict() for finding in findings],
+        "parse_error": parse_error,
+        "agent_error": result.error,
+        "timings": timings,
+    }, indent=2, ensure_ascii=False) + "\n")
+    print(f"[static] {len(findings)} candidate(s) → {static_path}")
+    return 0 if findings and not result.error else 2
+
+
+def _cmd_dynamic(args) -> int:
+    """Run dynamic validation for a selected static candidate, without grade."""
+    try:
+        target_dir = resolve_target_dir(args.target)
+        target = TargetConfig.load(target_dir, docker_params_path=args.docker_params)
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    global _current_target_name
+    _current_target_name = target.name
+    if not args.model:
+        print("error: --model required (or set VULN_PIPELINE_MODEL)", file=sys.stderr)
+        return 1
+    agent_env = _resolve_auth_env()
+    if agent_env is None:
+        print(NO_AUTH_MSG, file=sys.stderr)
+        return 1
+    _warn_bedrock_model(args.model)
+
+    report_payload, load_error = _load_static_report(args.static_report)
+    if load_error:
+        print(f"error: {load_error}", file=sys.stderr)
+        return 1
+    reported_commit = report_payload.get("commit")
+    if reported_commit and reported_commit != target.commit:
+        print(
+            "error: static report commit does not match target: "
+            f"report={reported_commit}, target={target.commit}",
+            file=sys.stderr,
+        )
+        return 1
+    findings = [
+        StaticFinding.from_dict(item)
+        for item in report_payload["findings"][:5]
+        if isinstance(item, dict)
+    ]
+    findings.sort(key=lambda finding: finding.confidence, reverse=True)
+    if not findings:
+        print("error: static report contains no usable findings", file=sys.stderr)
+        return 1
+    if args.candidate_id:
+        matches = [f for f in findings if f.candidate_id == args.candidate_id]
+        if not matches:
+            print(f"error: candidate {args.candidate_id!r} is not in {args.static_report}",
+                  file=sys.stderr)
+            return 1
+        candidate = matches[0]
+    else:
+        candidate = findings[0]
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    out_dir = Path(args.results_dir) / target.name / f"dynamic-{timestamp}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    static_copy = out_dir / "static_analysis.json"
+    static_copy.write_text(json.dumps({
+        "phase": "static_analysis",
+        "status": "candidates_found",
+        "candidate_count": len(findings),
+        "selected_candidate_id": candidate.candidate_id,
+        "repository": target.github_url,
+        "commit": target.commit,
+        "findings": [finding.to_dict() for finding in findings],
+        "source_report": str(args.static_report),
+    }, indent=2, ensure_ascii=False) + "\n")
+
+    print(f"[dynamic] Target: {target.name} (model={args.model})")
+    print(f"[dynamic] Candidate: {candidate.candidate_id} ({candidate.location})")
+    print(f"[dynamic] Instrumentation: {args.instrumentation or (target.instrumentation or {}).get('default', 'auto')}")
+    print(f"[dynamic] Symbolic execution: {args.symbolic_execution or (target.symbolic_execution or {}).get('default', 'off')}")
+    try:
+        prepare_target_image(target, rebuild=False)
+        result, agent_result, timings = asyncio.run(run_dynamic_validation(
+            target=target,
+            candidate=candidate,
+            model=args.model,
+            max_turns=args.max_turns,
+            agent_env=agent_env,
+            container_name=f"dynamic_{target.name}_standalone",
+            transcript_path=str(out_dir / "dynamic_transcript.jsonl"),
+            progress_prefix="[dynamic]",
+            system_prompt=build_system_prompt(args.engagement_context),
+            instrumentation=args.instrumentation,
+            instrumentation_result_path=str(out_dir / "instrumentation"),
+            symbolic_execution=args.symbolic_execution,
+            symbolic_execution_result_path=str(out_dir / "symbolic_execution"),
+            crash_result_path=str(out_dir / "crash-result.xml"),
+            max_iterations=args.max_iterations,
+        ))
+    except Exception as exc:
+        print(f"error: dynamic phase failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+
+    (out_dir / "dynamic_validation.json").write_text(json.dumps({
+        "phase": "dynamic_validation",
+        "candidate": candidate.to_dict(),
+        "result": result.to_dict(),
+        "timings": timings,
+        "agent_error": agent_result.error,
+    }, indent=2, ensure_ascii=False) + "\n")
+    print(f"[dynamic] status={result.status} → {out_dir / 'dynamic_validation.json'}")
+    if result.crash or result.logic:
+        print(f"[dynamic] PoC artifact is ready for the original grade phase: {out_dir}")
+        return 0
+    return 2
+
+
 def _cmd_run(args) -> int:
     # Resolve target
     try:
@@ -1222,8 +1555,12 @@ def _cmd_run(args) -> int:
     print(f"  binary:      {target.binary_path}")
     print(f"  source_root: {target.source_root}")
     print(f"  max_turns:   {args.max_turns}")
+    print(f"  max_iterations: {args.max_iterations}")
     print(f"  runs:        {args.runs}{' (parallel)' if args.parallel else ''}")
     print(f"  find_only:   {args.find_only}")
+    print(
+        f"  instrumentation: {args.instrumentation or (target.instrumentation or {}).get('default', 'auto')}"
+    )
     if target.focus_areas and not args.auto_focus:
         print(f"  focus_areas: {len(target.focus_areas)} configured")
     if args.auto_focus:
@@ -1254,8 +1591,9 @@ def _cmd_run(args) -> int:
         if result.status == "error":
             _write_result(out_dir, result)
         _sline = f"  run {i}: {result.status:16s} → {out_dir}/result.json"
-        print(color(_sline, "red") if result.status == "crash_found" else _sline)
-        if result.status != "crash_found":
+        passed_status = result.status in {"crash_found", "logic_found"}
+        print(color(_sline, "red") if passed_status else _sline)
+        if not passed_status:
             exit_code = 2
     if args.stream:
         reports = results_root / "reports"

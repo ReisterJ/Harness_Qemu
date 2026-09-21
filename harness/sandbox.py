@@ -35,9 +35,11 @@ def proxy() -> str | None:
 
 
 def network() -> str:
-    if not runtime():
-        return "bridge"
-    return os.environ.get(NETWORK_ENV) or NETWORK_DEFAULT
+    # An explicit network is useful for the documented dangerous/no-gVisor
+    # mode too (for example, host networking with a loopback model proxy).
+    # Without an override, retain the isolated network under gVisor and the
+    # historical Docker bridge default outside it.
+    return os.environ.get(NETWORK_ENV) or (NETWORK_DEFAULT if runtime() else "bridge")
 
 
 # Alias so ``agent_container``'s ``network`` parameter can shadow the function
