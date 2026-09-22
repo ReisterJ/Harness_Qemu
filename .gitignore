@@ -13,6 +13,7 @@ results/
 # Downloaded source trees and local experiment targets. These are rebuilt by
 # the target workflow and should not be committed to the harness repository.
 targets/*/source/
+targets/*/src/
 targets/curl-cve-2023-38039/
 targets/curl-socks5-overflow/
 targets/ghostscript-type2-51089/
