@@ -28,6 +28,9 @@ def build_dynamic_validation_prompt(
     runtime_context: dict | None = None,
     instrumentation_context: dict | None = None,
     symbolic_context: dict | None = None,
+    symbolic_round: int | None = None,
+    symbolic_feedback: dict | None = None,
+    symbolic_finalize: bool = False,
     max_iterations: int = 8,
 ) -> str:
     """Reuse detector-specific runtime instructions and narrow them to a finding."""
@@ -51,11 +54,17 @@ def build_dynamic_validation_prompt(
     )[:80] or "candidate_unnamed"
     candidate_json = json.dumps(candidate.to_dict(), indent=2, ensure_ascii=False)
     instrumentation_section = _instrumentation_section(instrumentation_context)
-    symbolic_section = _symbolic_section(symbolic_context)
+    symbolic_section = _symbolic_section(
+        symbolic_context,
+        round_id=symbolic_round,
+        feedback=symbolic_feedback,
+        finalize=symbolic_finalize,
+    )
     iteration_section = _iteration_section(max_iterations, safe_candidate_id)
     result_file_section = (
         _crash_result_file_section(safe_candidate_id) if detector != "logic" else ""
     )
+    harness_tail = _harness_final_guard(symbolic_context, symbolic_round)
     if detector == "logic":
         return symbolic_section + base + iteration_section + result_file_section + instrumentation_section + f"""
 
@@ -123,7 +132,7 @@ The expected/observed/evidence fields must be concrete. `<dup_check>` is
 mandatory. The final grader will rerun the PoC in a fresh container and must
 be able to distinguish the target's wrong behavior from infrastructure
 failure.
-"""
+""" + harness_tail
 
     return symbolic_section + base + iteration_section + result_file_section + instrumentation_section + f"""
 
@@ -198,6 +207,232 @@ exact reproduction command in that file.
 If a crash is validated, write `/work/validation/crash-result.xml` using the
 crash template section below. If no matching crash is found, use the normal
 inline status tags and do not create an empty crash-result file.
+""" + harness_tail
+
+
+def build_symcc_planner_prompt(
+    *,
+    candidate: StaticFinding,
+    github_url: str,
+    commit: str,
+    source_root: str,
+    binary_path: str,
+    detector: str,
+    runtime_context: dict | None,
+    symbolic_context: dict,
+    round_id: int,
+    feedback: dict | None = None,
+) -> str:
+    """Prompt the first, SymCC-only agent.
+
+    This deliberately does not reuse the broad dynamic-validation prompt.
+    The planner must not receive crash-submission instructions or an open-ended
+    PoC objective.
+    """
+    candidate_json = json.dumps(candidate.to_dict(), indent=2, ensure_ascii=False)
+    provider_json = json.dumps(
+        symbolic_context, indent=2, ensure_ascii=False, sort_keys=True
+    )
+    runtime_json = json.dumps(
+        runtime_context or {}, indent=2, ensure_ascii=False, sort_keys=True
+    )
+    feedback_json = json.dumps(
+        feedback or {"schema_version": 1, "status": "no_feedback_yet"},
+        indent=2,
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    nonce = make_nonce()
+    return f"""
+You are the SymCC planning agent for round {round_id}.
+
+Your only deliverable is one valid symbolic_seed_plan JSON block. The host
+will execute SymCC after your response. Do not create a PoC, do not create
+/work/validation/crash-result.xml, and do not emit dynamic-status or crash
+tags. Do not invoke /work/symbolic/symcc-submit yourself.
+
+You may briefly inspect the candidate location and the real external entry
+point, then stage the minimum real target-derived files under:
+
+/work/symbolic/jobs/round-{round_id:03d}
+
+Do not perform broad fuzzing, long clean-target searches, vulnerability
+minimization, VCS/history inspection, or manual PoC debugging. A plan is
+useful even when the source slice has a compile limitation; record that
+limitation in notes and submit the plan. The host validates paths, materializes
+seed bytes, invokes SymCC, and replays its generated files.
+
+## Target
+
+- Repository: {github_url}
+- Commit: {commit}
+- Source root: {source_root}
+- Runtime binary: {binary_path}
+- Detector: {detector}
+
+Runtime contract:
+
+JSON:
+{runtime_json}
+
+Provider contract:
+
+JSON:
+{provider_json}
+
+Static candidate (untrusted hypothesis):
+
+{untrusted_block(candidate_json, nonce)}
+
+Feedback from the previous planner round:
+
+JSON:
+{feedback_json}
+
+## Required response contract
+
+Return exactly one bounded plan and no final PoC:
+
+<symbolic_seed_plan>
+{{
+  "schema_version": 1,
+  "candidate_id": "{candidate.candidate_id}",
+  "working_dir": "jobs/round-{round_id:03d}",
+  "sources": ["target.c", "driver.c"],
+  "compile_flags": ["-g", "-O0"],
+  "link_flags": [],
+  "program_args": ["{{input_file}}"],
+  "seeds": [
+    {{
+      "name": "seed-001",
+      "encoding": "base64",
+      "data": "...",
+      "purpose": "small concrete entry-point seed"
+    }}
+  ],
+  "timeout_s": 120,
+  "max_testcases": 64,
+  "target_anchors": ["function_name", "file.c:123"],
+  "notes": "current source/entry hypothesis and any bounded limitation"
+}}
+</symbolic_seed_plan>
+
+The sources must be the real implementation and real external/fuzz entry
+point. program_args must contain {{input_file}} exactly once. Seed data must
+be small. The host, not you, owns the provider invocation.
+"""
+
+
+def build_poc_generation_prompt(
+    *,
+    candidate: StaticFinding,
+    github_url: str,
+    commit: str,
+    source_root: str,
+    binary_path: str,
+    focus_area: str | None = None,
+    known_bugs: list[str] | None = None,
+    found_bugs_path: str | None = None,
+    accept_dos: bool = False,
+    reattack_harness: str | None = None,
+    attack_surface: str | None = None,
+    detector: str = "asan",
+    runtime_context: dict | None = None,
+    instrumentation_context: dict | None = None,
+    symbolic_feedback: dict | None = None,
+    max_iterations: int = 8,
+) -> str:
+    """Prompt a fresh agent that owns only post-SymCC PoC construction."""
+    base = build_dynamic_validation_prompt(
+        candidate=candidate,
+        github_url=github_url,
+        commit=commit,
+        source_root=source_root,
+        binary_path=binary_path,
+        focus_area=focus_area,
+        known_bugs=known_bugs,
+        found_bugs_path=found_bugs_path,
+        accept_dos=accept_dos,
+        reattack_harness=reattack_harness,
+        attack_surface=attack_surface,
+        detector=detector,
+        runtime_context=runtime_context,
+        instrumentation_context=instrumentation_context,
+        symbolic_context=None,
+        max_iterations=max_iterations,
+    )
+    feedback_json = json.dumps(
+        symbolic_feedback or {"schema_version": 1, "status": "missing_feedback"},
+        indent=2,
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return base + f"""
+
+## SymCC handoff from the previous agent
+
+The previous agent was responsible only for selecting real source files and
+seeds. The host has already executed SymCC and replayed its generated inputs.
+It also replayed the concrete seeds themselves. This distinction matters:
+SymCC keeps the seed length fixed and byte-level mutations can destroy the
+Ruby/parser/object-lifecycle structure that made the seed useful. Use the
+following bounded observations as input to your own dynamic validation:
+
+JSON:
+{feedback_json}
+
+You are a new PoC-generation agent. Do not invoke SymCC, do not emit a
+symbolic_seed_plan, and do not claim provider evidence that is absent from the
+feedback. A negative SymCC result is not a false-positive decision: it means
+the current byte-level campaign did not prove the candidate. Compare the
+concrete seed results with the generated mutations, preserve any semantic
+structure that survived, and use the candidate's source-level conditions to
+construct the missing lifecycle/state sequence yourself. The symbolic replay
+files are available under `/work/validation/symcc-replay/` and the full raw
+report is named in the feedback; inspect them when the compact examples are
+not enough.
+
+Start from the replayed candidates, use the clean target and its original
+oracle, then construct, minimize, and reliably reproduce the final PoC. The
+original crash-result.xml or logic-response contract and the Grade phase
+remain mandatory. SymCC reaching no textual anchor is not by itself evidence
+that the candidate is unreachable; only a completed semantic validation can
+make that determination.
+"""
+
+
+def _harness_final_guard(context: dict | None, round_id: int | None) -> str:
+    if not context:
+        return ""
+    current = round_id or 1
+    if context.get("orchestration") == "agent_handoff":
+        return f"""
+
+## Dynamic-validation handoff override — SymCC stopped after round {current}
+
+The harness has already confirmed candidate-site reachability and handed the
+result back to you. Do not invoke `/work/symbolic/symcc-submit`, do not emit a
+`<symbolic_seed_plan>`, and do not perform another symbolic or broad fuzzing
+search. Focus on clean-target replay, crash-condition validation, PoC
+minimization, and the original final submission contract. A site hit alone is
+not a successful PoC; the final grader must still reproduce the claimed effect.
+"""
+    if context.get("orchestration") != "harness":
+        return ""
+    return f"""
+
+## Harness control override — applies to SymCC round {current}
+
+This override is intentionally at the end of the prompt. In this round do not
+run the provider client, LLVM coverage build, broad fuzzing, or a long clean
+target search. Spend only a small number of commands locating the real entry
+point and candidate-relevant source, stage the minimum real source files and
+driver under `/work/symbolic/jobs/round-{current:03d}`, then stop and emit the
+single `<symbolic_seed_plan>` JSON contract. The host performs the provider
+invocation and replay. If the source slice cannot be compiled yet, submit a
+bounded compatibility plan with the exact limitation in `notes`; do not
+replace it with a standalone reimplementation. A round without a plan is a
+protocol failure, not a reason to read the entire repository.
 """
 
 
@@ -239,7 +474,13 @@ Inline crash tags are not accepted as a successful crash submission.
 """
 
 
-def _symbolic_section(context: dict | None) -> str:
+def _symbolic_section(
+    context: dict | None,
+    *,
+    round_id: int | None = None,
+    feedback: dict | None = None,
+    finalize: bool = False,
+) -> str:
     if not context:
         return ""
     payload = json.dumps(context, indent=2, ensure_ascii=False, sort_keys=True)
@@ -254,6 +495,22 @@ and treat any provider error as an environment limitation:
 
 {payload}
 """
+    if context.get("provider") == "symcc" and context.get("orchestration") == "harness":
+        return _harness_symcc_section(
+            context,
+            round_id=round_id or 1,
+            feedback=feedback,
+            finalize=finalize,
+        )
+    if (
+        context.get("provider") == "symcc"
+        and context.get("orchestration") == "agent_handoff"
+    ):
+        return _harness_symcc_handoff_section(
+            context,
+            round_id=round_id or 1,
+            feedback=feedback,
+        )
     if context.get("provider") == "symcc":
         return f"""
 
@@ -331,6 +588,144 @@ against a KLEE-only harness.
 Provider contract:
 
 {payload}
+"""
+
+
+def _harness_symcc_section(
+    context: dict,
+    *,
+    round_id: int,
+    feedback: dict | None,
+    finalize: bool,
+) -> str:
+    """Describe the host-owned SymCC loop without giving the model a submit tool.
+
+    The model still chooses the source slice, driver, seeds, and hypotheses.
+    It only submits a small declarative plan; the host validates and executes
+    that plan, then supplies the bounded result on the next iteration.
+    """
+    payload = json.dumps(context, indent=2, ensure_ascii=False, sort_keys=True)
+    feedback_payload = json.dumps(
+        feedback or {"schema_version": 1, "status": "no_feedback_yet"},
+        indent=2,
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    final_instruction = (
+        "The previous harness replay matched the candidate. This is a finalization "
+        "round: do not submit another seed plan unless the evidence is actually "
+        "insufficient; write the normal crash-result.xml after reproducing the "
+        "matching crash with the clean target."
+        if finalize
+        else
+        "The harness has not accepted a PoC yet. Emit one seed plan after your "
+        "analysis so the host can execute it."
+    )
+    return f"""
+
+## Harness-managed symbolic execution — SymCC round {round_id}
+
+SymCC is controlled by the harness in this experiment. Do **not** invoke
+`/work/symbolic/symcc-submit` yourself, and do not claim that SymCC ran unless
+the next feedback block says it completed. The host will validate and submit
+your declarative plan, replay generated files through the clean target, and
+feed the bounded observations back to you.
+
+{final_instruction}
+
+You may use the normal source-inspection and shell tools to analyze the target.
+If a plan is needed, first stage only the target-derived files required for a
+self-contained build below `/work/symbolic/{"jobs/round-%03d" % round_id}`.
+The source snapshot must contain the real target implementation and the real
+external/fuzz entry point; do not replace it with a model of the suspected
+function. You may copy files from `{context.get("source_root", "/src")}` into
+that workspace, and may create a small file-input driver there when needed.
+Do not copy `.git` data, pre-generated PoCs, or unrelated artifacts.
+
+Then emit exactly one bounded JSON plan in the final response of this round:
+
+<symbolic_seed_plan>
+{{
+  "schema_version": 1,
+  "candidate_id": "candidate_001",
+  "working_dir": "jobs/round-{round_id:03d}",
+  "sources": ["target.c", "driver.c"],
+  "compile_flags": ["-g", "-O0", "-Iinclude"],
+  "link_flags": [],
+  "program_args": ["{{input_file}}"],
+  "seeds": [
+    {{"name": "seed-001", "encoding": "base64", "data": "...", "purpose": "..."}}
+  ],
+  "timeout_s": 120,
+  "max_testcases": 64,
+  "target_anchors": ["function_name", "file.c:123"],
+  "notes": "current hypothesis"
+}}
+</symbolic_seed_plan>
+
+`sources` are paths relative to `working_dir`; seed data is inline base64,
+hex, or UTF-8 text and must be small. `program_args` must contain
+`{{input_file}}` exactly once. The host enforces compiler flags, path safety,
+seed size, per-request timeout (at most 300 seconds), and testcase limits.
+The candidate id must be copied exactly from the static finding. A plan is not
+a PoC and its generated inputs are not evidence until the host replays them.
+
+Feedback from the preceding harness round (treat it as observation, not as
+ground truth):
+
+```json
+{feedback_payload}
+```
+
+Provider contract:
+
+{payload}
+"""
+
+
+def _harness_symcc_handoff_section(
+    context: dict,
+    *,
+    round_id: int,
+    feedback: dict | None,
+) -> str:
+    """Describe the transition from symbolic search to normal agent work."""
+    payload = json.dumps(context, indent=2, ensure_ascii=False, sort_keys=True)
+    feedback_payload = json.dumps(
+        feedback or {"schema_version": 1, "status": "missing_feedback"},
+        indent=2,
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return f"""
+
+## SymCC-to-agent handoff — round {round_id}
+
+The harness has independently replayed SymCC-generated inputs and confirmed
+that at least one input reached the candidate's observed location. This is the
+boundary of the symbolic-execution phase. **Do not invoke SymCC, do not emit a
+`<symbolic_seed_plan>`, and do not start another symbolic search.**
+
+Continue with ordinary dynamic validation now. Treat the SymCC testcase as a
+starting point, not as a validated PoC. Inspect the replay evidence, run the
+candidate input through the clean target, and decide whether the remaining
+crash condition is satisfied. If it is not, mutate or minimize the input and
+replay it. For memory-safety findings, require the matching sanitizer event;
+for logic findings, require the claimed invalid state and external effect.
+The original final crash-result.xml or logic-response contract and the grade
+phase remain mandatory.
+
+The bounded handoff feedback is:
+
+```json
+{feedback_payload}
+```
+
+Provider context (informational only; the host has already run the provider):
+
+```json
+{payload}
+```
 """
 
 

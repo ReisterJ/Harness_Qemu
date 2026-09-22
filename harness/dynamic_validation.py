@@ -3,13 +3,15 @@
 """Dynamic validation phase of the split find workflow."""
 from __future__ import annotations
 
+import asyncio
 import time
 import json
 import re
+import shlex
 import xml.etree.ElementTree as ET
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 from xml.sax.saxutils import escape as xml_escape
 
 from . import docker_ops
@@ -24,9 +26,14 @@ from .artifacts import (
 from .config import TargetConfig
 from .instrumentation import select_provider
 from .instrumentation.base import InstrumentationReport
-from .prompts.dynamic_validation_prompt import build_dynamic_validation_prompt
+from .prompts.dynamic_validation_prompt import (
+    build_dynamic_validation_prompt,
+    build_poc_generation_prompt,
+    build_symcc_planner_prompt,
+)
 from .runtimes import open_runtime_session
 from .symbolic import KleeSession, SymccSession, select_symbolic_execution
+from .symbolic.seed_plan import SeedPlanError, parse_seed_plan
 
 _DYNAMIC_STATUSES = {
     "not_reached",
@@ -100,6 +107,20 @@ async def run_dynamic_validation(
         symbolic_context = (
             symbolic_session.prepare_agent(container) if symbolic_session else None
         )
+        if (
+            symbolic_session is not None
+            and isinstance(symbolic_session, SymccSession)
+            and symbolic_context is not None
+            and symbolic_context.get("status") == "ready"
+        ):
+            # This marker switches only the prompt contract. The actual
+            # provider invocation is performed below by the host harness.
+            symbolic_context = dict(symbolic_context)
+            symbolic_context.update({
+                "orchestration": "harness",
+                "source_root": target.source_root,
+                "binary_path": target.binary_path,
+            })
         if provider is not None:
             prepare_started = time.time()
             instrumentation_prepared = provider.prepare(
@@ -124,37 +145,69 @@ async def run_dynamic_validation(
             }
         else:
             instrumentation_context = None
-        prompt = build_dynamic_validation_prompt(
-            candidate=candidate,
-            github_url=target.github_url,
-            commit=target.commit,
-            source_root=target.source_root,
-            binary_path=target.binary_path,
-            focus_area=focus_area,
-            known_bugs=known_bugs if known_bugs is not None else target.known_bugs,
-            found_bugs_path="/tmp/found_bugs.jsonl" if found_bugs_path else None,
-            accept_dos=accept_dos,
-            reattack_harness=target.reattack_harness,
-            attack_surface=target.attack_surface,
-            detector=target.detector,
-            runtime_context=target.runtime_context(),
-            instrumentation_context=instrumentation_context,
-            symbolic_context=symbolic_context,
-            max_iterations=iteration_limit,
-        )
         started = time.time()
-        result = await run_agent(
-            prompt=prompt,
-            max_turns=max_turns,
-            model=model,
-            container=container,
-            transcript_path=transcript_path,
-            progress_prefix=progress_prefix,
-            system_prompt=system_prompt,
-            max_resume_attempts=max_resume_attempts,
-            tools=["Read", "Write", "Bash"],
-        )
-        timings["dynamic_validation"] = time.time() - started
+        if (
+            symbolic_session is not None
+            and isinstance(symbolic_session, SymccSession)
+            and symbolic_context is not None
+            and symbolic_context.get("orchestration") == "harness"
+        ):
+            result, orchestration_timings = await _run_harness_managed_symcc(
+                target=target,
+                candidate=candidate,
+                model=model,
+                max_turns=max_turns,
+                container=container,
+                symbolic_session=symbolic_session,
+                symbolic_context=symbolic_context,
+                focus_area=focus_area,
+                known_bugs=known_bugs if known_bugs is not None else target.known_bugs,
+                found_bugs_path="/tmp/found_bugs.jsonl" if found_bugs_path else None,
+                accept_dos=accept_dos,
+                instrumentation_context=instrumentation_context,
+                system_prompt=system_prompt,
+                reattack_harness=target.reattack_harness,
+                attack_surface=target.attack_surface,
+                detector=target.detector,
+                runtime_context=target.runtime_context(),
+                iteration_limit=iteration_limit,
+                max_resume_attempts=max_resume_attempts,
+                transcript_path=transcript_path,
+                progress_prefix=progress_prefix,
+                symbolic_result_path=symbolic_execution_result_path,
+            )
+            timings.update(orchestration_timings)
+        else:
+            prompt = build_dynamic_validation_prompt(
+                candidate=candidate,
+                github_url=target.github_url,
+                commit=target.commit,
+                source_root=target.source_root,
+                binary_path=target.binary_path,
+                focus_area=focus_area,
+                known_bugs=known_bugs if known_bugs is not None else target.known_bugs,
+                found_bugs_path="/tmp/found_bugs.jsonl" if found_bugs_path else None,
+                accept_dos=accept_dos,
+                reattack_harness=target.reattack_harness,
+                attack_surface=target.attack_surface,
+                detector=target.detector,
+                runtime_context=target.runtime_context(),
+                instrumentation_context=instrumentation_context,
+                symbolic_context=symbolic_context,
+                max_iterations=iteration_limit,
+            )
+            result = await run_agent(
+                prompt=prompt,
+                max_turns=max_turns,
+                model=model,
+                container=container,
+                transcript_path=transcript_path,
+                progress_prefix=progress_prefix,
+                system_prompt=system_prompt,
+                max_resume_attempts=max_resume_attempts,
+                tools=["Read", "Write", "Bash"],
+            )
+            timings["dynamic_validation"] = time.time() - started
         timings["dynamic_agent_tool_calls"] = float(result.tool_call_count)
         timings["dynamic_agent_messages"] = float(result.assistant_message_count)
         if symbolic_session is not None:
@@ -428,6 +481,727 @@ async def run_dynamic_validation(
     ), result, timings
 
 
+async def _run_harness_managed_symcc(
+    *,
+    target: TargetConfig,
+    candidate: StaticFinding,
+    model: str,
+    max_turns: int,
+    container: str,
+    symbolic_session: SymccSession,
+    symbolic_context: dict,
+    focus_area: str | None,
+    known_bugs: list[str] | None,
+    found_bugs_path: str | None,
+    accept_dos: bool,
+    instrumentation_context: dict | None,
+    system_prompt: str | None,
+    reattack_harness: str | None,
+    attack_surface: str | None,
+    detector: str,
+    runtime_context: dict,
+    iteration_limit: int,
+    max_resume_attempts: int,
+    transcript_path: str | None,
+    progress_prefix: str | None,
+    symbolic_result_path: str | None,
+) -> tuple[AgentResult, dict[str, float]]:
+    """Run the host-owned SymCC/agent feedback loop.
+
+    The agent supplies a declarative source/seed plan.  The harness validates
+    it, invokes the fixed SymCC client, replays generated files through the
+    clean target, and exposes only bounded observations on the next round.
+    This keeps provider invocation deterministic while retaining the agent's
+    role in source understanding and hypothesis refinement.
+    """
+    started = time.time()
+    deadline = time.monotonic() + 1800.0
+    merged = AgentResult()
+    feedback: dict | None = None
+    rounds = 0
+    time_to_site_reached: float | None = None
+    # `max_turns` is deliberately not reduced for the planner.  The caller's
+    # default is 20,000 and the wall-clock deadline below is the real bound;
+    # reducing the step cap here caused the model to stop while it was still
+    # staging a real source slice.
+    planner_max_turns = max_turns
+
+    for round_id in range(1, iteration_limit + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 15:
+            merged.error = "agent/model_blocked: phase exceeded 1800s"
+            break
+
+        prompt = build_symcc_planner_prompt(
+            candidate=candidate,
+            github_url=target.github_url,
+            commit=target.commit,
+            source_root=target.source_root,
+            binary_path=target.binary_path,
+            detector=detector,
+            runtime_context=runtime_context,
+            symbolic_context=symbolic_context,
+            feedback=feedback,
+            round_id=round_id,
+        )
+        # Give the semantic planner enough time to stage a real source slice.
+        # SymCC and the clean-target PoC phase still need a substantial part of
+        # the fixed 1800-second budget, so this is intentionally a single
+        # bounded planning turn in the normal case rather than eight short
+        # turns that repeatedly rediscover the same source facts.
+        agent_budget = min(600.0, max(90.0, remaining - 900.0))
+        try:
+            round_result = await asyncio.wait_for(
+                run_agent(
+                    prompt=prompt,
+                    max_turns=planner_max_turns,
+                    model=model,
+                    container=container,
+                    transcript_path=None,
+                    progress_prefix=progress_prefix,
+                    system_prompt=system_prompt,
+                    max_resume_attempts=max_resume_attempts,
+                    tools=["Read", "Write", "Bash"],
+                    phase_timeout_s=agent_budget,
+                    idle_timeout_s=agent_budget,
+                ),
+                timeout=min(agent_budget + 30.0, max(15.0, remaining - 5.0)),
+            )
+        except asyncio.TimeoutError:
+            _terminate_agent_processes(container)
+            round_result = AgentResult(
+                error=f"agent/model_blocked: round exceeded {agent_budget:.0f}s"
+            )
+        if round_result.error and round_result.error.startswith("agent/"):
+            _terminate_agent_processes(container)
+        _merge_agent_result(merged, round_result)
+        _append_transcript(transcript_path, round_result, role="symcc-planner")
+        rounds = round_id
+
+        # A final crash file is the original dynamic-validation contract. Do
+        # not force the model to emit another plan after it has completed it.
+        _crash_data, _crash_error, crash_present = _read_crash_result_xml(
+            container, candidate.candidate_id
+        )
+        plan_text = round_result.find_tagged_message("symbolic_seed_plan")
+        # A model may finish its clean-target proof and include a declarative
+        # plan in the same response.  Run that plan before accepting the crash
+        # so the experiment never labels a direct model result as a SymCC-aided
+        # result.  If there is no plan, an already materialized crash remains
+        # the original final protocol and can terminate normally.
+        if crash_present and not plan_text:
+            break
+        if not plan_text:
+            # Normal negative status tags also terminate this candidate. A
+            # missing plan without a status is an agent failure, not evidence
+            # that the candidate is unreachable.
+            status_text = round_result.find_tagged_message("dynamic_status")
+            if not round_result.error and not status_text:
+                merged.error = "agent/model_blocked: no symbolic seed plan emitted"
+            break
+        try:
+            plan = parse_seed_plan(plan_text, candidate_id=candidate.candidate_id)
+        except SeedPlanError as exc:
+            feedback = _seed_plan_error_feedback(round_id, str(exc))
+            _persist_symcc_feedback(
+                container, symbolic_result_path, round_id, feedback
+            )
+            continue
+
+        symbolic_report = symbolic_session.submit_seed_plan(
+            container, plan, round_id=round_id
+        )
+        replay_report = _replay_symcc_testcases(
+            target=target,
+            candidate=candidate,
+            container=container,
+            workspace=symbolic_session.workspace,
+            plan=plan,
+            symbolic_report=symbolic_report,
+            round_id=round_id,
+        )
+        _persist_symcc_replay(
+            container, symbolic_result_path, round_id, replay_report
+        )
+        feedback = _make_symcc_feedback(
+            round_id=round_id,
+            plan=plan,
+            symbolic_report=symbolic_report,
+            replay_report=replay_report,
+            detector=detector,
+        )
+        if replay_report.get("site_reached"):
+            time_to_site_reached = time.time() - started
+            feedback["handoff"] = {
+                "phase": "agent_dynamic_validation",
+                "reason": (
+                    "SymCC replay reached the candidate observation; stop symbolic "
+                    "exploration and return control to the agent"
+                ),
+                "time_to_site_reached_s": round(time_to_site_reached, 3),
+            }
+        _persist_symcc_feedback(container, symbolic_result_path, round_id, feedback)
+        _write_harness_iteration(container, candidate, feedback, round_id, detector)
+
+        # SymCC is a constrained candidate generator, not the semantic oracle.
+        # Hand off after the first usable campaign even when no textual anchor
+        # was observed: a clean negative result, the original semantic seeds,
+        # and the generated mutations are precisely the feedback the PoC agent
+        # needs to choose a better lifecycle/state construction.  Waiting for
+        # `site_reached` here made the planner loop consume the whole phase and
+        # discarded the most useful LLM-produced seed information.
+        if symbolic_report.get("status") in {"completed", "failed", "unavailable", "invalid_plan"}:
+            remaining = deadline - time.monotonic()
+            if remaining <= 15:
+                merged.error = "agent/model_blocked: no time left after site reach"
+                break
+            handoff_budget = min(900.0, max(30.0, remaining - 15.0))
+            handoff_prompt = build_poc_generation_prompt(
+                candidate=candidate,
+                github_url=target.github_url,
+                commit=target.commit,
+                source_root=target.source_root,
+                binary_path=target.binary_path,
+                focus_area=focus_area,
+                known_bugs=known_bugs,
+                found_bugs_path=found_bugs_path,
+                accept_dos=accept_dos,
+                reattack_harness=reattack_harness,
+                attack_surface=attack_surface,
+                detector=detector,
+                runtime_context=runtime_context,
+                instrumentation_context=instrumentation_context,
+                symbolic_feedback=feedback,
+                max_iterations=iteration_limit,
+            )
+            try:
+                handoff_result = await asyncio.wait_for(
+                    run_agent(
+                        prompt=handoff_prompt,
+                        max_turns=max_turns,
+                        model=model,
+                        container=container,
+                        transcript_path=None,
+                        progress_prefix=progress_prefix,
+                        system_prompt=system_prompt,
+                        max_resume_attempts=max_resume_attempts,
+                        tools=["Read", "Write", "Bash"],
+                        phase_timeout_s=handoff_budget,
+                        idle_timeout_s=handoff_budget,
+                    ),
+                    timeout=min(handoff_budget + 30.0, max(15.0, remaining - 5.0)),
+                )
+            except asyncio.TimeoutError:
+                _terminate_agent_processes(container)
+                handoff_result = AgentResult(
+                    error=f"agent/model_blocked: handoff exceeded {handoff_budget:.0f}s"
+                )
+            if handoff_result.error and handoff_result.error.startswith("agent/"):
+                _terminate_agent_processes(container)
+            _merge_agent_result(merged, handoff_result)
+            _append_transcript(transcript_path, handoff_result, role="poc-generator")
+            break
+
+        if crash_present:
+            break
+
+        if time.monotonic() >= deadline:
+            merged.error = "agent/model_blocked: phase exceeded 1800s"
+            break
+
+    merged.finished_at = time.time()
+    timings = {
+        "dynamic_validation": time.time() - started,
+        "harness_symcc_rounds": float(rounds),
+    }
+    if time_to_site_reached is not None:
+        timings["time_to_site_reached"] = time_to_site_reached
+        timings["symcc_site_reached"] = 1.0
+    else:
+        timings["symcc_site_reached"] = 0.0
+    return merged, timings
+
+
+def _merge_agent_result(destination: AgentResult, source: AgentResult) -> None:
+    """Merge per-round agent telemetry without losing structured messages."""
+    destination.messages.extend(source.messages)
+    destination.result_message = source.result_message or destination.result_message
+    destination.session_id = source.session_id or destination.session_id
+    destination.error = source.error
+    destination.resume_count += source.resume_count
+    destination.tool_call_count += source.tool_call_count
+    destination.assistant_message_count += source.assistant_message_count
+    if destination.started_at is None:
+        destination.started_at = source.started_at
+    destination.finished_at = source.finished_at or destination.finished_at
+    if destination.first_poc_at is None:
+        destination.first_poc_at = source.first_poc_at
+
+
+def _append_transcript(
+    path: str | None, result: AgentResult, *, role: str | None = None
+) -> None:
+    if not path:
+        return
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("a") as stream:
+        for event in result.transcript():
+            if role:
+                event = dict(event)
+                event["harness_agent_role"] = role
+            stream.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
+def _terminate_agent_processes(container: str) -> None:
+    """Stop only the opencode process after an orchestration hard deadline."""
+    try:
+        docker_ops.exec_sh(
+            container,
+            "pids=$(ps -eo pid=,comm= | awk '$2 == \"opencode\" {print $1}'); "
+            "[ -z \"$pids\" ] || kill -TERM $pids; sleep 1; "
+            "pids=$(ps -eo pid=,comm= | awk '$2 == \"opencode\" {print $1}'); "
+            "[ -z \"$pids\" ] || kill -KILL $pids",
+            timeout=5,
+        )
+    except Exception:
+        return
+
+
+def _seed_plan_error_feedback(round_id: int, error: str) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "provider": "symcc",
+        "round_id": round_id,
+        "status": "invalid_plan",
+        "errors": [error[:2000]],
+        "progress": {
+            "testcase_count": 0,
+            "site_reached": False,
+            "matched_candidate": False,
+            "distance_to_candidate": None,
+        },
+    }
+
+
+def _persist_symcc_feedback(
+    container: str,
+    result_path: str | None,
+    round_id: int,
+    feedback: dict[str, Any],
+) -> None:
+    raw = json.dumps(feedback, indent=2, ensure_ascii=False).encode() + b"\n"
+    guest_path = f"/work/validation/symcc-feedback-round-{round_id:03d}.json"
+    try:
+        docker_ops.write_file(container, guest_path, raw)
+    except Exception:
+        pass
+    if result_path:
+        root = Path(result_path)
+        root.mkdir(parents=True, exist_ok=True)
+        (root / f"feedback-round-{round_id:03d}.json").write_bytes(raw)
+
+
+def _persist_symcc_replay(
+    container: str,
+    result_path: str | None,
+    round_id: int,
+    replay_report: dict[str, Any],
+) -> None:
+    """Keep the complete replay evidence outside the next model prompt."""
+    raw = json.dumps(replay_report, indent=2, ensure_ascii=False).encode() + b"\n"
+    guest_path = f"/work/validation/symcc-replay-round-{round_id:03d}.json"
+    try:
+        docker_ops.write_file(container, guest_path, raw)
+    except Exception:
+        pass
+    if result_path:
+        root = Path(result_path)
+        root.mkdir(parents=True, exist_ok=True)
+        (root / f"replay-round-{round_id:03d}.json").write_bytes(raw)
+
+
+def _replay_symcc_testcases(
+    *,
+    target: TargetConfig,
+    candidate: StaticFinding,
+    container: str,
+    workspace: Path | None,
+    plan: Any,
+    symbolic_report: dict[str, Any],
+    round_id: int,
+) -> dict[str, Any]:
+    """Replay seeds and generated files through the original target container.
+
+    A seed is not evidence of a bug by itself, but it is an important part of
+    the semantic handoff: the planner may have chosen a valid lifecycle/state
+    sequence that byte-level SymCC mutations immediately destroy.  The old
+    implementation replayed only provider-generated files, so it threw away
+    exactly that information before the PoC agent saw it.
+    """
+    cases: list[dict[str, Any]] = []
+    if workspace is None:
+        return {
+            "schema_version": 1,
+            "round_id": round_id,
+            "status": "unavailable",
+            "cases": cases,
+            "testcase_count": 0,
+            "site_reached": False,
+            "matched_candidate": False,
+            "errors": ["SymCC workspace is unavailable"],
+        }
+    root = workspace.resolve()
+    markers = _candidate_observation_markers(candidate, plan.target_anchors)
+    raw_cases = symbolic_report.get("testcases", [])
+    if not isinstance(raw_cases, list):
+        raw_cases = []
+    try:
+        rc, _out, err = docker_ops.exec_sh(
+            container,
+            f"mkdir -p -- {shlex.quote(f'/work/validation/symcc-replay/round-{round_id:03d}')}",
+            timeout=15,
+        )
+        if rc:
+            return {
+                "schema_version": 1,
+                "round_id": round_id,
+                "status": "unavailable",
+                "cases": cases,
+                "testcase_count": 0,
+                "site_reached": False,
+                "matched_candidate": False,
+                "errors": [f"cannot create replay directory: {err[-500:]}"]
+            }
+    except Exception as exc:
+        return {
+            "schema_version": 1,
+            "round_id": round_id,
+            "status": "unavailable",
+            "cases": cases,
+            "testcase_count": 0,
+            "site_reached": False,
+            "matched_candidate": False,
+            "errors": [f"cannot create replay directory: {type(exc).__name__}: {exc}"]
+        }
+    def replay_case(
+        *,
+        data: bytes,
+        source_path: str,
+        guest_name: str,
+        kind: str,
+        seed_name: str | None = None,
+    ) -> None:
+        guest_path = f"/work/validation/symcc-replay/round-{round_id:03d}/{guest_name}"
+        try:
+            docker_ops.write_file(container, guest_path, data)
+            argv = [
+                shlex.quote(target.binary_path),
+                *(
+                    shlex.quote(arg.replace("{input_file}", guest_path))
+                    for arg in plan.program_args
+                ),
+            ]
+            command = f"timeout --signal=KILL {max(1, int(plan.timeout_s))}s " + " ".join(argv)
+            rc, out, err = docker_ops.exec_sh(
+                container, command, timeout=max(15, int(plan.timeout_s) + 15)
+            )
+        except Exception as exc:
+            cases.append({
+                "path": source_path,
+                "kind": kind,
+                "seed_name": seed_name,
+                "status": "replay_error",
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+            return
+        output = ((out or "") + "\n" + (err or ""))[-12_000:]
+        sanitizer_event = bool(
+            re.search(
+                r"AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:|"
+                r"LeakSanitizer",
+                output,
+                re.IGNORECASE,
+            )
+        )
+        matched_markers = [marker for marker in markers if marker in output]
+        site_reached = bool(matched_markers)
+        matched = site_reached and (sanitizer_event if target.detector != "logic" else True)
+        cases.append({
+            "path": source_path,
+            "kind": kind,
+            "seed_name": seed_name,
+            "size": len(data),
+            "exit_code": rc,
+            "status": "candidate_match" if matched else "observed",
+            "sanitizer_event": sanitizer_event,
+            "site_reached": site_reached,
+            "matched_candidate": matched,
+            "matched_anchors": matched_markers[:32],
+            "output_tail": output,
+        })
+
+    # Replay the concrete seeds first.  SymCC keeps input length fixed and
+    # often mutates syntax or object-lifecycle setup; a valid seed therefore
+    # carries semantic information that its generated variants may not retain.
+    for index, seed in enumerate(plan.seeds):
+        source = (root / plan.working_dir / "seeds" / seed.name).resolve()
+        if not source.is_relative_to(root) or not source.is_file():
+            cases.append({
+                "path": f"{plan.working_dir}/seeds/{seed.name}",
+                "kind": "seed",
+                "seed_name": seed.name,
+                "status": "missing_seed",
+                "error": "seed materialization is missing from the symbolic workspace",
+            })
+            continue
+        try:
+            data = source.read_bytes()
+        except OSError as exc:
+            cases.append({
+                "path": str(source.relative_to(root)),
+                "kind": "seed",
+                "seed_name": seed.name,
+                "status": "read_error",
+                "error": str(exc),
+            })
+            continue
+        replay_case(
+            data=data,
+            source_path=str(source.relative_to(root)),
+            guest_name=f"seed-{index:03d}-{seed.name}",
+            kind="seed",
+            seed_name=seed.name,
+        )
+
+    generated_index = 0
+    for item in raw_cases[:128]:
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+            continue
+        source = (root / item["path"]).resolve()
+        if not source.is_relative_to(root) or not source.is_file():
+            continue
+        try:
+            data = source.read_bytes()
+        except OSError:
+            continue
+        replay_case(
+            data=data,
+            source_path=item["path"],
+            guest_name=f"generated-{generated_index:03d}",
+            kind="generated",
+            seed_name=str(item.get("seed") or "") or None,
+        )
+        generated_index += 1
+    site_reached = any(bool(item.get("site_reached")) for item in cases)
+    matched_candidate = any(bool(item.get("matched_candidate")) for item in cases)
+    sanitizer = any(bool(item.get("sanitizer_event")) for item in cases)
+    if matched_candidate:
+        distance: int | None = 0
+    elif site_reached:
+        distance = 1
+    elif sanitizer:
+        distance = 2
+    else:
+        distance = None
+    return {
+        "schema_version": 1,
+        "round_id": round_id,
+        "status": "completed",
+        "cases": cases,
+        "testcase_count": len(cases),
+        "seed_case_count": sum(item.get("kind") == "seed" for item in cases),
+        "generated_case_count": sum(item.get("kind") == "generated" for item in cases),
+        "site_reached": site_reached,
+        "matched_candidate": matched_candidate,
+        "sanitizer_event": sanitizer,
+        "distance_to_candidate": distance,
+        "anchors": markers,
+    }
+
+
+def _candidate_observation_markers(
+    candidate: StaticFinding, anchors: tuple[str, ...]
+) -> list[str]:
+    values = list(anchors)
+    values.extend([candidate.location, candidate.static_call_chain, candidate.root_cause])
+    markers: list[str] = []
+    for value in values:
+        for marker in re.findall(r"[A-Za-z_][A-Za-z0-9_.:/-]{3,}", value or ""):
+            if marker not in markers and len(markers) < 64:
+                markers.append(marker)
+    return markers
+
+
+def _make_symcc_feedback(
+    *,
+    round_id: int,
+    plan: Any,
+    symbolic_report: dict[str, Any],
+    replay_report: dict[str, Any],
+    detector: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "provider": "symcc",
+        "round_id": round_id,
+        "status": symbolic_report.get("status", "unknown"),
+        "plan": {
+            "working_dir": plan.working_dir,
+            "source_count": len(plan.sources),
+            "seed_count": len(plan.seeds),
+            "seed_names": [seed.name for seed in plan.seeds],
+            "target_anchors": list(plan.target_anchors),
+            "timeout_s": plan.timeout_s,
+            "max_testcases": plan.max_testcases,
+        },
+        "symbolic": {
+            "status": symbolic_report.get("status"),
+            "duration_s": symbolic_report.get("duration_s"),
+            "compile_duration_s": symbolic_report.get("compile_duration_s"),
+            "testcase_count": symbolic_report.get("testcase_count", 0),
+            "runs": symbolic_report.get("runs", [])[:32],
+            "errors": symbolic_report.get("errors", [])[:20],
+        },
+        # The complete report is persisted separately.  The model receives a
+        # compact, representative view so feedback remains actionable instead
+        # of consuming the context window with dozens of repeated parser
+        # errors or sanitizer tails.
+        "replay": _summarize_replay_for_model(replay_report),
+        "progress": {
+            "detector": detector,
+            "site_reached": bool(replay_report.get("site_reached")),
+            "matched_candidate": bool(replay_report.get("matched_candidate")),
+            "distance_to_candidate": replay_report.get("distance_to_candidate"),
+            "phase": (
+                "agent_handoff"
+                if replay_report.get("site_reached")
+                else "symcc_search"
+            ),
+            "handoff_to_agent": bool(replay_report.get("site_reached")),
+            "interpretation": (
+                "candidate sanitizer event matched an anchor"
+                if replay_report.get("matched_candidate")
+                else "candidate site reached; stop SymCC and hand off crash-condition "
+                "construction to the agent"
+                if replay_report.get("site_reached")
+                else "generated inputs did not yet prove the candidate"
+            ),
+        },
+    }
+
+
+def _summarize_replay_for_model(replay_report: dict[str, Any]) -> dict[str, Any]:
+    """Build a bounded semantic view of a replay campaign for the LLM."""
+    raw_cases = replay_report.get("cases", [])
+    if not isinstance(raw_cases, list):
+        raw_cases = []
+    seeds = [item for item in raw_cases if item.get("kind") == "seed"]
+    generated = [item for item in raw_cases if item.get("kind") == "generated"]
+
+    def compact(item: dict[str, Any]) -> dict[str, Any]:
+        result = {
+            key: item.get(key)
+            for key in (
+                "path", "kind", "seed_name", "size", "exit_code", "status",
+                "sanitizer_event", "site_reached", "matched_candidate",
+                "matched_anchors",
+            )
+            if key in item
+        }
+        output = item.get("output_tail")
+        if isinstance(output, str) and output:
+            result["output_tail"] = output[-1600:]
+        if item.get("error"):
+            result["error"] = str(item["error"])[:1200]
+        return result
+
+    # Always retain every concrete seed (there are at most 16), then include a
+    # small representative sample of mutations.  Prefer candidates with an
+    # observable event or non-zero exit, followed by the first few normal
+    # cases, so the feedback explains both progress and failure modes.
+    interesting = [
+        item for item in generated
+        if item.get("matched_candidate")
+        or item.get("site_reached")
+        or item.get("sanitizer_event")
+        or item.get("exit_code") not in (0, None)
+    ]
+    examples = interesting[:12]
+    if len(examples) < 20:
+        examples.extend(item for item in generated if item not in examples)
+        examples = examples[:20]
+    status_counts: dict[str, int] = {}
+    for item in raw_cases:
+        status = str(item.get("status") or "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+    return {
+        "status": replay_report.get("status"),
+        "testcase_count": replay_report.get("testcase_count", len(raw_cases)),
+        "seed_case_count": replay_report.get("seed_case_count", len(seeds)),
+        "generated_case_count": replay_report.get(
+            "generated_case_count", len(generated)
+        ),
+        "status_counts": status_counts,
+        "site_reached": bool(replay_report.get("site_reached")),
+        "matched_candidate": bool(replay_report.get("matched_candidate")),
+        "sanitizer_event": bool(replay_report.get("sanitizer_event")),
+        "distance_to_candidate": replay_report.get("distance_to_candidate"),
+        "anchors": list(replay_report.get("anchors", []))[:64],
+        "errors": [str(item)[:1200] for item in replay_report.get("errors", [])[:20]],
+        "seed_results": [compact(item) for item in seeds],
+        "generated_examples": [compact(item) for item in examples],
+        "raw_report": (
+            f"/work/validation/symcc-replay-round-"
+            f"{int(replay_report.get('round_id', 0)):03d}.json"
+        ),
+    }
+
+
+def _write_harness_iteration(
+    container: str,
+    candidate: StaticFinding,
+    feedback: dict[str, Any],
+    round_id: int,
+    detector: str,
+) -> None:
+    progress = feedback.get("progress", {})
+    matched = bool(progress.get("matched_candidate"))
+    site = bool(progress.get("site_reached"))
+    sanitizer = bool(feedback.get("replay", {}).get("sanitizer_event"))
+    record = {
+        "schema_version": 1,
+        "round_id": round_id,
+        "candidate_id": candidate.candidate_id,
+        "hypothesis": {
+            "target_site": ", ".join(feedback.get("plan", {}).get("target_anchors", [])),
+            "source": "harness-managed SymCC replay",
+        },
+        "observations": {
+            "site_reached": site,
+            "sanitizer_event": sanitizer,
+            "bad_state_observed": False,
+            "bad_effect_observed": matched if detector == "logic" else sanitizer,
+            "matched_candidate": matched,
+        },
+        "decision": "candidate_ready" if matched else "continue",
+        "reason": str(feedback.get("progress", {}).get("interpretation", ""))[:2000],
+        "evidence": {
+            "provider": "symcc",
+            "distance_to_candidate": progress.get("distance_to_candidate"),
+            "testcase_count": feedback.get("replay", {}).get("testcase_count", 0),
+        },
+    }
+    try:
+        docker_ops.write_file(
+            container,
+            f"/work/validation/iterations/round-{round_id:03d}.json",
+            json.dumps(record, indent=2, ensure_ascii=False).encode() + b"\n",
+        )
+    except Exception:
+        return
+
+
 @contextmanager
 def _open_dynamic_session(
     target: TargetConfig,
@@ -464,7 +1238,24 @@ def _open_dynamic_session(
                 writable_mounts=writable_mounts,
             )
         )
-        yield runtime_session, symbolic_session
+        try:
+            yield runtime_session, symbolic_session
+        finally:
+            # The agent image may create files in the shared mount as root.
+            # Reclaim the temporary workspace while the target container is
+            # still alive, then let ExitStack tear down the runtime.  This
+            # prevents a successful round from becoming a host-side
+            # PermissionError during TemporaryDirectory cleanup.
+            if symbolic_session is not None:
+                try:
+                    docker_ops.exec_sh(
+                        runtime_session.container,
+                        "chmod -R a+rwX -- /work/symbolic",
+                        timeout=15,
+                    )
+                except Exception:
+                    pass
+                symbolic_session.stop()
 
 
 def _split_functions(value: str | None) -> list[str]:

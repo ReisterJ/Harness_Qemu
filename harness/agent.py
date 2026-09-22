@@ -321,6 +321,27 @@ async def _agent_watchdog(
                         f"tool process for {idle_timeout_s:.0f}s"
                     )
         if state["error"]:
+            # Killing the host-side `docker exec` does not necessarily kill
+            # the command it started inside the target container.  In
+            # particular, opencode can remain as PID 1's child while its
+            # stdout pipe keeps the outer coroutine alive.  Terminate only
+            # processes whose executable name is exactly opencode, preserving
+            # the target binary and any bounded probe the agent may have
+            # launched.
+            try:
+                docker_ops.exec_sh(
+                    container,
+                    "pids=$(ps -eo pid=,comm= | awk '$2 == \"opencode\" {print $1}'); "
+                    "[ -z \"$pids\" ] || kill -TERM $pids; "
+                    "sleep 1; "
+                    "pids=$(ps -eo pid=,comm= | awk '$2 == \"opencode\" {print $1}'); "
+                    "[ -z \"$pids\" ] || kill -KILL $pids",
+                    timeout=5,
+                )
+            except Exception:
+                # The outer process is still killed below; cleanup failure is
+                # recorded by the caller as the original watchdog reason.
+                pass
             if proc.returncode is None:
                 proc.kill()
             return

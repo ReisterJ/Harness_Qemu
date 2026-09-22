@@ -5,8 +5,13 @@ from pathlib import Path
 import pytest
 
 from harness.artifacts import StaticFinding
+from harness.dynamic_validation import _summarize_replay_for_model
 from harness.config import TargetConfig
-from harness.prompts.dynamic_validation_prompt import build_dynamic_validation_prompt
+from harness.prompts.dynamic_validation_prompt import (
+    build_dynamic_validation_prompt,
+    build_poc_generation_prompt,
+    build_symcc_planner_prompt,
+)
 from harness.symbolic import select_symbolic_execution
 from harness.symbolic.worker import (
     compiler_flags,
@@ -18,6 +23,7 @@ from harness.symbolic.worker import (
     symbolic_file_objects,
 )
 from harness.symbolic.klee import _persist_job_source_tree
+from harness.symbolic.seed_plan import SeedPlanError, parse_seed_plan
 from harness.symbolic.symcc_worker import (
     compiler_flags as symcc_compiler_flags,
     link_flags,
@@ -111,6 +117,168 @@ def test_symcc_prompt_requires_concrete_seeds_and_original_target_replay():
     assert "{input_file}" in prompt
     assert "clean original target binary" in prompt
     assert "mrb_env_unshare" not in prompt
+
+
+def test_harness_managed_symcc_prompt_requests_a_declarative_plan():
+    prompt = build_dynamic_validation_prompt(
+        candidate=_finding(),
+        github_url="local",
+        commit="test",
+        source_root="/src/project",
+        binary_path="/out/target",
+        symbolic_context={
+            "provider": "symcc",
+            "status": "ready",
+            "orchestration": "harness",
+            "source_root": "/src/project",
+            "client": "/work/symbolic/symcc-submit",
+        },
+        symbolic_round=2,
+        symbolic_feedback={"progress": {"distance_to_candidate": 1}},
+    )
+    assert "Harness-managed symbolic execution — SymCC round 2" in prompt
+    assert "Do **not** invoke" in prompt
+    assert "<symbolic_seed_plan>" in prompt
+    assert '"working_dir": "jobs/round-002"' in prompt
+    assert '"distance_to_candidate": 1' in prompt
+
+
+def test_symcc_handoff_prompt_returns_control_to_agent_without_new_plan():
+    prompt = build_dynamic_validation_prompt(
+        candidate=_finding(),
+        github_url="local",
+        commit="test",
+        source_root="/src/project",
+        binary_path="/out/target",
+        symbolic_context={
+            "provider": "symcc",
+            "status": "ready",
+            "orchestration": "agent_handoff",
+            "source_root": "/src/project",
+        },
+        symbolic_round=1,
+        symbolic_feedback={
+            "progress": {"site_reached": True, "distance_to_candidate": 1}
+        },
+        symbolic_finalize=True,
+    )
+    assert "SymCC-to-agent handoff" in prompt
+    assert "site_reached" in prompt
+    assert "Do not invoke" in prompt
+    assert "do not emit a" in prompt
+    assert "clean-target replay" in prompt
+
+
+def test_symcc_planner_prompt_has_only_seed_plan_contract():
+    prompt = build_symcc_planner_prompt(
+        candidate=_finding(),
+        github_url="local",
+        commit="test",
+        source_root="/src/project",
+        binary_path="/out/target",
+        detector="asan",
+        runtime_context={"artifact": {"path": "/out/target"}},
+        symbolic_context={"provider": "symcc", "status": "ready"},
+        round_id=1,
+    )
+    assert "SymCC planning agent" in prompt
+    assert "<symbolic_seed_plan>" in prompt
+    assert "crash-result.xml" in prompt
+    assert "Do not create a PoC" in prompt
+    assert "Do not invoke /work/symbolic/symcc-submit" in prompt
+    assert "Do not perform broad fuzzing" in prompt
+    assert "dynamic-status or crash" in prompt
+    assert "You are conducting authorized security research" not in prompt
+
+
+def test_poc_generation_prompt_does_not_expose_provider_contract():
+    prompt = build_poc_generation_prompt(
+        candidate=_finding(),
+        github_url="local",
+        commit="test",
+        source_root="/src/project",
+        binary_path="/out/target",
+        detector="asan",
+        runtime_context={"artifact": {"path": "/out/target"}},
+        symbolic_feedback={"progress": {"site_reached": True}},
+    )
+    assert "SymCC handoff from the previous agent" in prompt
+    assert "Do not invoke SymCC" in prompt
+    assert "symbolic_seed_plan" in prompt
+    assert "provider contract" not in prompt.lower()
+    assert "clean target" in prompt
+
+
+def test_symcc_feedback_keeps_concrete_seeds_and_bounds_mutation_examples():
+    cases = [
+        {
+            "path": "jobs/round-001/seeds/seed-001",
+            "kind": "seed",
+            "seed_name": "seed-001",
+            "size": 43,
+            "exit_code": 0,
+            "status": "observed",
+            "output_tail": "seed output",
+        }
+    ]
+    cases.extend(
+        {
+            "path": f"generated/{index:03d}",
+            "kind": "generated",
+            "seed_name": "seeds/seed-001",
+            "size": 43,
+            "exit_code": 0,
+            "status": "observed",
+            "output_tail": "syntax error" * 500,
+        }
+        for index in range(128)
+    )
+
+    summary = _summarize_replay_for_model(
+        {
+            "round_id": 1,
+            "status": "completed",
+            "cases": cases,
+            "testcase_count": len(cases),
+            "seed_case_count": 1,
+            "generated_case_count": 128,
+            "site_reached": False,
+            "matched_candidate": False,
+            "sanitizer_event": False,
+            "distance_to_candidate": None,
+            "anchors": ["mrb_env_unshare"],
+            "errors": [],
+        }
+    )
+
+    assert summary["seed_case_count"] == 1
+    assert summary["generated_case_count"] == 128
+    assert summary["seed_results"][0]["seed_name"] == "seed-001"
+    assert len(summary["generated_examples"]) == 20
+    assert len(summary["generated_examples"][0]["output_tail"]) <= 1600
+
+
+def test_seed_plan_parser_validates_agent_owned_plan_without_running_provider():
+    response = '''<symbolic_seed_plan>
+    {
+      "schema_version": 1,
+      "candidate_id": "candidate_001",
+      "working_dir": "jobs/round-001",
+      "sources": ["target.c", "driver.c"],
+      "compile_flags": ["-g", "-O0"],
+      "link_flags": [],
+      "program_args": ["--input", "{input_file}"],
+      "seeds": [{"name": "seed-001", "encoding": "base64", "data": "YWJj"}],
+      "timeout_s": 30,
+      "max_testcases": 4,
+      "target_anchors": ["target_function"]
+    }
+    </symbolic_seed_plan>'''
+    plan = parse_seed_plan(response, candidate_id="candidate_001")
+    assert plan.seeds[0].data == b"abc"
+    assert plan.program_args[-1] == "{input_file}"
+    with pytest.raises(SeedPlanError, match="candidate_id"):
+        parse_seed_plan(response, candidate_id="candidate_002")
 
 
 def test_worker_request_options_are_narrowly_validated():

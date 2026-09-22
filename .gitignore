@@ -6,6 +6,19 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 results/
+
+# Local editor settings
+.vscode/
+
+# Downloaded source trees and local experiment targets. These are rebuilt by
+# the target workflow and should not be committed to the harness repository.
+targets/*/source/
+targets/curl-cve-2023-38039/
+targets/curl-socks5-overflow/
+targets/ghostscript-type2-51089/
+targets/libxml2/
+targets/linux-v7-2/
+
 # Large generated mruby/arvo SymCC experiment artifacts; keep the audit document
 # and source changes versioned, but do not commit raw transcripts/containers.
 /results/experiments/mruby-env-write-barrier/symcc-mruby-20260920/
