@@ -228,6 +228,8 @@ def protocol_readme(
         "container with its own memory limit; at most "
         f"{max(1, int(max_concurrent_symcc_jobs))} job(s) run concurrently, while later "
         "jobs wait in the bounded background queue rather than being discarded. "
+        "The worker receives only the request-scoped input and its private output/trace "
+        "directory; if the agent finishes first, the Harness stops the outstanding worker. "
         "A later run-input response includes a `ready_feedback` array for earlier jobs that "
         "finished since your previous submission; it is mandatory evidence for the next input. "
         "If you parse or redirect runner output, preserve and print a concise summary of every "

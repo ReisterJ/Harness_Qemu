@@ -6,7 +6,9 @@ import pytest
 from harness.symbolic.feedback import (
     TRACE_EVENT,
     TRACE_FLAG_COMPLETE,
+    TRACE_FLAG_TARGETS_CONFIGURED,
     TRACE_FLAG_TARGET_REACHED,
+    TRACE_FLAG_TRUNCATED,
     TRACE_HEADER,
     TRACE_MAGIC,
     FeedbackMapError,
@@ -60,10 +62,15 @@ def _map():
     })])
 
 
-def _trace(events, *, complete=False, target=False, capacity=None):
+def _trace(
+    events, *, complete=False, target=False, truncated=False,
+    targets_configured=False, capacity=None,
+):
     capacity = len(events) if capacity is None else capacity
     flags = (TRACE_FLAG_COMPLETE if complete else 0) | (
         TRACE_FLAG_TARGET_REACHED if target else 0
+    ) | (TRACE_FLAG_TRUNCATED if truncated else 0) | (
+        TRACE_FLAG_TARGETS_CONFIGURED if targets_configured else 0
     )
     return TRACE_HEADER.pack(TRACE_MAGIC, 1, TRACE_HEADER.size, capacity,
                              len(events), flags, 0) + b"".join(
@@ -154,6 +161,25 @@ def test_runtime_target_flag_preserves_positive_hit_when_trace_truncated():
         target_block_ids=target_blocks,
     )
     assert result["target_reached"] is True
+
+
+def test_truncated_trace_without_target_hit_is_unknown_not_a_false_miss():
+    graph = _map()
+    marker_ids, target_block_ids = resolve_target_ids(
+        graph, {"targets": [{"source_file": "src/parser.c", "line": 20}]}
+    )
+    trace = parse_trace(_trace(
+        [(100, 1)], complete=True, truncated=True, targets_configured=True,
+    ))
+
+    result = summarize_trace(
+        graph, trace, marker_ids=marker_ids, target_block_ids=target_block_ids,
+    )
+
+    assert trace.target_reached is None
+    assert result["target_reached"] is None
+    assert result["target_reachability"] == "unknown"
+    assert result["trace_truncated"] is True
 
 
 def test_missing_target_and_malformed_map_fail_explicitly():

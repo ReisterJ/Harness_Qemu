@@ -2,6 +2,7 @@
 import asyncio
 import json
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -13,7 +14,10 @@ from harness.dynamic_validation import (
     _execute_prebuilt_protocol_request,
     _prebuilt_protocol_worker,
     _prepare_prebuilt_symcc_protocol,
+    _run_protocol_binary,
+    _symcc_sidecar_settings,
 )
+from harness import dynamic_validation
 from harness.execution_protocol import (
     FEEDBACK_ROOT,
     INPUT_ROOT,
@@ -69,6 +73,100 @@ def _target():
     )
 
 
+def _patch_sidecar(
+    monkeypatch, *, trace_bytes=None, generated_seed=b"mutated", oom_kill_count=0
+):
+    """Mock Docker while exercising the real sidecar request orchestration."""
+    target = _target()
+    mounts = {}
+    run_specs = {}
+    binary_calls = []
+    removed = []
+    writes = {}
+
+    def fake_run(image_tag, name, **kwargs):
+        params = kwargs["run_params"]
+        assert image_tag == target.runtime_image_tag
+        assert params.mounts and len(params.mounts) == 1
+        mounts[name] = Path(params.mounts[0].source)
+        run_specs[name] = (kwargs, params)
+        return name
+
+    def fake_exec(container, command, timeout=0):
+        if command == "cat /sys/fs/cgroup/memory.events":
+            return 0, (
+                f"low 0\nhigh 0\nmax 0\noom 0\noom_kill {oom_kill_count}\n"
+            ), ""
+        if command.startswith("readlink -f"):
+            return 0, f"{INPUT_ROOT}/candidate.bin\n", ""
+        if command.startswith("stat -c"):
+            return 0, "4\n", ""
+        return 0, "", ""
+
+    def fake_read(_container, path):
+        if path == f"{INPUT_ROOT}/candidate.bin":
+            return b"seed"
+        if path.startswith("/symcc-job/traces/"):
+            root = mounts[_container]
+            relative = Path(path).relative_to("/symcc-job")
+            try:
+                return (root / relative).read_bytes()
+            except OSError:
+                return b""
+        return b""
+
+    def fake_write(_container, path, data):
+        writes[path] = data
+
+    def fake_binary(*, container, binary, request, input_path,
+                    symcc_output=None, extra_env=None):
+        extra_env = dict(extra_env or {})
+        binary_calls.append({
+            "container": container, "binary": binary, "input_path": input_path,
+            "symcc_output": symcc_output, "extra_env": extra_env,
+        })
+        if container == "target":
+            is_crash = ".harness-clean-target" in binary
+            input_data = b"seed"
+        else:
+            root = mounts[container]
+            guest_input = Path(input_path).relative_to("/symcc-job")
+            input_data = (root / guest_input).read_bytes()
+            if "SYMCC_FEEDBACK_TRACE" in extra_env:
+                trace_file = Path(extra_env["SYMCC_FEEDBACK_TRACE"])
+                host_trace = root / trace_file.relative_to("/symcc-job")
+                host_trace.parent.mkdir(parents=True, exist_ok=True)
+                host_trace.write_bytes(trace_bytes or b"")
+            if symcc_output == "/symcc-job/symcc-results":
+                if oom_kill_count:
+                    return {
+                        "status": "failed", "exit_code": 137, "duration_s": 0.1,
+                        "stdout": "", "stderr": "", "output_tail": "",
+                        "sanitizer_event": False,
+                    }
+                output_root = root / "symcc-results"
+                output_root.mkdir(parents=True, exist_ok=True)
+                (output_root / "testcase-000").write_bytes(generated_seed)
+            is_crash = binary == "/out/target" and input_data == generated_seed
+        binary_calls[-1]["input_bytes"] = input_data
+        output = "AddressSanitizer: heap-use-after-free\n" if is_crash else "ok\n"
+        return {
+            "status": "failed" if is_crash else "completed",
+            "exit_code": 1 if is_crash else 0,
+            "duration_s": 0.01,
+            "stdout": "", "stderr": output, "output_tail": output,
+            "sanitizer_event": is_crash,
+        }
+
+    monkeypatch.setattr(docker_ops, "run", fake_run)
+    monkeypatch.setattr(docker_ops, "rm", removed.append)
+    monkeypatch.setattr(docker_ops, "exec_sh", fake_exec)
+    monkeypatch.setattr(docker_ops, "read_file", fake_read)
+    monkeypatch.setattr(docker_ops, "write_file", fake_write)
+    monkeypatch.setattr(dynamic_validation, "_run_protocol_binary", fake_binary)
+    return target, run_specs, binary_calls, removed, writes
+
+
 def test_parse_execution_request_accepts_safe_input_and_unique_id():
     parsed = parse_request(json.dumps(_request()).encode(), filename="round-001.json")
     assert parsed.request_id == "round-001"
@@ -113,44 +211,39 @@ def test_target_argv_keeps_arguments_separate_and_substitutes_input():
     ]
 
 
+@pytest.mark.parametrize(
+    ("return_code", "timeout_s", "elapsed", "expected_status"),
+    [
+        (137, 120, 120.1, "timed_out"),
+        (137, 120, 0.1, "failed"),
+        (124, 2, 2.1, "timed_out"),
+    ],
+)
+def test_protocol_binary_distinguishes_deadline_kill_from_other_failure(
+    monkeypatch, return_code, timeout_s, elapsed, expected_status,
+):
+    clock = iter((100.0, 100.0 + elapsed))
+    monkeypatch.setattr(dynamic_validation.time, "time", lambda: next(clock))
+    monkeypatch.setattr(
+        docker_ops,
+        "exec_sh",
+        lambda *_args, **_kwargs: (return_code, "", "killed"),
+    )
+    request = parse_request(json.dumps(_request(timeout_s=timeout_s)))
+
+    result = _run_protocol_binary(
+        container="symcc-sidecar", binary="/out/target-symcc",
+        request=request, input_path=request.input_path,
+    )
+
+    assert result["status"] == expected_status
+    assert result["timed_out"] is (expected_status == "timed_out")
+
+
 def test_protocol_runs_same_input_through_both_binaries_and_replays_generated(
     monkeypatch,
 ):
-    target = _target()
-    commands = []
-    writes = {}
-
-    def fake_exec(container, command, timeout=0):
-        commands.append(command)
-        if command.startswith("readlink -f"):
-            return 0, f"{INPUT_ROOT}/candidate.bin\n", ""
-        if command.startswith("stat -c"):
-            return 0, "4\n", ""
-        if "find /work/validation/symcc-results/round-001" in command:
-            return (
-                0,
-                "/work/validation/symcc-results/round-001/testcase-000\t7\n",
-                "",
-            )
-        if ".harness-symcc-target-symcc" in command:
-            return 0, "symcc run\n", ""
-        if ".harness-clean-target" in command:
-            return 1, "AddressSanitizer: heap-buffer-overflow\n", ""
-        return 0, "", ""
-
-    def fake_read(container, path):
-        if path.endswith("candidate.bin"):
-            return b"seed"
-        if path.endswith("testcase-000"):
-            return b"mutated"
-        return b""
-
-    def fake_write(container, path, data):
-        writes[path] = data
-
-    monkeypatch.setattr(docker_ops, "exec_sh", fake_exec)
-    monkeypatch.setattr(docker_ops, "read_file", fake_read)
-    monkeypatch.setattr(docker_ops, "write_file", fake_write)
+    target, run_specs, binary_calls, removed, writes = _patch_sidecar(monkeypatch)
 
     response = _execute_prebuilt_protocol_request(
         container="target",
@@ -170,27 +263,66 @@ def test_protocol_runs_same_input_through_both_binaries_and_replays_generated(
     assert writes[response["snapshot_path"]] == b"seed"
     assert response["generated_replays"][0]["replay"]["sanitizer_event"] is True
     assert writes[f"{INPUT_ROOT}/symcc-round-001-000.bin"] == b"mutated"
-    assert sum("/out/target-symcc" in command for command in commands) == 0
-    symcc_commands = [
-        command for command in commands
-        if "/out/.harness-symcc-target-symcc" in command
+    symcc_calls = [call for call in binary_calls if call["binary"] == "/out/target-symcc"]
+    assert len(symcc_calls) == 3  # submitted trace, symbolic exploration, seed trace
+    assert all(call["container"] != "target" for call in symcc_calls)
+    assert [call["input_bytes"] for call in symcc_calls] == [b"seed", b"seed", b"mutated"]
+    assert "SYMCC_NO_SYMBOLIC_INPUT" in symcc_calls[0]["extra_env"]
+    assert "SYMCC_FEEDBACK_TRACE" not in symcc_calls[1]["extra_env"]
+    trace_calls = [
+        call for call in symcc_calls
+        if "SYMCC_FEEDBACK_TRACE" in call["extra_env"]
     ]
-    assert len(symcc_commands) == 3  # submitted trace, symbolic exploration, seed trace
-    assert any(
-        "SYMCC_NO_SYMBOLIC_INPUT=1" in command
-        and "/symcc-feedback/round-001/input.trace" in command
-        for command in symcc_commands
-    )
-    exploration = next(
-        command for command in symcc_commands
-        if "SYMCC_NO_SYMBOLIC_INPUT=1" not in command
-    )
-    assert "SYMCC_FEEDBACK_TRACE=" not in exploration
+    assert len(trace_calls) == 2
     assert all(
-        f"{SNAPSHOT_ROOT}/round-001.bin" in command
-        for command in symcc_commands[:2]
+        call["extra_env"]["SYMCC_FEEDBACK_CAPACITY"] == "1000000"
+        for call in trace_calls
     )
-    assert any("/out/.harness-clean-target" in command for command in commands)
+    assert symcc_calls[0]["input_path"] == "/symcc-job/input.bin"
+    assert any(call["binary"] == "/out/.harness-clean-target" for call in binary_calls)
+    assert any(call["binary"] == "/out/target" for call in binary_calls)
+    assert len(run_specs) == 1
+    run_kwargs, run_params = next(iter(run_specs.values()))
+    assert run_kwargs["network"] == "none"
+    assert run_params.network == "none"
+    assert run_params.memory == "4g"
+    assert run_params.cpus == "2"
+    assert run_params.mounts[0].target == "/symcc-job"
+    assert run_params.mounts[0].read_only is False
+    assert run_params.entrypoint == ("/bin/sh",)
+    assert run_params.command[0] == "-c"
+    assert removed == list(run_specs)
+
+
+def test_symcc_sidecar_marks_oom_without_confusing_it_with_a_valid_miss(monkeypatch):
+    target, _run_specs, _calls, _removed, _writes = _patch_sidecar(
+        monkeypatch, oom_kill_count=1
+    )
+    response = _execute_prebuilt_protocol_request(
+        container="target", target=target,
+        raw=json.dumps(_request()).encode(),
+        filename="round-001.json", round_id=1,
+    )
+    assert response["symcc"]["status"] == "resource_exhausted"
+    assert response["symcc"]["worker"]["oom_kill_count"] == 1
+    assert response["symcc_observation"]["target_reachability"] == "unknown"
+    assert response["generated_replays"] == []
+
+
+def test_symcc_sidecar_settings_have_safe_defaults_and_validate_limits():
+    assert _symcc_sidecar_settings({}) == ("4g", "2", 1)
+    assert _symcc_sidecar_settings({
+        "memory_limit": "2048m", "cpus": 1.5, "max_concurrent_jobs": 3,
+    }) == ("2048m", "1.5", 3)
+    for config in (
+        {"memory_limit": "0g"},
+        {"cpus": 0},
+        {"cpus": 65},
+        {"max_concurrent_jobs": 0},
+        {"max_concurrent_jobs": True},
+    ):
+        with pytest.raises(ValueError):
+            _symcc_sidecar_settings(config)
 
 
 def test_protocol_returns_exact_target_hit_and_source_distance_per_input(monkeypatch):
@@ -219,32 +351,8 @@ def test_protocol_returns_exact_target_hit_and_source_distance_per_input(monkeyp
         + TRACE_EVENT.pack(200, 1, 0)
         + TRACE_EVENT.pack(2000, 2, 0)
     )
-    commands = []
-    writes = {}
-
-    def fake_exec(_container, command, timeout=0):
-        commands.append(command)
-        if command.startswith("readlink -f"):
-            return 0, f"{INPUT_ROOT}/candidate.bin\n", ""
-        if command.startswith("stat -c"):
-            return 0, "4\n", ""
-        if "find /work/validation/symcc-results/round-001" in command:
-            return 0, "/work/validation/symcc-results/round-001/testcase-000\t7\n", ""
-        return 0, "", ""
-
-    def fake_read(_container, path):
-        if path.endswith("candidate.bin"):
-            return b"seed"
-        if path.endswith("testcase-000"):
-            return b"mutated"
-        if path.endswith("input.trace") or path.endswith("generated-000.trace"):
-            return target_trace
-        return b""
-
-    monkeypatch.setattr(docker_ops, "exec_sh", fake_exec)
-    monkeypatch.setattr(docker_ops, "read_file", fake_read)
-    monkeypatch.setattr(
-        docker_ops, "write_file", lambda _container, path, data: writes.__setitem__(path, data)
+    target, _run_specs, binary_calls, _removed, _writes = _patch_sidecar(
+        monkeypatch, trace_bytes=target_trace
     )
 
     response = _execute_prebuilt_protocol_request(
@@ -259,8 +367,14 @@ def test_protocol_returns_exact_target_hit_and_source_distance_per_input(monkeyp
     assert response["site_reached"] is True
     assert response["symcc_observation"]["distance"] == 0
     assert response["generated_replays"][0]["symcc_observation"]["target_reached"] is True
-    assert any("SYMCC_FEEDBACK_TARGET_IDS=2000" in command for command in commands)
-    assert any("SYMCC_NO_SYMBOLIC_INPUT=1" in command for command in commands)
+    assert any(
+        call["extra_env"].get("SYMCC_FEEDBACK_TARGET_IDS") == "2000"
+        for call in binary_calls
+    )
+    assert any(
+        call["extra_env"].get("SYMCC_NO_SYMBOLIC_INPUT") == "1"
+        for call in binary_calls
+    )
 
 
 def test_prebuilt_protocol_returns_clean_result_while_symcc_runs_in_background(
@@ -286,14 +400,7 @@ def test_prebuilt_protocol_returns_clean_result_while_symcc_runs_in_background(
             return 0, "4\n", ""
         if command.startswith("test -f"):
             return 0, "", ""
-        if "find /work/validation/symcc-results/round-001" in command:
-            return 0, "", ""
         if "timeout --signal=KILL" in command:
-            if ".harness-symcc-target-symcc" in command:
-                symcc_started.set()
-                if not symcc_release.wait(timeout=5):
-                    return 124, "", "test SymCC wait timed out"
-                return 0, "symcc complete", ""
             return 0, "clean target complete", ""
         if command.startswith(f"mv -- {PENDING_ROOT}/"):
             pending_moved.set()
@@ -316,9 +423,28 @@ def test_prebuilt_protocol_returns_clean_result_while_symcc_runs_in_background(
         if path == response_path:
             response_written.set()
 
+    def blocking_symcc(**job_args):
+        symcc_started.set()
+        if not symcc_release.wait(timeout=5):
+            raise TimeoutError("test SymCC wait timed out")
+        request = job_args["job"]["request"]
+        return {
+            "schema_version": 1, "protocol": "dynamic-execution-feedback",
+            "request_id": request.request_id,
+            "symcc": {"status": "completed", "duration_s": 0.01,
+                      "testcase_count": 0},
+            "symcc_observation": {"status": "missing", "target_reached": None},
+            "input_trace_execution": {"status": "completed", "exit_code": 0},
+            "generated_replays": [],
+        }
+
     monkeypatch.setattr(docker_ops, "exec_sh", fake_exec)
     monkeypatch.setattr(docker_ops, "read_file", fake_read)
     monkeypatch.setattr(docker_ops, "write_file", fake_write)
+    monkeypatch.setattr(
+        dynamic_validation, "_execute_prebuilt_protocol_symcc_request",
+        blocking_symcc,
+    )
 
     async def exercise():
         stop = asyncio.Event()
@@ -339,6 +465,7 @@ def test_prebuilt_protocol_returns_clean_result_while_symcc_runs_in_background(
         feedback = json.loads(writes[feedback_path])
         assert feedback["feedback_status"] == "ready"
         assert feedback["symcc"]["status"] == "completed"
+        assert "stderr" not in feedback["symcc"]
 
         stop.set()
         summary = await asyncio.wait_for(worker, timeout=3)
@@ -525,6 +652,7 @@ def test_next_protocol_response_auto_delivers_completed_symcc_feedback(monkeypat
 
 def test_protocol_worker_queues_all_inputs_with_bounded_symcc_concurrency(monkeypatch):
     target = _target()
+    target.symbolic_execution["symcc"]["max_concurrent_jobs"] = 2
     request_ids = ["round-001", "round-002", "round-003"]
     pending_ids = list(request_ids)
     writes = {}
@@ -675,7 +803,7 @@ def test_protocol_worker_does_not_wait_for_unused_symcc_after_agent_finishes(
     pending_moved = threading.Event()
     response_written = threading.Event()
     symcc_started = threading.Event()
-    symcc_release = threading.Event()
+    symcc_cancelled = threading.Event()
     writes = {}
 
     def fake_exec(_container, command, timeout=0):
@@ -703,14 +831,18 @@ def test_protocol_worker_does_not_wait_for_unused_symcc_after_agent_finishes(
         if path == response_path:
             response_written.set()
 
-    def blocking_symcc(**_kwargs):
+    def blocking_symcc(**job_args):
         symcc_started.set()
-        symcc_release.wait(timeout=5)
+        cancel_event = job_args["job"]["cancel_event"]
+        assert cancel_event.wait(timeout=5)
+        symcc_cancelled.set()
         return {"symcc": {"status": "completed"}}
 
+    removed = []
     monkeypatch.setattr(docker_ops, "exec_sh", fake_exec)
     monkeypatch.setattr(docker_ops, "read_file", fake_read)
     monkeypatch.setattr(docker_ops, "write_file", fake_write)
+    monkeypatch.setattr(docker_ops, "rm", removed.append)
     monkeypatch.setattr(
         "harness.dynamic_validation._execute_prebuilt_protocol_symcc_request",
         blocking_symcc,
@@ -728,7 +860,8 @@ def test_protocol_worker_does_not_wait_for_unused_symcc_after_agent_finishes(
         assert summary["status"] == "incomplete"
         assert summary["symcc_abandoned"] == 1
         assert summary["records"][0]["feedback_status"] == "abandoned_agent_finished"
-        symcc_release.set()
+        assert await asyncio.to_thread(symcc_cancelled.wait, 2)
+        assert removed and removed[0].startswith("symcc-fb-sample-")
 
     asyncio.run(exercise())
 

@@ -75,7 +75,9 @@ def parse_trace(data: bytes) -> SymccTrace:
     target_ids_valid = not bool(flags & TRACE_FLAG_TARGETS_INVALID)
     if flags & TRACE_FLAG_TARGET_REACHED:
         target_reached: bool | None = True
-    elif complete and target_ids_configured and target_ids_valid:
+    elif (
+        complete and not truncated and target_ids_configured and target_ids_valid
+    ):
         target_reached = False
     else:
         target_reached = None

@@ -10,6 +10,7 @@ import json
 import re
 import shlex
 import tempfile
+import threading
 import uuid
 import xml.etree.ElementTree as ET
 from contextlib import ExitStack, contextmanager
@@ -1248,6 +1249,11 @@ def _symcc_hidden_path(binary_path: str, role: str) -> str:
     return str(path.with_name(f".harness-{role}-{path.name}"))
 
 
+def _symcc_sidecar_name(target_name: str) -> str:
+    safe_target = re.sub(r"[^A-Za-z0-9_.-]", "-", target_name)[:20] or "target"
+    return f"symcc-fb-{safe_target}-{uuid.uuid4().hex[:12]}"[:63]
+
+
 def _hide_source_vcs_metadata(container: str, target: TargetConfig) -> None:
     """Remove source-control metadata before dynamic exploration in every arm.
 
@@ -1623,11 +1629,19 @@ def _run_protocol_binary(
         rc, stdout, stderr = docker_ops.exec_sh(
             container, command, timeout=request.timeout_s + 15
         )
+        duration = time.time() - started
+        timed_out = (
+            rc in {124, 137}
+            and duration >= max(0, request.timeout_s - 1)
+        )
         output = ((stdout or "") + "\n" + (stderr or ""))[-12_000:]
         return {
-            "status": "completed" if rc == 0 else "failed",
+            "status": (
+                "completed" if rc == 0 else "timed_out" if timed_out else "failed"
+            ),
             "exit_code": rc,
-            "duration_s": round(time.time() - started, 3),
+            "duration_s": round(duration, 3),
+            "timed_out": timed_out,
             "stdout": (stdout or "")[-12_000:],
             "stderr": (stderr or "")[-12_000:],
             "output_tail": output,
@@ -1755,6 +1769,8 @@ def _prepare_prebuilt_protocol_request(
         "input_bytes": input_bytes,
         "snapshot_path": snapshot_path,
         "clean": clean,
+        "sidecar_name": _symcc_sidecar_name(target.name),
+        "cancel_event": threading.Event(),
     }
     return immediate, job
 
@@ -1792,17 +1808,15 @@ def _execute_prebuilt_protocol_symcc_request(
         (host_root / "traces").mkdir()
         (host_root / "symcc-results").mkdir()
         (host_root / "input.bin").write_bytes(input_bytes)
-        sidecar_name = (
-            f"symcc-fb-{re.sub(r'[^A-Za-z0-9_.-]', '-', target.name)[:20]}-"
-            f"{uuid.uuid4().hex[:12]}"
-        )[:63]
+        sidecar_name = str(job.get("sidecar_name") or _symcc_sidecar_name(target.name))
+        cancel_event = job.get("cancel_event")
         run_params = DockerRunParams(
             network="none",
             memory=memory_limit,
             cpus=sidecar_cpus,
             mounts=(DockerMount(str(host_root), sidecar_root, read_only=False),),
             entrypoint=("/bin/sh",),
-            command=("/bin/sh", "-c", "while :; do sleep 3600; done"),
+            command=("-c", "while :; do sleep 3600; done"),
         )
         started_sidecar = False
         try:
@@ -1815,6 +1829,8 @@ def _execute_prebuilt_protocol_symcc_request(
                 run_params=run_params,
             )
             started_sidecar = True
+            if isinstance(cancel_event, threading.Event) and cancel_event.is_set():
+                raise InterruptedError("SymCC feedback job cancelled during sidecar startup")
             target_ids = (feedback_runtime or {}).get("marker_ids", [])
             symcc_args = tuple(symcc_cfg.get("program_args") or request.program_args)
             concrete_request = ExecutionRequest(
@@ -1823,7 +1839,9 @@ def _execute_prebuilt_protocol_symcc_request(
             )
             trace_env = {
                 "SYMCC_FEEDBACK_TRACE": f"{trace_dir}/input.trace",
-                "SYMCC_FEEDBACK_CAPACITY": str(symcc_cfg.get("feedback_capacity") or 65536),
+                "SYMCC_FEEDBACK_CAPACITY": str(
+                    symcc_cfg.get("feedback_capacity") or 1_000_000
+                ),
                 "SYMCC_NO_SYMBOLIC_INPUT": "1",
             }
             if target_ids:
@@ -1836,7 +1854,7 @@ def _execute_prebuilt_protocol_symcc_request(
                 symcc_output=f"{out_dir}/concrete-input", extra_env=trace_env,
             )
             initial_observation = _summarize_symcc_trace_bytes(
-                _read_host_trace(host_root / "traces" / "input.trace"),
+                _read_container_trace(sidecar_name, f"{trace_dir}/input.trace"),
                 feedback_runtime,
             )
 
@@ -1889,7 +1907,6 @@ def _execute_prebuilt_protocol_symcc_request(
                     container=sidecar_name, binary=clean_binary,
                     request=replay_request, input_path=sidecar_seed,
                 )
-                candidate_trace_path = host_root / "traces" / f"generated-{index:03d}.trace"
                 candidate_symcc_request = ExecutionRequest(
                     request.request_id, sidecar_seed,
                     symcc_args, min(request.timeout_s, 10), request.env,
@@ -1901,7 +1918,7 @@ def _execute_prebuilt_protocol_symcc_request(
                     symcc_output=f"{out_dir}/concrete-{index:03d}",
                     extra_env={
                         "SYMCC_FEEDBACK_CAPACITY": str(
-                            symcc_cfg.get("feedback_capacity") or 65536
+                            symcc_cfg.get("feedback_capacity") or 1_000_000
                         ),
                         **({
                             "SYMCC_FEEDBACK_TARGET_IDS": ",".join(
@@ -1913,7 +1930,10 @@ def _execute_prebuilt_protocol_symcc_request(
                     },
                 )
                 site_feedback = _summarize_symcc_trace_bytes(
-                    _read_host_trace(candidate_trace_path), feedback_runtime
+                    _read_container_trace(
+                        sidecar_name, f"{trace_dir}/generated-{index:03d}.trace"
+                    ),
+                    feedback_runtime,
                 )
                 generated.append({
                     "path": replay_path,
@@ -1963,10 +1983,17 @@ def _execute_prebuilt_protocol_symcc_request(
     }
 
 
-def _read_host_trace(path: Path) -> bytes:
+def _read_container_trace(container: str, path: str) -> bytes:
+    """Read private SymCC traces inside the worker container.
+
+    SymCC creates trace files with mode 0600. The worker container commonly
+    runs as root, so its files are not readable by the unprivileged host user
+    through the bind mount. `docker exec cat` reads them without weakening the
+    file permissions on the shared workspace.
+    """
     try:
-        return path.read_bytes()
-    except OSError:
+        return docker_ops.read_file(container, path)
+    except Exception:
         return b""
 
 
@@ -2132,6 +2159,13 @@ def _compact_protocol_feedback(record: dict[str, Any]) -> dict[str, Any]:
     }
     if record.get("feedback_error"):
         compact["feedback_error"] = str(record["feedback_error"])[:500]
+    worker = symcc.get("worker")
+    if isinstance(worker, dict):
+        compact["symcc"]["worker"] = {
+            key: worker[key] for key in
+            ("isolated", "network", "memory_limit", "cpus", "oom_kill_count")
+            if key in worker
+        }
     if record.get("error"):
         compact["error"] = str(record["error"])[:500]
     return compact
@@ -2144,7 +2178,9 @@ async def _prebuilt_protocol_worker(
     max_requests: int = _DEFAULT_MAX_ITERATIONS,
 ) -> dict[str, Any]:
     request_limit = max(1, min(int(max_requests), _MAX_ITERATION_RECORDS))
-    max_inflight_symcc_jobs = 2
+    _memory_limit, _cpus, max_inflight_symcc_jobs = _symcc_sidecar_settings(
+        target.symcc_runtime or {}
+    )
     symcc_slots = asyncio.Semaphore(max_inflight_symcc_jobs)
     seen: set[str] = set()
     records: list[dict[str, Any]] = []
@@ -2211,7 +2247,14 @@ async def _prebuilt_protocol_worker(
         result["feedback_status"] = "ready"
         record.update(result)
         try:
-            payload = (json.dumps(result, indent=2, ensure_ascii=False) + "\n").encode()
+            payload = (
+                json.dumps(
+                    _compact_protocol_feedback(result),
+                    indent=2,
+                    ensure_ascii=False,
+                )
+                + "\n"
+            ).encode()
             await asyncio.to_thread(docker_ops.write_file, container, temp_path, payload)
             rc, _out, err = await asyncio.to_thread(
                 docker_ops.exec_sh,
@@ -2230,11 +2273,20 @@ async def _prebuilt_protocol_worker(
     async def run_queued_feedback_job(
         job: dict[str, Any], record: dict[str, Any], enqueued_at: float
     ) -> None:
-        async with symcc_slots:
-            queue_wait = max(0.0, time.monotonic() - enqueued_at)
-            record["symcc_queue_wait_s"] = round(queue_wait, 3)
-            stats["symcc_queue_wait_s"] += queue_wait
-            await run_feedback_job(job, record)
+        try:
+            async with symcc_slots:
+                queue_wait = max(0.0, time.monotonic() - enqueued_at)
+                record["symcc_queue_wait_s"] = round(queue_wait, 3)
+                stats["symcc_queue_wait_s"] += queue_wait
+                await run_feedback_job(job, record)
+        except asyncio.CancelledError:
+            cancel_event = job.get("cancel_event")
+            if isinstance(cancel_event, threading.Event):
+                cancel_event.set()
+            sidecar_name = job.get("sidecar_name")
+            if isinstance(sidecar_name, str):
+                await asyncio.to_thread(docker_ops.rm, sidecar_name)
+            raise
 
     while not stop.is_set():
         try:
@@ -2588,17 +2640,31 @@ def _normalize_poc_kind(value: str, detector: str) -> str:
     non-file service requests.
     """
     kind = value.strip().lower()
-    if detector != "logic" and (
-        kind.endswith("_source")
-        or kind.endswith("_script")
-        or "_source_via_" in kind
-        or kind in {"raw-binary", "raw_binary", "binary", "raw_file"}
-        or kind in {
-            "crash", "input", "raw_input", "ruby_source", "python_source",
-            "ruby", "python", "shell", "shell_script", "script",
-        }
-    ):
-        return "file"
+    # Models sometimes describe the contents and how the target consumes
+    # them (for example, "ruby-source-fuzzer-input") instead of the artifact
+    # transport kind. Normalize separators before recognizing these generic
+    # file-input descriptions. Do not apply this relaxation to logic findings:
+    # their request/program/bundle distinction is semantically significant.
+    normalized = re.sub(r"[-\s]+", "_", kind)
+    if detector != "logic":
+        tokens = set(normalized.split("_"))
+        source_file_label = (
+            "fuzzer" in tokens
+            and bool(tokens & {"input", "seed"})
+            and bool(tokens & {"source", "script", "binary"})
+        )
+        if (
+            normalized.endswith("_source")
+            or normalized.endswith("_script")
+            or "_source_via_" in normalized
+            or normalized in {"raw_binary", "binary", "raw_file"}
+            or normalized in {
+                "crash", "input", "raw_input", "ruby_source", "python_source",
+                "ruby", "python", "shell", "shell_script", "script",
+            }
+            or source_file_label
+        ):
+            return "file"
     return kind
 
 
