@@ -148,6 +148,35 @@ class TargetConfig:
         symbolic_execution = dict(symbolic_execution)
         if symbolic_execution.get("default") is False:
             symbolic_execution["default"] = "off"
+        symcc_config = symbolic_execution.get("symcc")
+        if symcc_config is not None:
+            if not isinstance(symcc_config, dict):
+                raise ValueError("symbolic_execution.symcc must be a mapping")
+            symcc_config = dict(symcc_config)
+            symbolic_execution["symcc"] = symcc_config
+            symcc_binary = symcc_config.get("binary_path")
+            if symcc_binary is not None and (
+                not isinstance(symcc_binary, str)
+                or not symcc_binary.startswith("/")
+                or "\x00" in symcc_binary
+            ):
+                raise ValueError(
+                    "symbolic_execution.symcc.binary_path must be an absolute container path"
+                )
+            symcc_args = symcc_config.get("program_args")
+            if symcc_args is not None and (
+                not isinstance(symcc_args, list)
+                or not symcc_args
+                or len(symcc_args) > 64
+                or not all(isinstance(arg, str) and "\x00" not in arg for arg in symcc_args)
+                or any(len(arg) > 4096 for arg in symcc_args)
+                or sum(arg.count("{input_file}") for arg in symcc_args) != 1
+                or any("{" in arg.replace("{input_file}", "") for arg in symcc_args)
+            ):
+                raise ValueError(
+                    "symbolic_execution.symcc.program_args must be a non-empty list "
+                    "of at most 64 strings containing {input_file} exactly once"
+                )
 
         if cfg.get("kind") == "dnr":
             raise ValueError(
@@ -210,6 +239,12 @@ class TargetConfig:
 
     def docker_run_params(self, phase: str) -> DockerRunParams:
         return self.docker_params.for_phase(phase) if self.docker_params else DockerRunParams()
+
+    @property
+    def symcc_runtime(self) -> dict[str, Any] | None:
+        """Prebuilt SymCC executable contract, if the target supplies one."""
+        config = (self.symbolic_execution or {}).get("symcc")
+        return dict(config) if isinstance(config, dict) else None
 
     def docker_build_params(self) -> DockerBuildParams:
         return self.docker_params.build if self.docker_params else DockerBuildParams()

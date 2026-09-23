@@ -1,0 +1,4 @@
+**
+!harness/
+!harness/symbolic/
+!harness/symbolic/fuzzer_file_driver.c

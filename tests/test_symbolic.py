@@ -63,13 +63,43 @@ def test_symbolic_provider_selection_is_opt_in_and_target_configurable():
 def test_prebuilt_mruby_experiment_target_resolves_without_revealing_bug():
     root = Path(__file__).resolve().parents[1]
     target = TargetConfig.load(root / "targets" / "mruby-arvo")
-    assert target.runtime_image_tag == "n132/arvo:57672-vul"
+    assert target.runtime_image_tag == "local/mruby-arvo-prebuilt-symcc:2de602b"
     assert target.source_root == "/src/mruby"
     assert target.binary_path == "/out/mruby_fuzzer"
     assert target.known_bugs == []
     assert target.symbolic_execution == {
-        "default": "off", "providers": ["symcc", "klee"]
+        "default": "off",
+        "providers": ["symcc", "klee"],
+        "symcc": {
+            "binary_path": "/out/mruby_fuzzer_symcc",
+            "commit": "2de602b8696bc21e4cbc2c6e08e2fae27b1ad79b",
+        },
     }
+
+
+def test_prebuilt_symcc_protocol_is_the_final_dynamic_prompt_override():
+    prompt = build_dynamic_validation_prompt(
+        candidate=_finding(),
+        github_url="local",
+        commit="a" * 40,
+        source_root="/src/project",
+        binary_path="/out/target",
+        symbolic_context={
+            "provider": "symcc",
+            "status": "ready",
+            "orchestration": "prebuilt_protocol",
+            "artifact_commit": "a" * 40,
+            "runner": "/work/validation/run-input",
+            "input_root": "/work/validation/inputs",
+            "request_template": "/work/validation/execution/request-template.json",
+        },
+    )
+    assert "Harness runs both prebuilt binaries on the same input" in prompt
+    assert "Do not compile a source slice" in prompt
+    assert prompt.rfind("Harness execution override") > prompt.rfind(
+        "Dynamic-validation scope"
+    )
+    assert prompt.rstrip().endswith("Grade remains the final reproduction check.")
 
 
 def test_ready_symbolic_context_teaches_the_tool_contract_not_the_answer():

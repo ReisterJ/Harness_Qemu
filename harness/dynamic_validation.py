@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 import json
 import re
@@ -24,6 +25,24 @@ from .artifacts import (
     StaticFinding,
 )
 from .config import TargetConfig
+from .execution_protocol import (
+    INPUT_ROOT,
+    PENDING_ROOT,
+    PROCESSED_ROOT,
+    README_PATH as EXECUTION_README_PATH,
+    REQUEST_ROOT,
+    REQUEST_TEMPLATE_PATH,
+    RESPONSE_ROOT,
+    RUNNER_PATH,
+    ExecutionRequest,
+    ExecutionRequestError,
+    parse_request,
+    protocol_readme,
+    protocol_runner_script,
+    protocol_template,
+    shell_argv,
+    target_argv,
+)
 from .instrumentation import select_provider
 from .instrumentation.base import InstrumentationReport
 from .prompts.dynamic_validation_prompt import (
@@ -88,6 +107,13 @@ async def run_dynamic_validation(
     symbolic_provider = select_symbolic_execution(
         symbolic_execution, target.symbolic_execution
     )
+    if symbolic_provider == "symcc" and not (
+        target.symcc_runtime and target.symcc_runtime.get("binary_path")
+    ):
+        raise ValueError(
+            "SymCC was selected, but target config has no prebuilt "
+            "symbolic_execution.symcc.binary_path"
+        )
     iteration_limit = max(1, min(int(max_iterations), _MAX_ITERATION_RECORDS))
     instrumentation_prepared: InstrumentationReport | None = None
     instrumentation_result: InstrumentationReport | None = None
@@ -105,22 +131,10 @@ async def run_dynamic_validation(
             container, candidate, iteration_limit, target.detector
         )
         symbolic_context = (
-            symbolic_session.prepare_agent(container) if symbolic_session else None
+            _prepare_prebuilt_symcc_protocol(container, target)
+            if symbolic_provider == "symcc"
+            else symbolic_session.prepare_agent(container) if symbolic_session else None
         )
-        if (
-            symbolic_session is not None
-            and isinstance(symbolic_session, SymccSession)
-            and symbolic_context is not None
-            and symbolic_context.get("status") == "ready"
-        ):
-            # This marker switches only the prompt contract. The actual
-            # provider invocation is performed below by the host harness.
-            symbolic_context = dict(symbolic_context)
-            symbolic_context.update({
-                "orchestration": "harness",
-                "source_root": target.source_root,
-                "binary_path": target.binary_path,
-            })
         if provider is not None:
             prepare_started = time.time()
             instrumentation_prepared = provider.prepare(
@@ -146,37 +160,38 @@ async def run_dynamic_validation(
         else:
             instrumentation_context = None
         started = time.time()
-        if (
-            symbolic_session is not None
-            and isinstance(symbolic_session, SymccSession)
-            and symbolic_context is not None
-            and symbolic_context.get("orchestration") == "harness"
-        ):
-            result, orchestration_timings = await _run_harness_managed_symcc(
-                target=target,
+        if symbolic_provider == "symcc":
+            prompt = build_dynamic_validation_prompt(
                 candidate=candidate,
-                model=model,
-                max_turns=max_turns,
-                container=container,
-                symbolic_session=symbolic_session,
-                symbolic_context=symbolic_context,
+                github_url=target.github_url,
+                commit=target.commit,
+                source_root=target.source_root,
+                binary_path=target.binary_path,
                 focus_area=focus_area,
                 known_bugs=known_bugs if known_bugs is not None else target.known_bugs,
                 found_bugs_path="/tmp/found_bugs.jsonl" if found_bugs_path else None,
                 accept_dos=accept_dos,
-                instrumentation_context=instrumentation_context,
-                system_prompt=system_prompt,
                 reattack_harness=target.reattack_harness,
                 attack_surface=target.attack_surface,
                 detector=target.detector,
                 runtime_context=target.runtime_context(),
-                iteration_limit=iteration_limit,
+                instrumentation_context=instrumentation_context,
+                symbolic_context=symbolic_context,
+                max_iterations=iteration_limit,
+            )
+            result, protocol_timings, symbolic_result = await _run_prebuilt_symcc_agent(
+                prompt=prompt,
+                target=target,
+                container=container,
+                model=model,
+                max_turns=max_turns,
+                system_prompt=system_prompt,
                 max_resume_attempts=max_resume_attempts,
                 transcript_path=transcript_path,
                 progress_prefix=progress_prefix,
-                symbolic_result_path=symbolic_execution_result_path,
+                result_path=symbolic_execution_result_path,
             )
-            timings.update(orchestration_timings)
+            timings.update(protocol_timings)
         else:
             prompt = build_dynamic_validation_prompt(
                 candidate=candidate,
@@ -1202,6 +1217,454 @@ def _write_harness_iteration(
         return
 
 
+def _symcc_hidden_path(binary_path: str, role: str) -> str:
+    path = Path(shlex.split(binary_path)[0])
+    return str(path.with_name(f".harness-{role}-{path.name}"))
+
+
+def _prepare_prebuilt_symcc_protocol(
+    container: str, target: TargetConfig
+) -> dict[str, Any]:
+    """Validate prebuilt executables and expose the request/response client."""
+    config = target.symcc_runtime or {}
+    symcc_binary = str(config.get("binary_path") or "")
+    if not symcc_binary.startswith("/"):
+        raise ValueError("symbolic_execution.symcc.binary_path must be absolute")
+    artifact_commit = config.get("commit")
+    if not isinstance(artifact_commit, str) or artifact_commit != target.commit:
+        raise ValueError(
+            "prebuilt SymCC artifact must declare the target commit: "
+            f"expected {target.commit!r}, got {artifact_commit!r}"
+        )
+    clean_parts = shlex.split(target.binary_path)
+    symcc_parts = shlex.split(symcc_binary)
+    if len(clean_parts) != 1 or len(symcc_parts) != 1:
+        raise ValueError("prebuilt execution binary paths must not contain arguments")
+    if clean_parts[0] == symcc_parts[0]:
+        raise ValueError("clean and SymCC binary_path values must be different")
+
+    symcc_args = config.get("program_args") or ["{input_file}"]
+    if (
+        not isinstance(symcc_args, list)
+        or not symcc_args
+        or not all(isinstance(arg, str) and "\x00" not in arg for arg in symcc_args)
+        or sum(str(arg).count("{input_file}") for arg in symcc_args) != 1
+    ):
+        raise ValueError(
+            "symbolic_execution.symcc.program_args must contain {input_file} exactly once"
+        )
+    binary_clean_hidden = _symcc_hidden_path(clean_parts[0], "clean")
+    binary_symcc_hidden = _symcc_hidden_path(symcc_parts[0], "symcc")
+    paths = [
+        INPUT_ROOT,
+        REQUEST_ROOT,
+        PENDING_ROOT,
+        RESPONSE_ROOT,
+        PROCESSED_ROOT,
+        "/work/validation/symcc-results",
+        str(Path(binary_clean_hidden).parent),
+        str(Path(binary_symcc_hidden).parent),
+    ]
+    command = "mkdir -p -- " + " ".join(shlex.quote(path) for path in paths)
+    rc, _out, err = docker_ops.exec_sh(container, command, timeout=15)
+    if rc:
+        raise RuntimeError(f"cannot prepare execution protocol directories: {err[-500:]}")
+
+    for original, hidden, label in (
+        (clean_parts[0], binary_clean_hidden, "clean"),
+        (symcc_parts[0], binary_symcc_hidden, "SymCC"),
+    ):
+        check = f"test -f {shlex.quote(original)} && test -x {shlex.quote(original)}"
+        rc, _out, err = docker_ops.exec_sh(container, check, timeout=15)
+        if rc:
+            raise RuntimeError(
+                f"prebuilt {label} executable is missing or not executable: {original}: {err[-300:]}"
+            )
+        stage = (
+            f"test ! -e {shlex.quote(hidden)} && "
+            f"mv -- {shlex.quote(original)} {shlex.quote(hidden)}"
+        )
+        rc, _out, err = docker_ops.exec_sh(container, stage, timeout=30)
+        if rc:
+            raise RuntimeError(f"cannot stage prebuilt {label} executable: {err[-500:]}")
+        guard = (
+            "#!/bin/sh\n"
+            f"echo 'direct {label} execution is disabled; use {RUNNER_PATH}' >&2\n"
+            "exit 126\n"
+        ).encode()
+        docker_ops.write_file(container, original, guard)
+        rc, _out, err = docker_ops.exec_sh(
+            container, f"chmod 0555 -- {shlex.quote(original)}", timeout=15
+        )
+        if rc:
+            raise RuntimeError(f"cannot install {label} execution guard: {err[-300:]}")
+
+    vcs_path = f"{target.source_root.rstrip('/')}/.git"
+    rc, _out, err = docker_ops.exec_sh(
+        container,
+        f"if [ -e {shlex.quote(vcs_path)} ]; then "
+        f"rm -rf -- {shlex.quote(vcs_path)}; fi",
+        timeout=30,
+    )
+    if rc:
+        raise RuntimeError(f"cannot remove target VCS metadata from dynamic view: {err[-500:]}")
+
+    docker_ops.write_file(container, RUNNER_PATH, protocol_runner_script())
+    rc, _out, err = docker_ops.exec_sh(
+        container, f"chmod 0555 -- {shlex.quote(RUNNER_PATH)}", timeout=15
+    )
+    if rc:
+        raise RuntimeError(f"cannot enable execution protocol client: {err[-300:]}")
+    docker_ops.write_file(container, REQUEST_TEMPLATE_PATH, protocol_template())
+    docker_ops.write_file(
+        container, EXECUTION_README_PATH, protocol_readme(symbolic_enabled=True)
+    )
+    return {
+        "schema_version": 1,
+        "provider": "symcc",
+        "status": "ready",
+        "orchestration": "prebuilt_protocol",
+        "runner": RUNNER_PATH,
+        "input_root": INPUT_ROOT,
+        "request_root": REQUEST_ROOT,
+        "response_root": RESPONSE_ROOT,
+        "prebuilt_binary": True,
+        "artifact_commit": artifact_commit,
+        "symcc_program_args": symcc_args,
+    }
+
+
+def _protocol_sanitizer_event(output: str) -> bool:
+    return bool(re.search(
+        r"AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:|LeakSanitizer",
+        output,
+        re.IGNORECASE,
+    ))
+
+
+def _run_protocol_binary(
+    *, container: str, binary: str, request: ExecutionRequest, input_path: str,
+    symcc_output: str | None = None,
+) -> dict[str, Any]:
+    argv = target_argv(binary, request.program_args, input_path)
+    env = dict(request.env)
+    if symcc_output is not None:
+        env.update({"SYMCC_INPUT_FILE": input_path, "SYMCC_OUTPUT_DIR": symcc_output})
+    env_prefix = " ".join(
+        f"{shlex.quote(key)}={shlex.quote(value)}" for key, value in env.items()
+    )
+    command = (
+        f"timeout --signal=KILL {request.timeout_s}s "
+        + (f"env {env_prefix} " if env_prefix else "")
+        + shell_argv(argv)
+    )
+    started = time.time()
+    try:
+        rc, stdout, stderr = docker_ops.exec_sh(
+            container, command, timeout=request.timeout_s + 15
+        )
+        output = ((stdout or "") + "\n" + (stderr or ""))[-12_000:]
+        return {
+            "status": "completed" if rc == 0 else "failed",
+            "exit_code": rc,
+            "duration_s": round(time.time() - started, 3),
+            "stdout": (stdout or "")[-12_000:],
+            "stderr": (stderr or "")[-12_000:],
+            "output_tail": output,
+            "sanitizer_event": _protocol_sanitizer_event(output),
+        }
+    except Exception as exc:
+        return {
+            "status": "execution_error",
+            "exit_code": None,
+            "duration_s": round(time.time() - started, 3),
+            "stdout": "",
+            "stderr": "",
+            "output_tail": "",
+            "sanitizer_event": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def _execute_prebuilt_protocol_request(
+    *, container: str, target: TargetConfig, raw: bytes, filename: str,
+    round_id: int,
+) -> dict[str, Any]:
+    try:
+        request = parse_request(raw, filename=filename)
+    except (ExecutionRequestError, UnicodeDecodeError) as exc:
+        return {"schema_version": 1, "status": "invalid_request", "errors": [str(exc)]}
+    try:
+        rc, resolved_input, err = docker_ops.exec_sh(
+            container,
+            f"readlink -f -- {shlex.quote(request.input_path)}",
+            timeout=15,
+        )
+        resolved_input = resolved_input.strip()
+        if rc or not resolved_input.startswith(INPUT_ROOT + "/"):
+            raise ValueError(
+                f"input must resolve to a regular file below {INPUT_ROOT}: {err[-300:]}"
+            )
+        rc, _out, err = docker_ops.exec_sh(
+            container, f"test -f {shlex.quote(resolved_input)}", timeout=15
+        )
+        if rc:
+            raise ValueError(f"input is not a regular file: {request.input_path}: {err[-300:]}")
+        rc, size_text, err = docker_ops.exec_sh(
+            container,
+            f"stat -c %s -- {shlex.quote(resolved_input)}",
+            timeout=15,
+        )
+        if rc:
+            raise ValueError(f"input file does not exist: {request.input_path}")
+        try:
+            input_size = int(size_text.strip())
+        except ValueError as exc:
+            raise ValueError(f"cannot determine input size: {err[-300:]}") from exc
+        if input_size > 16 * 1024 * 1024:
+            raise ValueError("input exceeds the 16 MiB execution-protocol limit")
+        input_bytes = docker_ops.read_file(container, resolved_input)
+        if len(input_bytes) != input_size:
+            raise ValueError("input read was incomplete")
+    except Exception as exc:
+        return {
+            "schema_version": 1, "status": "invalid_request",
+            "request_id": request.request_id, "errors": [str(exc)],
+        }
+    digest = hashlib.sha256(input_bytes).hexdigest()
+    clean_binary = _symcc_hidden_path(target.binary_path, "clean")
+    symcc_cfg = target.symcc_runtime or {}
+    symcc_binary = _symcc_hidden_path(str(symcc_cfg["binary_path"]), "symcc")
+    clean = _run_protocol_binary(
+        container=container, binary=clean_binary, request=request,
+        input_path=request.input_path,
+    )
+    out_dir = f"/work/validation/symcc-results/{request.request_id}"
+    rc, _out, err = docker_ops.exec_sh(
+        container, f"rm -rf -- {shlex.quote(out_dir)} && mkdir -p -- {shlex.quote(out_dir)}",
+        timeout=15,
+    )
+    if rc:
+        symcc = {"status": "setup_failed", "errors": [err[-500:]], "testcase_count": 0}
+        replays = []
+    else:
+        symcc_request = ExecutionRequest(
+            request.request_id, request.input_path,
+            tuple(symcc_cfg.get("program_args") or request.program_args),
+            request.timeout_s, request.env,
+        )
+        symcc = _run_protocol_binary(
+            container=container, binary=symcc_binary, request=symcc_request,
+            input_path=request.input_path, symcc_output=out_dir,
+        )
+        list_cmd = (
+            f"find {shlex.quote(out_dir)} -maxdepth 1 -type f "
+            "-printf '%p\\t%s\\n' 2>/dev/null | "
+            "sort | head -n 32"
+        )
+        list_rc, listing, list_err = docker_ops.exec_sh(container, list_cmd, timeout=15)
+        generated: list[dict[str, Any]] = []
+        if list_rc == 0:
+            total = 0
+            for index, row in enumerate(listing.splitlines()):
+                path, sep, size_text = row.rpartition("\t")
+                if not sep or not path.startswith(out_dir + "/"):
+                    continue
+                try:
+                    size = int(size_text)
+                except ValueError:
+                    continue
+                if size < 0 or size > 1024 * 1024 or total + size > 16 * 1024 * 1024:
+                    continue
+                data = docker_ops.read_file(container, path)
+                if len(data) != size:
+                    continue
+                total += size
+                replay_path = f"{INPUT_ROOT}/symcc-{request.request_id}-{index:03d}.bin"
+                docker_ops.write_file(container, replay_path, data)
+                replay_request = ExecutionRequest(
+                    request.request_id,
+                    request.input_path,
+                    request.program_args,
+                    min(request.timeout_s, 10),
+                    request.env,
+                )
+                replay = _run_protocol_binary(
+                    container=container, binary=clean_binary, request=replay_request,
+                    input_path=replay_path,
+                )
+                generated.append({
+                    "path": replay_path,
+                    "size": size,
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                    "replay": replay,
+                })
+        else:
+            list_err = list_err[-500:]
+        replays = generated
+        symcc.update({
+            "testcase_count": len(generated),
+            "testcases": [
+                {key: item[key] for key in ("path", "size", "sha256")}
+                for item in generated
+            ],
+        })
+        if list_rc:
+            symcc.setdefault("errors", []).append(f"cannot list SymCC outputs: {list_err}")
+    return {
+        "schema_version": 1,
+        "protocol": "dynamic-execution",
+        "status": "completed",
+        "request_id": request.request_id,
+        "round_id": round_id,
+        "input_path": request.input_path,
+        "input_size": len(input_bytes),
+        "input_sha256": digest,
+        "clean": clean,
+        "symcc": symcc,
+        "generated_replays": replays,
+        "site_reached": None,
+        "site_reachability_note": (
+            "SymCC execution and clean-target replay are reported; no source-site "
+            "reachability is inferred from testcase generation alone."
+        ),
+    }
+
+
+async def _prebuilt_protocol_worker(
+    *, container: str, target: TargetConfig, stop: asyncio.Event,
+    result_path: str | None,
+) -> dict[str, Any]:
+    seen: set[str] = set()
+    records: list[dict[str, Any]] = []
+    stats = {"processed": 0, "invalid": 0, "errors": 0, "symcc_duration_s": 0.0}
+    command = (
+        f"find {shlex.quote(PENDING_ROOT)} -maxdepth 1 -type f "
+        "-name '*.json' -print | sort"
+    )
+    while not stop.is_set():
+        try:
+            rc, listing, _err = await asyncio.to_thread(
+                docker_ops.exec_sh, container, command, timeout=15
+            )
+        except Exception:
+            rc, listing = 1, ""
+        if rc == 0:
+            for path in listing.splitlines():
+                path = path.strip()
+                name = Path(path).name
+                if not path.startswith(PENDING_ROOT + "/") or not name.endswith(".json") or name in seen:
+                    continue
+                seen.add(name)
+                try:
+                    raw = await asyncio.to_thread(docker_ops.read_file, container, path)
+                    response = await asyncio.to_thread(
+                        _execute_prebuilt_protocol_request,
+                        container=container, target=target, raw=raw,
+                        filename=name, round_id=stats["processed"] + 1,
+                    )
+                    if response.get("status") == "invalid_request":
+                        stats["invalid"] += 1
+                    elif response.get("status") != "completed":
+                        stats["errors"] += 1
+                    symcc = response.get("symcc") or {}
+                    stats["symcc_duration_s"] += float(symcc.get("duration_s") or 0)
+                    await asyncio.to_thread(
+                        docker_ops.write_file, container,
+                        f"{RESPONSE_ROOT}/{name}",
+                        (json.dumps(response, indent=2, ensure_ascii=False) + "\n").encode(),
+                    )
+                    await asyncio.to_thread(
+                        docker_ops.exec_sh, container,
+                        f"mv -- {shlex.quote(path)} {shlex.quote(PROCESSED_ROOT + '/' + name)}",
+                        timeout=15,
+                    )
+                    records.append(response)
+                    stats["processed"] += 1
+                except Exception as exc:
+                    stats["errors"] += 1
+                    response = {
+                        "schema_version": 1,
+                        "status": "execution_error",
+                        "request_file": name,
+                        "errors": [f"{type(exc).__name__}: {exc}"],
+                    }
+                    records.append(response)
+                    try:
+                        await asyncio.to_thread(
+                            docker_ops.write_file, container,
+                            f"{RESPONSE_ROOT}/{name}",
+                            (json.dumps(response, indent=2) + "\n").encode(),
+                        )
+                        await asyncio.to_thread(
+                            docker_ops.exec_sh, container,
+                            f"mv -- {shlex.quote(path)} {shlex.quote(PROCESSED_ROOT + '/' + name)}",
+                            timeout=15,
+                        )
+                    except Exception:
+                        pass
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=0.25)
+        except asyncio.TimeoutError:
+            pass
+    summary = {
+        "schema_version": 1, "provider": "symcc-prebuilt", "status": "completed",
+        "requests": stats["processed"], "invalid_requests": stats["invalid"],
+        "errors": stats["errors"], "symcc_execution_s": round(stats["symcc_duration_s"], 3),
+        "records": records,
+    }
+    if result_path:
+        output = Path(result_path)
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
+        with (output / "requests.jsonl").open("w") as stream:
+            for record in records:
+                stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return summary
+
+
+async def _run_prebuilt_symcc_agent(
+    *, prompt: str, target: TargetConfig, container: str, model: str,
+    max_turns: int, system_prompt: str | None, max_resume_attempts: int,
+    transcript_path: str | None, progress_prefix: str | None,
+    result_path: str | None,
+) -> tuple[AgentResult, dict[str, float], dict[str, Any]]:
+    started = time.time()
+    stop = asyncio.Event()
+    worker = asyncio.create_task(_prebuilt_protocol_worker(
+        container=container, target=target, stop=stop, result_path=result_path
+    ))
+    try:
+        result = await run_agent(
+            prompt=prompt, max_turns=max_turns, model=model, container=container,
+            transcript_path=transcript_path, progress_prefix=progress_prefix,
+            system_prompt=system_prompt, max_resume_attempts=max_resume_attempts,
+            tools=["Read", "Write", "Bash"], phase_timeout_s=1800.0,
+            idle_timeout_s=1800.0,
+        )
+    finally:
+        stop.set()
+        try:
+            summary = await asyncio.wait_for(worker, timeout=15)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            worker.cancel()
+            try:
+                await worker
+            except (asyncio.CancelledError, Exception):
+                pass
+            summary = {
+                "schema_version": 1, "provider": "symcc-prebuilt", "status": "incomplete",
+                "errors": ["execution protocol worker did not stop cleanly"],
+            }
+    return result, {
+        "dynamic_validation": time.time() - started,
+        "execution_protocol_requests": float(summary.get("requests", 0)),
+        "execution_protocol_invalid": float(summary.get("invalid_requests", 0)),
+        "execution_protocol_errors": float(summary.get("errors", 0)),
+        "symbolic_execution_session": float(summary.get("symcc_execution_s", 0)),
+    }, summary
+
+
 @contextmanager
 def _open_dynamic_session(
     target: TargetConfig,
@@ -1216,8 +1679,8 @@ def _open_dynamic_session(
     with ExitStack() as stack:
         symbolic_session = None
         writable_mounts = None
-        if symbolic_provider in {"klee", "symcc"}:
-            session_type = KleeSession if symbolic_provider == "klee" else SymccSession
+        if symbolic_provider == "klee":
+            session_type = KleeSession
             symbolic_session = stack.enter_context(
                 session_type(
                     container_name=container_name,
@@ -1225,7 +1688,7 @@ def _open_dynamic_session(
                 )
             )
             writable_mounts = [symbolic_session.mount()]
-        elif symbolic_provider is not None:
+        elif symbolic_provider not in {None, "symcc"}:
             raise ValueError(
                 f"symbolic-execution provider is not implemented: {symbolic_provider}"
             )
@@ -1361,6 +1824,7 @@ def _normalize_poc_kind(value: str, detector: str) -> str:
     if detector != "logic" and (
         kind.endswith("_source")
         or kind.endswith("_script")
+        or "_source_via_" in kind
         or kind in {"raw-binary", "raw_binary", "binary", "raw_file"}
         or kind in {
             "crash", "input", "raw_input", "ruby_source", "python_source",

@@ -95,10 +95,12 @@ def test_dynamic_prompt_contains_candidate_and_no_static_result_is_grade_input()
 
 def test_crash_poc_kind_aliases_are_normalized_to_file():
     assert _normalize_poc_kind("ruby_source", "asan") == "file"
+    assert _normalize_poc_kind("ruby_source_via_mrb_load_string", "asan") == "file"
     assert _normalize_poc_kind("shell_script", "asan") == "file"
     assert _normalize_poc_kind("raw-binary", "asan") == "file"
     assert _normalize_poc_kind("program", "asan") == "program"
     assert _normalize_poc_kind("ruby_source", "logic") == "ruby_source"
+    assert _normalize_poc_kind("ruby_source_via_mrb_load_string", "logic") == "ruby_source_via_mrb_load_string"
 
 
 def test_logic_dynamic_prompt_uses_semantic_oracle_contract():

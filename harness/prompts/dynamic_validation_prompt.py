@@ -417,6 +417,24 @@ search. Focus on clean-target replay, crash-condition validation, PoC
 minimization, and the original final submission contract. A site hit alone is
 not a successful PoC; the final grader must still reproduce the claimed effect.
 """
+    if context.get("orchestration") == "prebuilt_protocol":
+        return f"""
+
+## Harness execution override — prebuilt SymCC is mandatory feedback
+
+This is the final execution instruction and overrides any general build/run
+examples above. Do not compile a source slice and do not invoke either target
+binary directly. For every candidate input, save it under
+`{context.get('input_root', '/work/validation/inputs')}/`, create a fresh JSON
+request from `{context.get('request_template', '/work/validation/execution/request-template.json')}`,
+and run `{context.get('runner', '/work/validation/run-input')} REQUEST.json`.
+Wait for and inspect its JSON response before deciding the next input. The
+Harness runs both prebuilt binaries on the same input and replays SymCC outputs
+on the ordinary target. Read source between iterations and use those concrete
+observations to refine the input. SymCC output is feedback only: it is not
+reachability proof or a PoC. Preserve the existing final crash-result or logic
+submission contract; Grade remains the final reproduction check.
+"""
     if context.get("orchestration") != "harness":
         return ""
     return f"""
@@ -462,6 +480,10 @@ field values; do not paste raw XML markup into a field.
 Fill `poc_path`, the exact `reproduction_command`, `poc_kind`, `crash_type`,
 `exit_code`, bounded `crash_output`, and `dup_check`. The PoC path must point
 to a non-empty file in the container and must occur verbatim in the command.
+Use only the artifact kinds supported by the template (`file`, `command`,
+`request`, `program`, or `bundle`). For example, Ruby source supplied as the
+input file to an mruby/libFuzzer executable is a `file` PoC, even when the
+target internally passes those bytes to `mrb_load_string`.
 `<reproduction_command>` must be the exact command containing that path; do not substitute aliases such as `<repro_command>` or `<reproduce>`.
 <reproduction_command>exact command containing that path</reproduction_command>
 The host parses this file strictly and reads the PoC bytes from that path.
@@ -511,6 +533,34 @@ and treat any provider error as an environment limitation:
             round_id=round_id or 1,
             feedback=feedback,
         )
+    if (
+        context.get("provider") == "symcc"
+        and context.get("orchestration") == "prebuilt_protocol"
+    ):
+        return f"""
+
+## Prebuilt SymCC feedback through the Harness
+
+The target source is available at `{context.get('source_root', '/src')}`. The
+ordinary target and a SymCC-instrumented target were both prepared before this
+dynamic phase from commit `{context.get('artifact_commit', 'unknown')}`. Do not
+build a source slice and do not invoke a compiler for SymCC.
+
+Create each candidate input under `{context.get('input_root', '/work/validation/inputs')}/`,
+write a fresh request using `{context.get('request_template', '/work/validation/execution/request-template.json')}`,
+then call `{context.get('runner', '/work/validation/run-input')} REQUEST.json`.
+The Harness runs that exact input against the ordinary target and the prebuilt
+SymCC target, then replays SymCC-generated inputs through the ordinary target.
+Read the JSON response and compare the concrete execution with generated-input
+replays before revising your hypothesis. Configured SymCC arguments are
+`{json.dumps(context.get('symcc_program_args', ['{input_file}']), ensure_ascii=False)}`.
+
+You remain responsible for reading source and constructing semantically valid
+inputs. SymCC feedback is advisory: a generated testcase is not a PoC, and
+testcase generation alone does not prove that the reported source location was
+reached. Keep the original candidate and final crash-result/logic-response
+contract; final acceptance remains the Grade phase's responsibility.
+"""
     if context.get("provider") == "symcc":
         return f"""
 
