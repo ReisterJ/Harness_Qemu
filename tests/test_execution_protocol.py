@@ -23,6 +23,15 @@ from harness.execution_protocol import (
     protocol_feedback_reader_script,
     target_argv,
 )
+from harness.symbolic.feedback import (
+    TRACE_EVENT,
+    TRACE_FLAG_COMPLETE,
+    TRACE_FLAG_TARGET_REACHED,
+    TRACE_FLAG_TARGETS_CONFIGURED,
+    TRACE_HEADER,
+    TRACE_MAGIC,
+    load_json_map_files,
+)
 
 
 def _request(**changes):
@@ -80,6 +89,14 @@ def test_parse_execution_request_rejects_invalid_contract(changes):
 def test_parse_execution_request_binds_filename_to_request_id():
     with pytest.raises(ExecutionRequestError, match="filename"):
         parse_request(json.dumps(_request()), filename="round-002.json")
+
+
+def test_parse_execution_request_preserves_parent_input_provenance():
+    value = _request(parent_input_id="round-previous")
+    parsed = parse_request(json.dumps(value))
+    assert parsed.parent_input_id == "round-previous"
+    with pytest.raises(ExecutionRequestError, match="parent_input_id"):
+        parse_request(json.dumps(_request(parent_input_id="../../bad")))
 
 
 def test_target_argv_keeps_arguments_separate_and_substitutes_input():
@@ -150,6 +167,76 @@ def test_protocol_runs_same_input_through_both_binaries_and_replays_generated(
     assert sum("/out/target-symcc" in command for command in commands) == 0
     assert any("/out/.harness-symcc-target-symcc" in command for command in commands)
     assert any("/out/.harness-clean-target" in command for command in commands)
+
+
+def test_protocol_returns_exact_target_hit_and_source_distance_per_input(monkeypatch):
+    target = _target()
+    map_record = json.loads('''{"schema_version":1,"module_id":"src/x.c",
+      "source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "function":"parse","blocks":[
+      {"id":100,"entry":true,"exit":false,"successors":[200],
+       "source_locations":[{"id":1000,"source_file":"src/x.c",
+        "source_function":"parse","line":1,"column":1}],"calls":[]},
+      {"id":200,"entry":false,"exit":true,"successors":[],
+       "source_locations":[{"id":2000,"source_file":"src/x.c",
+        "source_function":"parse","line":2,"column":1}],"calls":[]}]}''')
+    site_map = load_json_map_files([json.dumps(map_record)])
+    feedback_runtime = {
+        "status": "ready", "source_commit": "a" * 40,
+        "goal": {"targets": [{"source_file": "src/x.c", "line": 2}]},
+        "marker_ids": [2000], "target_block_ids": [200], "graph": site_map,
+    }
+    target_trace = (
+        TRACE_HEADER.pack(
+            TRACE_MAGIC, 1, TRACE_HEADER.size, 8, 2,
+            TRACE_FLAG_COMPLETE | TRACE_FLAG_TARGET_REACHED |
+            TRACE_FLAG_TARGETS_CONFIGURED, 0,
+        )
+        + TRACE_EVENT.pack(200, 1, 0)
+        + TRACE_EVENT.pack(2000, 2, 0)
+    )
+    commands = []
+    writes = {}
+
+    def fake_exec(_container, command, timeout=0):
+        commands.append(command)
+        if command.startswith("readlink -f"):
+            return 0, f"{INPUT_ROOT}/candidate.bin\n", ""
+        if command.startswith("stat -c"):
+            return 0, "4\n", ""
+        if "find /work/validation/symcc-results/round-001" in command:
+            return 0, "/work/validation/symcc-results/round-001/testcase-000\t7\n", ""
+        return 0, "", ""
+
+    def fake_read(_container, path):
+        if path.endswith("candidate.bin"):
+            return b"seed"
+        if path.endswith("testcase-000"):
+            return b"mutated"
+        if path.endswith("input.trace") or path.endswith("generated-000.trace"):
+            return target_trace
+        return b""
+
+    monkeypatch.setattr(docker_ops, "exec_sh", fake_exec)
+    monkeypatch.setattr(docker_ops, "read_file", fake_read)
+    monkeypatch.setattr(
+        docker_ops, "write_file", lambda _container, path, data: writes.__setitem__(path, data)
+    )
+
+    response = _execute_prebuilt_protocol_request(
+        container="target", target=target,
+        raw=json.dumps(_request(parent_input_id="round-000")).encode(),
+        filename="round-001.json", round_id=1,
+        feedback_runtime=feedback_runtime,
+    )
+    assert response["input_id"] == response["input_sha256"]
+    assert response["parent_input_id"] == "round-000"
+    assert response["target_commit"] == target.commit
+    assert response["site_reached"] is True
+    assert response["symcc_observation"]["distance"] == 0
+    assert response["generated_replays"][0]["symcc_observation"]["target_reached"] is True
+    assert any("SYMCC_FEEDBACK_TARGET_IDS=2000" in command for command in commands)
+    assert any("SYMCC_NO_SYMBOLIC_INPUT=1" in command for command in commands)
 
 
 def test_prebuilt_protocol_returns_clean_result_while_symcc_runs_in_background(

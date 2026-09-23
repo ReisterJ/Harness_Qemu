@@ -177,6 +177,24 @@ class TargetConfig:
                     "symbolic_execution.symcc.program_args must be a non-empty list "
                     "of at most 64 strings containing {input_file} exactly once"
                 )
+            feedback_map_path = symcc_config.get("feedback_map_path")
+            if feedback_map_path is not None and (
+                not isinstance(feedback_map_path, str)
+                or not feedback_map_path.startswith("/")
+                or "\x00" in feedback_map_path
+            ):
+                raise ValueError(
+                    "symbolic_execution.symcc.feedback_map_path must be an absolute container path"
+                )
+            feedback_capacity = symcc_config.get("feedback_capacity", 65536)
+            if (
+                isinstance(feedback_capacity, bool)
+                or not isinstance(feedback_capacity, int)
+                or not 1 <= feedback_capacity <= 2_000_000
+            ):
+                raise ValueError(
+                    "symbolic_execution.symcc.feedback_capacity must be between 1 and 2000000"
+                )
 
         if cfg.get("kind") == "dnr":
             raise ValueError(

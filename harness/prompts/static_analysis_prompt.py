@@ -83,7 +83,7 @@ Each candidate must contain these keys:
   "root_cause": "why validation or lifetime handling is insufficient",
   "verification_plan": "concrete dynamic steps the next agent should try",
   "observability_targets": [
-    {{"file": "src/parser.c", "function": "parse_chunk", "line": 123,
+    {{"source_file": "src/parser.c", "function": "parse_chunk", "line": 123,
      "why": "candidate sink or reachability checkpoint"}}
   ],
   "confidence": 0.0,

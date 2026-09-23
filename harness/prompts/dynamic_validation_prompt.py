@@ -561,16 +561,24 @@ decision point, query
 `{context.get('feedback_reader', '/work/validation/read-feedback')} REQUEST_ID`.
 Only query when the response says SymCC is `queued`; `skipped_busy` means no
 feedback will be produced for that request. If the reader returns `pending`, do
-not poll or wait; continue work and check later. Once ready, compare the clean
-execution with SymCC-generated-input replays before revising your hypothesis.
+not poll or wait; continue work and check later. Set `parent_input_id` when a
+candidate derives from a previous request or generated seed. Once ready,
+distinguish the submitted input's trace from each generated seed's separate
+trace. `target_reached=true` is an exact positive for that run; `false` is
+exact only when the trace is complete; `unknown` cannot establish a negative.
+Use `observed_locations` as observed source positions. `distance` is only a
+static CFG/call-graph heuristic, never a proof of reachability or
+non-reachability. If an input reaches the target, continue source reasoning and
+clean-target tests to derive the crash/invalid-effect condition; a site hit is
+not a PoC.
 Configured SymCC arguments are
 `{json.dumps(context.get('symcc_program_args', ['{input_file}']), ensure_ascii=False)}`.
 
 You remain responsible for reading source and constructing semantically valid
-inputs. SymCC feedback is advisory: a generated testcase is not a PoC, and
-testcase generation alone does not prove that the reported source location was
-reached. Keep the original candidate and final crash-result/logic-response
-contract; final acceptance remains the Grade phase's responsibility.
+inputs. A generated testcase is not a PoC; use its per-run source trace to know
+whether that concrete input hit the configured static target. Keep the original
+candidate and final crash-result/logic-response contract; final acceptance
+remains the Grade phase's responsibility.
 """
     if context.get("provider") == "symcc":
         return f"""

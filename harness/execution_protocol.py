@@ -37,6 +37,7 @@ class ExecutionRequest:
     program_args: tuple[str, ...]
     timeout_s: int
     env: dict[str, str]
+    parent_input_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -46,6 +47,7 @@ class ExecutionRequest:
             "program_args": list(self.program_args),
             "timeout_s": self.timeout_s,
             "env": dict(self.env),
+            "parent_input_id": self.parent_input_id,
         }
 
 
@@ -114,7 +116,20 @@ def parse_request(raw: bytes | str, *, filename: str | None = None,
         if len(normalized) > 4096:
             raise ExecutionRequestError(f"environment value for {key!r} is too long")
         env[key] = normalized
-    return ExecutionRequest(request_id, input_path, tuple(args), timeout_s, env)
+    parent_input_id = value.get("parent_input_id")
+    if parent_input_id is not None and (
+        not isinstance(parent_input_id, str)
+        or not (
+            _SAFE_ID.fullmatch(parent_input_id)
+            or re.fullmatch(r"[0-9a-fA-F]{64}", parent_input_id)
+        )
+    ):
+        raise ExecutionRequestError(
+            "parent_input_id must be a request identifier or SHA-256 digest"
+        )
+    return ExecutionRequest(
+        request_id, input_path, tuple(args), timeout_s, env, parent_input_id
+    )
 
 
 def target_argv(binary_path: str, program_args: tuple[str, ...],
@@ -187,14 +202,15 @@ def protocol_template(default_args: list[str] | None = None) -> bytes:
         "program_args": default_args or ["{input_file}"],
         "timeout_s": 120,
         "env": {},
+        "parent_input_id": None,
     }, indent=2, ensure_ascii=False) + "\n").encode()
 
 
 def protocol_readme(*, symbolic_enabled: bool) -> bytes:
     symbolic = (
-        "After the ordinary target result returns, the Harness queues this input for the configured "
-        "prebuilt SymCC binary in the background and later replays generated inputs on the ordinary "
-        "target. `run-input` does not wait for SymCC. Treat its result as feedback, not proof."
+        "After the ordinary target result returns, the Harness queues this same input for the "
+        "configured prebuilt SymCC binary in the background, records its instrumented source "
+        "trace, and replays bounded generated inputs. `run-input` does not wait for SymCC."
         if symbolic_enabled else "Only the ordinary target is run."
     )
     feedback = (
@@ -214,6 +230,8 @@ Put each candidate below `{INPUT_ROOT}/`, create a JSON request below
 
 The request uses `schema_version`, a fresh unique `request_id`, `input_path`,
 `program_args` (with `{{input_file}}` exactly once), and optional `timeout_s`/`env`.
+Set `parent_input_id` to the originating request id or input SHA-256 when this
+candidate was derived from a prior candidate or generated seed.
 The Harness owns the executable selection and execution. {symbolic}
 {feedback}
 Request ids are single-use; use a fresh id for every candidate. Reproduce the final PoC through the
