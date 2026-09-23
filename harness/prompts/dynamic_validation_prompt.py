@@ -572,10 +572,17 @@ non-reachability. If an input reaches the target, continue source reasoning and
 clean-target tests to derive the crash/invalid-effect condition; a site hit is
 not a PoC.
 When you submit a later input, its response may include `ready_feedback` for
-earlier SymCC jobs that completed asynchronously. Review and use those results
-before deciding the next input; the original response is not rewritten after
-the job finishes. `ready_feedback` is a nonblocking delivery mechanism, not a
-reason to wait before continuing.
+earlier SymCC jobs that completed asynchronously. This feedback is mandatory
+evidence for the next input decision: inspect it before choosing the next
+candidate, and connect each result to its `request_id`, `input_id`, and parent
+input. If you parse or redirect the runner output, preserve and print a concise
+summary of every `ready_feedback` record (status, exact `target_reached` or
+`unknown`, trace completeness, closest source location, heuristic distance,
+SymCC status, and generated-seed hit/distance summaries). Do not filter the
+response down to only the clean-target output or silently discard
+`ready_feedback`. The original response is not rewritten after the job
+finishes. This is a nonblocking delivery mechanism, not a reason to wait before
+continuing.
 Configured SymCC arguments are
 `{json.dumps(context.get('symcc_program_args', ['{input_file}']), ensure_ascii=False)}`.
 

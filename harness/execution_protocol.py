@@ -215,7 +215,9 @@ def protocol_readme(*, symbolic_enabled: bool) -> bytes:
     )
     feedback = (
         "A later run-input response includes a `ready_feedback` array for earlier jobs that "
-        "finished since your previous submission; review it before choosing the next input. "
+        "finished since your previous submission; it is mandatory evidence for the next input. "
+        "If you parse or redirect runner output, preserve and print a concise summary of every "
+        "ready-feedback record; do not filter it down to only the clean-target result. "
         f"For an individual request, `{FEEDBACK_READER_PATH} round-001` remains available and returns "
         "`pending` immediately if the background job is still running. Do not poll in a tight loop "
         "or wait on it; continue source analysis and input work. "

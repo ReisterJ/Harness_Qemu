@@ -487,7 +487,10 @@ def test_feedback_reader_is_nonblocking_and_validates_request_id():
     assert "sleep" not in script
     assert '[ "${#id}" -le 80 ]' in script
     assert "read-feedback REQUEST_ID" in script
-    assert "ready_feedback" in protocol_readme(symbolic_enabled=True).decode()
+    readme = protocol_readme(symbolic_enabled=True).decode()
+    assert "ready_feedback" in readme
+    assert "mandatory evidence for the next input" in readme
+    assert "preserve and print a concise summary" in readme
 
 
 def test_protocol_worker_does_not_wait_for_unused_symcc_after_agent_finishes(
