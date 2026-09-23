@@ -207,7 +207,10 @@ def protocol_template(default_args: list[str] | None = None) -> bytes:
     }, indent=2, ensure_ascii=False) + "\n").encode()
 
 
-def protocol_readme(*, symbolic_enabled: bool, max_requests: int = 8) -> bytes:
+def protocol_readme(
+    *, symbolic_enabled: bool, max_requests: int = 8,
+    max_concurrent_symcc_jobs: int = 1,
+) -> bytes:
     symbolic = (
         "After the ordinary target result returns, the Harness queues this same input for the "
         "configured prebuilt SymCC binary in the background, records its instrumented source "
@@ -221,7 +224,9 @@ def protocol_readme(*, symbolic_enabled: bool, max_requests: int = 8) -> bytes:
         "when this status is returned. For each accepted request, the Harness snapshots the "
         "submitted bytes under a unique request ID before execution; the clean target, concrete "
         "SymCC trace, and symbolic exploration all use that request-scoped copy. "
-        "Every accepted input is queued for SymCC; only two jobs run concurrently, while later "
+        "Every accepted input is queued for SymCC in a separate, network-isolated worker "
+        "container with its own memory limit; at most "
+        f"{max(1, int(max_concurrent_symcc_jobs))} job(s) run concurrently, while later "
         "jobs wait in the bounded background queue rather than being discarded. "
         "A later run-input response includes a `ready_feedback` array for earlier jobs that "
         "finished since your previous submission; it is mandatory evidence for the next input. "

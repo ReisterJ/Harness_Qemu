@@ -28,6 +28,25 @@ LLVM pass 为编译模块输出 JSONL 映射，并在 IR 中加入运行时通�
 
 这不是源代码语义分析：优化、内联、宏展开、缺失调试信息和间接调用都会影响映射完整性。source anchor 无法唯一解析时，目标命中状态必须保持 `unknown`，不能把 CFG 近似结果包装成事实。
 
+### 2.1 SymCC fork 的具体改造
+
+实验用的本地 SymCC fork 基于 `eurecom-s3/symcc` 上游提交 `3b8acab`，QSYM runtime 基于 `892f817f38f5abfa083dd0c1caa7ced821566bf5`。改造限于可选反馈旁路；不改变输入符号化、约束建模或 solver 求解策略。
+
+| 文件 | 改动及职责 |
+| --- | --- |
+| `compiler/Feedback.h`（新增） | 仅在设置 `SYMCC_FEEDBACK_MAP_DIR` 时生成映射。用 FNV-1a 对规范化模块路径、函数名、基本块序号和调试位置生成带类型前缀的 64 位 ID；JSONL 每行记录一个函数的基本块、CFG 后继、调试源位置及可解析的直接调用边，并附 `SYMCC_SOURCE_COMMIT`。写入临时文件后 rename，避免留下半行映射。 |
+| `compiler/Pass.cpp` | 在每个 LLVM 模块进入现有 pass 时调用 `emitMap`；未启用映射时不输出文件。 |
+| `compiler/Symbolizer.cpp` | 在原有基本块通知之外插入 source-location 通知；只为具有 DWARF 行号且 ID 与前一个不同的位置插桩。启用反馈时采用映射中的稳定 block ID，否则仍用原来的 SymCC site ID。 |
+| `compiler/Runtime.h`, `compiler/Runtime.cpp` | 向生成的 LLVM IR 声明 `_sym_notify_source_location` runtime callback。 |
+| `runtime/include/RuntimeCommon.h` | 声明 source-location callback，使不同 runtime backend 的接口保持一致。 |
+| `runtime/src/backends/qsym/Runtime.cpp` | 在 QSYM backend 实现可选 trace：进程启动时按环境变量打开 trace 文件并映射有界缓冲区；basic-block 和 source-location callback 追加事件；析构时写完成标志。支持配置目标 ID、容量，标记 trace 完成/截断/目标命中/目标配置无效。 |
+| `runtime/src/backends/simple/Runtime.cpp` | 提供空 callback，保证不使用 QSYM backend 的构建仍可链接。 |
+| `Dockerfile.feedback`（新增） | 从 digest 固定的官方 SymCC 镜像构建改造后的 compiler 和 QSYM runtime；这是实验预构建工具镜像，不由动态 agent 临时编译。 |
+
+ID 的稳定性范围是“相同源码与相同编译产物映射”，不是跨编译器版本或优化选项的 ABI。source commit 校验能发现仓库版本不匹配，但不能证明不同 flags 编译的 CFG 相同；因此映射必须与生成它的那一个插桩 binary 成套发布，不能只因 commit 相同就跨 binary 复用。映射无法解析、源码 anchor 多义或 trace 格式/目标 ID 无效时，Harness 返回 `unknown`。
+
+当前 trace 格式在 QSYM runtime 和 Harness parser 中共同实现：little-endian `SYMFDB1` 文件头（schema、header size、capacity、event count、flags）后跟定长事件 `(uint64 site_id, uint32 kind, uint32 padding)`；`kind=1` 是基本块，`kind=2` 是源码位置。默认容量 1,000,000 条，最高 20,000,000 条。解析器按 runtime 的完成/截断 flag 决定能否将“没有目标 marker”报告为确定未命中，而不是仅依赖进程退出码。
+
 ## 3. 运行期：准确轨迹和距离参考
 
 修改后的 QSYM runtime 通过 `SYMCC_FEEDBACK_TRACE` 写出有界二进制轨迹。当前格式为 `SYMFDB1`，包含 schema、容量、事件数和标志位；事件由 `(site_id, kind)` 构成，`kind=1` 表示基本块，`kind=2` 表示源码位置。结束标志区分正常完成和截断。目标 marker IDs 由 harness 从静态报告的源文件/函数/行号解析后，通过 `SYMCC_FEEDBACK_TARGET_IDS` 交给运行时。运行时在实际执行相应 callback 时置位目标命中标志。

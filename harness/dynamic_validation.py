@@ -9,6 +9,8 @@ import time
 import json
 import re
 import shlex
+import tempfile
+import uuid
 import xml.etree.ElementTree as ET
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -25,6 +27,7 @@ from .artifacts import (
     StaticFinding,
 )
 from .config import TargetConfig
+from .docker_params import DockerMount, DockerRunParams
 from .execution_protocol import (
     FEEDBACK_READER_PATH,
     FEEDBACK_ROOT,
@@ -138,6 +141,7 @@ async def run_dynamic_validation(
         symbolic_result_path=symbolic_execution_result_path,
     ) as (session, symbolic_session):
         container = session.container
+        _hide_source_vcs_metadata(container, target)
         _prepare_iteration_workspace(
             container, candidate, iteration_limit, target.detector
         )
@@ -1244,6 +1248,52 @@ def _symcc_hidden_path(binary_path: str, role: str) -> str:
     return str(path.with_name(f".harness-{role}-{path.name}"))
 
 
+def _hide_source_vcs_metadata(container: str, target: TargetConfig) -> None:
+    """Remove source-control metadata before dynamic exploration in every arm.
+
+    Commit history can disclose a fix or a reproducer and invalidate a blinded
+    comparison. This is enforced in the target view rather than left as a
+    prompt-only instruction.
+    """
+    vcs_path = f"{target.source_root.rstrip('/')}/.git"
+    rc, _out, err = docker_ops.exec_sh(
+        container,
+        f"if [ -e {shlex.quote(vcs_path)} ]; then "
+        f"rm -rf -- {shlex.quote(vcs_path)}; fi",
+        timeout=30,
+    )
+    if rc:
+        raise RuntimeError(f"cannot remove target VCS metadata: {err[-500:]}")
+
+
+def _symcc_sidecar_settings(config: dict[str, Any]) -> tuple[str, str, int]:
+    """Validate resource limits for the isolated SymCC worker container."""
+    memory_limit = config.get("memory_limit", "4g")
+    if (
+        not isinstance(memory_limit, str)
+        or not re.fullmatch(r"[1-9][0-9]*(?:[kmg])?", memory_limit.lower())
+    ):
+        raise ValueError("symbolic_execution.symcc.memory_limit must look like 4g or 2048m")
+
+    raw_cpus = config.get("cpus", 2)
+    if isinstance(raw_cpus, bool) or not isinstance(raw_cpus, (int, float, str)):
+        raise ValueError("symbolic_execution.symcc.cpus must be a positive Docker CPU quota")
+    cpus = str(raw_cpus)
+    try:
+        cpu_count = float(cpus)
+    except ValueError as exc:
+        raise ValueError("symbolic_execution.symcc.cpus must be numeric") from exc
+    if not 0 < cpu_count <= 64:
+        raise ValueError("symbolic_execution.symcc.cpus must be between 0 and 64")
+
+    max_concurrent = config.get("max_concurrent_jobs", 1)
+    if isinstance(max_concurrent, bool) or not isinstance(max_concurrent, int):
+        raise ValueError("symbolic_execution.symcc.max_concurrent_jobs must be an integer")
+    if not 1 <= max_concurrent <= 4:
+        raise ValueError("symbolic_execution.symcc.max_concurrent_jobs must be between 1 and 4")
+    return memory_limit.lower(), cpus, max_concurrent
+
+
 def _prepare_prebuilt_symcc_protocol(
     container: str, target: TargetConfig, candidate: StaticFinding | None = None,
     *, max_requests: int = _DEFAULT_MAX_ITERATIONS,
@@ -1265,6 +1315,9 @@ def _prepare_prebuilt_symcc_protocol(
         raise ValueError("prebuilt execution binary paths must not contain arguments")
     if clean_parts[0] == symcc_parts[0]:
         raise ValueError("clean and SymCC binary_path values must be different")
+    memory_limit, sidecar_cpus, max_concurrent_symcc_jobs = _symcc_sidecar_settings(
+        config
+    )
 
     symcc_args = config.get("program_args") or ["{input_file}"]
     if (
@@ -1323,16 +1376,6 @@ def _prepare_prebuilt_symcc_protocol(
         if rc:
             raise RuntimeError(f"cannot install {label} execution guard: {err[-300:]}")
 
-    vcs_path = f"{target.source_root.rstrip('/')}/.git"
-    rc, _out, err = docker_ops.exec_sh(
-        container,
-        f"if [ -e {shlex.quote(vcs_path)} ]; then "
-        f"rm -rf -- {shlex.quote(vcs_path)}; fi",
-        timeout=30,
-    )
-    if rc:
-        raise RuntimeError(f"cannot remove target VCS metadata from dynamic view: {err[-500:]}")
-
     docker_ops.write_file(container, RUNNER_PATH, protocol_runner_script())
     rc, _out, err = docker_ops.exec_sh(
         container, f"chmod 0555 -- {shlex.quote(RUNNER_PATH)}", timeout=15
@@ -1357,7 +1400,11 @@ def _prepare_prebuilt_symcc_protocol(
     )
     docker_ops.write_file(
         container, EXECUTION_README_PATH,
-        protocol_readme(symbolic_enabled=True, max_requests=max_requests),
+        protocol_readme(
+            symbolic_enabled=True,
+            max_requests=max_requests,
+            max_concurrent_symcc_jobs=max_concurrent_symcc_jobs,
+        ),
     )
     feedback_runtime = _load_symcc_feedback_runtime(
         container=container, target=target, candidate=candidate
@@ -1379,6 +1426,11 @@ def _prepare_prebuilt_symcc_protocol(
         "feedback_root": FEEDBACK_ROOT,
         "prebuilt_binary": True,
         "artifact_commit": artifact_commit,
+        "worker_isolated": True,
+        "worker_network": "none",
+        "worker_memory_limit": memory_limit,
+        "worker_cpus": sidecar_cpus,
+        "max_concurrent_jobs": max_concurrent_symcc_jobs,
         "symcc_program_args": symcc_args,
         "feedback": prompt_feedback,
         "_feedback_runtime": feedback_runtime,
@@ -1700,6 +1752,7 @@ def _prepare_prebuilt_protocol_request(
         "input_size": len(input_bytes),
         "input_sha256": digest,
         "input_id": digest,
+        "input_bytes": input_bytes,
         "snapshot_path": snapshot_path,
         "clean": clean,
     }
@@ -1710,145 +1763,145 @@ def _execute_prebuilt_protocol_symcc_request(
     *, container: str, target: TargetConfig, job: dict[str, Any],
     feedback_runtime: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """Run concrete tracing and symbolic exploration in an isolated sidecar.
+
+    The agent container is never used for SymCC execution. Each job receives a
+    separate no-network container with an explicit memory/CPU budget and only
+    a request-scoped input/output bind mount. This prevents a solver OOM from
+    killing the PoC agent that is using the same target.
+    """
     request: ExecutionRequest = job["request"]
     round_id = int(job["round_id"])
     symcc_cfg = target.symcc_runtime or {}
-    clean_binary = _symcc_hidden_path(target.binary_path, "clean")
-    symcc_binary = _symcc_hidden_path(str(symcc_cfg["binary_path"]), "symcc")
+    memory_limit, sidecar_cpus, _max_concurrent = _symcc_sidecar_settings(symcc_cfg)
+    clean_binary = shlex.split(target.binary_path)[0]
+    symcc_binary = shlex.split(str(symcc_cfg["binary_path"]))[0]
     snapshot_path = str(job.get("snapshot_path") or request.input_path)
-    out_dir = f"/work/validation/symcc-results/{request.request_id}"
-    trace_dir = f"/work/validation/symcc-feedback/{request.request_id}"
-    rc, _out, err = docker_ops.exec_sh(
-        container, f"rm -rf -- {shlex.quote(out_dir)} && mkdir -p -- {shlex.quote(out_dir)}",
-        timeout=15,
-    )
-    if rc == 0:
-        rc, _out, err = docker_ops.exec_sh(
-            container,
-            f"rm -rf -- {shlex.quote(trace_dir)} && mkdir -p -- {shlex.quote(trace_dir)}",
-            timeout=15,
-        )
-    if rc:
-        symcc = {"status": "setup_failed", "errors": [err[-500:]], "testcase_count": 0}
-        input_trace_execution = {"status": "not_run", "exit_code": None}
-        replays = []
-        initial_observation = {
-            "status": "unavailable", "target_reached": None,
-            "target_reachability": "unknown", "reason": "cannot create feedback directories",
-        }
-    else:
-        symcc_args = tuple(symcc_cfg.get("program_args") or request.program_args)
-        concrete_request = ExecutionRequest(
-            request.request_id, snapshot_path,
-            symcc_args,
-            request.timeout_s, request.env,
-        )
-        input_trace_output_dir = f"{out_dir}/concrete-input"
-        rc, _out, err = docker_ops.exec_sh(
-            container,
-            f"mkdir -p -- {shlex.quote(input_trace_output_dir)}",
-            timeout=15,
-        )
-        trace_dir_ready = rc == 0
-        if not trace_dir_ready:
-            err = err[-500:]
-        target_ids = (feedback_runtime or {}).get("marker_ids", [])
-        trace_env = {
-            "SYMCC_FEEDBACK_TRACE": f"{trace_dir}/input.trace",
-            "SYMCC_FEEDBACK_CAPACITY": str(
-                (symcc_cfg.get("feedback_capacity") or 65536)
-            ),
-            "SYMCC_NO_SYMBOLIC_INPUT": "1",
-        }
-        if target_ids:
-            trace_env["SYMCC_FEEDBACK_TARGET_IDS"] = ",".join(
-                str(site_id) for site_id in target_ids
-            )
-        if trace_dir_ready:
-            input_trace_execution = _run_protocol_binary(
-                container=container, binary=symcc_binary,
-                request=concrete_request, input_path=snapshot_path,
-                symcc_output=input_trace_output_dir, extra_env=trace_env,
-            )
-            initial_observation = _read_symcc_trace_feedback(
-                container=container,
-                path=f"{trace_dir}/input.trace",
-                feedback_runtime=feedback_runtime,
-            )
-        else:
-            input_trace_execution = {
-                "status": "setup_failed", "exit_code": None,
-                "duration_s": 0.0, "error": f"cannot create concrete trace output: {err}",
-            }
-            initial_observation = {
-                "status": "unavailable", "target_reached": None,
-                "target_reachability": "unknown",
-                "reason": "cannot create concrete trace output directory",
-            }
+    input_bytes = job.get("input_bytes")
+    if not isinstance(input_bytes, bytes):
+        input_bytes = docker_ops.read_file(container, snapshot_path)
+    if len(input_bytes) != int(job["input_size"]):
+        raise RuntimeError("request snapshot bytes are unavailable or incomplete")
 
-        symcc_request = ExecutionRequest(
-            request.request_id, snapshot_path,
-            symcc_args,
-            request.timeout_s, request.env,
+    sidecar_root = "/symcc-job"
+    sidecar_input = f"{sidecar_root}/input.bin"
+    out_dir = f"{sidecar_root}/symcc-results"
+    trace_dir = f"{sidecar_root}/traces"
+    with tempfile.TemporaryDirectory(prefix="harness-symcc-feedback-") as temporary:
+        host_root = Path(temporary)
+        (host_root / "traces").mkdir()
+        (host_root / "symcc-results").mkdir()
+        (host_root / "input.bin").write_bytes(input_bytes)
+        sidecar_name = (
+            f"symcc-fb-{re.sub(r'[^A-Za-z0-9_.-]', '-', target.name)[:20]}-"
+            f"{uuid.uuid4().hex[:12]}"
+        )[:63]
+        run_params = DockerRunParams(
+            network="none",
+            memory=memory_limit,
+            cpus=sidecar_cpus,
+            mounts=(DockerMount(str(host_root), sidecar_root, read_only=False),),
+            entrypoint=("/bin/sh",),
+            command=("/bin/sh", "-c", "while :; do sleep 3600; done"),
         )
-        symcc = _run_protocol_binary(
-            container=container, binary=symcc_binary, request=symcc_request,
-            input_path=snapshot_path, symcc_output=out_dir,
-        )
-        list_cmd = (
-            f"find {shlex.quote(out_dir)} -maxdepth 1 -type f "
-            "-printf '%p\\t%s\\n' 2>/dev/null | "
-            "sort | head -n 8"
-        )
-        list_rc, listing, list_err = docker_ops.exec_sh(container, list_cmd, timeout=15)
-        generated: list[dict[str, Any]] = []
-        generated_index = 0
-        if list_rc == 0:
-            total = 0
-            for index, row in enumerate(listing.splitlines()):
-                path, sep, size_text = row.rpartition("\t")
-                if not sep or not path.startswith(out_dir + "/"):
+        started_sidecar = False
+        try:
+            docker_ops.run(
+                target.runtime_image_tag,
+                sidecar_name,
+                network="none",
+                memory=memory_limit,
+                shell="/bin/sh",
+                run_params=run_params,
+            )
+            started_sidecar = True
+            target_ids = (feedback_runtime or {}).get("marker_ids", [])
+            symcc_args = tuple(symcc_cfg.get("program_args") or request.program_args)
+            concrete_request = ExecutionRequest(
+                request.request_id, sidecar_input,
+                symcc_args, request.timeout_s, request.env,
+            )
+            trace_env = {
+                "SYMCC_FEEDBACK_TRACE": f"{trace_dir}/input.trace",
+                "SYMCC_FEEDBACK_CAPACITY": str(symcc_cfg.get("feedback_capacity") or 65536),
+                "SYMCC_NO_SYMBOLIC_INPUT": "1",
+            }
+            if target_ids:
+                trace_env["SYMCC_FEEDBACK_TARGET_IDS"] = ",".join(
+                    str(site_id) for site_id in target_ids
+                )
+            input_trace_execution = _run_protocol_binary(
+                container=sidecar_name, binary=symcc_binary,
+                request=concrete_request, input_path=sidecar_input,
+                symcc_output=f"{out_dir}/concrete-input", extra_env=trace_env,
+            )
+            initial_observation = _summarize_symcc_trace_bytes(
+                _read_host_trace(host_root / "traces" / "input.trace"),
+                feedback_runtime,
+            )
+
+            symcc_request = ExecutionRequest(
+                request.request_id, sidecar_input,
+                symcc_args, request.timeout_s, request.env,
+            )
+            symcc = _run_protocol_binary(
+                container=sidecar_name, binary=symcc_binary,
+                request=symcc_request, input_path=sidecar_input,
+                symcc_output=out_dir,
+            )
+            oom_kills = _symcc_sidecar_oom_kills(sidecar_name)
+            symcc["worker"] = {
+                "isolated": True,
+                "network": "none",
+                "memory_limit": memory_limit,
+                "cpus": sidecar_cpus,
+                "oom_kill_count": oom_kills,
+            }
+            if oom_kills and symcc.get("exit_code") == 137:
+                symcc["status"] = "resource_exhausted"
+                symcc.setdefault("errors", []).append(
+                    "isolated SymCC worker was OOM-killed; the agent container was unaffected"
+                )
+
+            seed_paths = sorted(
+                (path for path in (host_root / "symcc-results").iterdir()
+                 if path.is_file()),
+                key=lambda path: path.name,
+            )[:8]
+            generated: list[dict[str, Any]] = []
+            total_seed_bytes = 0
+            for index, seed_path in enumerate(seed_paths):
+                size = seed_path.stat().st_size
+                if size <= 0 or size > 1024 * 1024 or total_seed_bytes + size > 16 * 1024 * 1024:
                     continue
-                try:
-                    size = int(size_text)
-                except ValueError:
-                    continue
-                if size < 0 or size > 1024 * 1024 or total + size > 16 * 1024 * 1024:
-                    continue
-                data = docker_ops.read_file(container, path)
+                data = seed_path.read_bytes()
                 if len(data) != size:
                     continue
-                total += size
+                total_seed_bytes += size
+                sidecar_seed = f"{out_dir}/{seed_path.name}"
                 replay_path = f"{INPUT_ROOT}/symcc-{request.request_id}-{index:03d}.bin"
                 docker_ops.write_file(container, replay_path, data)
                 replay_request = ExecutionRequest(
-                    request.request_id,
-                    snapshot_path,
-                    request.program_args,
-                    min(request.timeout_s, 10),
-                    request.env,
+                    request.request_id, sidecar_seed,
+                    request.program_args, min(request.timeout_s, 10), request.env,
                 )
                 replay = _run_protocol_binary(
-                    container=container, binary=clean_binary, request=replay_request,
-                    input_path=replay_path,
+                    container=sidecar_name, binary=clean_binary,
+                    request=replay_request, input_path=sidecar_seed,
                 )
-                candidate_trace_path = f"{trace_dir}/generated-{generated_index:03d}.trace"
+                candidate_trace_path = host_root / "traces" / f"generated-{index:03d}.trace"
                 candidate_symcc_request = ExecutionRequest(
-                    request.request_id,
-                    snapshot_path,
-                    symcc_args,
-                    min(request.timeout_s, 10),
-                    request.env,
+                    request.request_id, sidecar_seed,
+                    symcc_args, min(request.timeout_s, 10), request.env,
                 )
                 candidate_trace_run = _run_protocol_binary(
-                    container=container,
-                    binary=symcc_binary,
+                    container=sidecar_name, binary=symcc_binary,
                     request=candidate_symcc_request,
-                    input_path=replay_path,
-                    symcc_output=f"{out_dir}/concrete-{generated_index:03d}",
+                    input_path=sidecar_seed,
+                    symcc_output=f"{out_dir}/concrete-{index:03d}",
                     extra_env={
                         "SYMCC_FEEDBACK_CAPACITY": str(
-                            (symcc_cfg.get("feedback_capacity") or 65536)
+                            symcc_cfg.get("feedback_capacity") or 65536
                         ),
                         **({
                             "SYMCC_FEEDBACK_TARGET_IDS": ",".join(
@@ -1856,13 +1909,11 @@ def _execute_prebuilt_protocol_symcc_request(
                             )
                         } if target_ids else {}),
                         "SYMCC_NO_SYMBOLIC_INPUT": "1",
-                        "SYMCC_FEEDBACK_TRACE": candidate_trace_path,
+                        "SYMCC_FEEDBACK_TRACE": f"{trace_dir}/generated-{index:03d}.trace",
                     },
                 )
-                site_feedback = _read_symcc_trace_feedback(
-                    container=container,
-                    path=candidate_trace_path,
-                    feedback_runtime=feedback_runtime,
+                site_feedback = _summarize_symcc_trace_bytes(
+                    _read_host_trace(candidate_trace_path), feedback_runtime
                 )
                 generated.append({
                     "path": replay_path,
@@ -1872,19 +1923,18 @@ def _execute_prebuilt_protocol_symcc_request(
                     "symcc_execution": candidate_trace_run,
                     "symcc_observation": site_feedback,
                 })
-                generated_index += 1
-        else:
-            list_err = list_err[-500:]
-        replays = generated
-        symcc.update({
-            "testcase_count": len(generated),
-            "testcases": [
-                {key: item[key] for key in ("path", "size", "sha256")}
-                for item in generated
-            ],
-        })
-        if list_rc:
-            symcc.setdefault("errors", []).append(f"cannot list SymCC outputs: {list_err}")
+            symcc.update({
+                "testcase_count": len(generated),
+                "testcases": [
+                    {key: item[key] for key in ("path", "size", "sha256")}
+                    for item in generated
+                ],
+            })
+            replays = generated
+        finally:
+            if started_sidecar:
+                docker_ops.rm(sidecar_name)
+
     return {
         "schema_version": 1,
         "protocol": "dynamic-execution",
@@ -1913,24 +1963,38 @@ def _execute_prebuilt_protocol_symcc_request(
     }
 
 
-def _read_symcc_trace_feedback(
-    *, container: str, path: str, feedback_runtime: dict[str, Any] | None
-) -> dict[str, Any]:
-    """Read one bounded execution trace and join it with its versioned map."""
+def _read_host_trace(path: Path) -> bytes:
     try:
-        raw = docker_ops.read_file(container, path)
-    except Exception as exc:
-        return {
-            "status": "read_error", "target_reached": None,
-            "target_reachability": "unknown",
-            "reason": f"{type(exc).__name__}: {exc}",
-        }
-    if not raw:
+        return path.read_bytes()
+    except OSError:
+        return b""
+
+
+def _symcc_sidecar_oom_kills(container: str) -> int | None:
+    rc, output, _err = docker_ops.exec_sh(
+        container, "cat /sys/fs/cgroup/memory.events", timeout=5
+    )
+    if rc:
+        return None
+    for line in output.splitlines():
+        key, _, value = line.partition(" ")
+        if key == "oom_kill":
+            try:
+                return int(value)
+            except ValueError:
+                return None
+    return None
+
+
+def _summarize_symcc_trace_bytes(
+    raw: bytes, feedback_runtime: dict[str, Any] | None
+) -> dict[str, Any]:
+    trace = parse_trace(raw) if raw else None
+    if trace is None:
         return {
             "status": "missing", "target_reached": None,
             "target_reachability": "unknown", "reason": "runtime trace file is missing",
         }
-    trace = parse_trace(raw)
     if feedback_runtime is None:
         return {
             "status": "map_unavailable", "trace_status": trace.status,
@@ -1952,16 +2016,28 @@ def _read_symcc_trace_feedback(
             or "target anchors could not be resolved through the versioned map",
         }
     result = summarize_trace(
-        graph,
-        trace,
-        marker_ids=marker_ids,
-        target_block_ids=target_block_ids,
+        graph, trace, marker_ids=marker_ids, target_block_ids=target_block_ids
     )
     result["status"] = "ready" if trace.status in {"completed", "interrupted"} else trace.status
     result["map_status"] = map_status
     result["map_commit"] = feedback_runtime.get("source_commit")
     result["goal"] = feedback_runtime.get("goal")
     return result
+
+
+def _read_symcc_trace_feedback(
+    *, container: str, path: str, feedback_runtime: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Read one bounded execution trace and join it with its versioned map."""
+    try:
+        raw = docker_ops.read_file(container, path)
+    except Exception as exc:
+        return {
+            "status": "read_error", "target_reached": None,
+            "target_reachability": "unknown",
+            "reason": f"{type(exc).__name__}: {exc}",
+        }
+    return _summarize_symcc_trace_bytes(raw, feedback_runtime)
 
 
 def _execute_prebuilt_protocol_request(
