@@ -376,9 +376,10 @@ def test_next_protocol_response_auto_delivers_completed_symcc_feedback(monkeypat
     target = _target()
     writes = {}
     pending_ids = ["round-001"]
+    clean_runs = []
     pending_lock = threading.Lock()
     responses_written = {request_id: threading.Event() for request_id in (
-        "round-001", "round-002"
+        "round-001", "round-002", "round-003"
     )}
     feedback_written = {request_id: threading.Event() for request_id in (
         "round-001", "round-002"
@@ -387,9 +388,9 @@ def test_next_protocol_response_auto_delivers_completed_symcc_feedback(monkeypat
         request_id: _request(
             request_id=request_id,
             input_path=f"{INPUT_ROOT}/candidate.bin",
-            parent_input_id="round-001" if request_id == "round-002" else None,
+            parent_input_id="round-001" if request_id in {"round-002", "round-003"} else None,
         )
-        for request_id in ("round-001", "round-002")
+        for request_id in ("round-001", "round-002", "round-003")
     }
 
     def fake_exec(_container, command, timeout=0):
@@ -404,6 +405,7 @@ def test_next_protocol_response_auto_delivers_completed_symcc_feedback(monkeypat
         if command.startswith("test -f"):
             return 0, "", ""
         if command.startswith("timeout --signal=KILL"):
+            clean_runs.append(command)
             return 0, "clean target complete", ""
         if command.startswith(f"mv -- {PENDING_ROOT}/"):
             request_id = command.rsplit("/", 1)[-1].removesuffix(".json")
@@ -467,6 +469,7 @@ def test_next_protocol_response_auto_delivers_completed_symcc_feedback(monkeypat
         stop = asyncio.Event()
         worker = asyncio.create_task(_prebuilt_protocol_worker(
             container="target", target=target, stop=stop, result_path=None,
+            max_requests=2,
         ))
         assert await asyncio.to_thread(responses_written["round-001"].wait, 3)
         assert await asyncio.to_thread(feedback_written["round-001"].wait, 3)
@@ -480,10 +483,20 @@ def test_next_protocol_response_auto_delivers_completed_symcc_feedback(monkeypat
         assert response["ready_feedback"][0]["symcc_observation"]["distance"] == 0
         assert await asyncio.to_thread(feedback_written["round-002"].wait, 3)
 
+        with pending_lock:
+            pending_ids.append("round-003")
+        assert await asyncio.to_thread(responses_written["round-003"].wait, 3)
+        limited = json.loads(writes[f"{RESPONSE_ROOT}/round-003.json"])
+        assert limited["status"] == "iteration_limit_reached"
+        assert limited["accepted_requests"] == 2
+        assert len(clean_runs) == 2
+
         stop.set()
         summary = await asyncio.wait_for(worker, timeout=3)
-        assert summary["feedback_auto_delivered"] == 1
+        assert summary["feedback_auto_delivered"] == 2
         assert summary["requests"] == 2
+        assert summary["iteration_limit"] == 2
+        assert summary["iteration_limit_rejections"] == 1
 
     asyncio.run(exercise())
 
@@ -496,6 +509,8 @@ def test_feedback_reader_is_nonblocking_and_validates_request_id():
     assert "read-feedback REQUEST_ID" in script
     readme = protocol_readme(symbolic_enabled=True).decode()
     assert "ready_feedback" in readme
+    assert "at most 8 input requests" in readme
+    assert "iteration_limit_reached" in readme
     assert "mandatory evidence for the next input" in readme
     assert "preserve and print a concise summary" in readme
 

@@ -206,7 +206,7 @@ def protocol_template(default_args: list[str] | None = None) -> bytes:
     }, indent=2, ensure_ascii=False) + "\n").encode()
 
 
-def protocol_readme(*, symbolic_enabled: bool) -> bytes:
+def protocol_readme(*, symbolic_enabled: bool, max_requests: int = 8) -> bytes:
     symbolic = (
         "After the ordinary target result returns, the Harness queues this same input for the "
         "configured prebuilt SymCC binary in the background, records its instrumented source "
@@ -214,6 +214,10 @@ def protocol_readme(*, symbolic_enabled: bool) -> bytes:
         if symbolic_enabled else "Only the ordinary target is run."
     )
     feedback = (
+        f"The Harness accepts at most {max(1, int(max_requests))} input requests in this phase; "
+        "each request consumes one numbered validation round. Requests beyond the limit receive "
+        "`iteration_limit_reached` and are not executed. Submit one request per round and stop "
+        "when this status is returned. "
         "A later run-input response includes a `ready_feedback` array for earlier jobs that "
         "finished since your previous submission; it is mandatory evidence for the next input. "
         "If you parse or redirect runner output, preserve and print a concise summary of every "

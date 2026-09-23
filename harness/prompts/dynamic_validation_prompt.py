@@ -59,6 +59,7 @@ def build_dynamic_validation_prompt(
         round_id=symbolic_round,
         feedback=symbolic_feedback,
         finalize=symbolic_finalize,
+        max_iterations=max_iterations,
     )
     iteration_section = _iteration_section(max_iterations, safe_candidate_id)
     result_file_section = (
@@ -507,6 +508,7 @@ def _symbolic_section(
     round_id: int | None = None,
     feedback: dict | None = None,
     finalize: bool = False,
+    max_iterations: int = 8,
 ) -> str:
     if not context:
         return ""
@@ -554,6 +556,12 @@ build a source slice and do not invoke a compiler for SymCC.
 Create each candidate input under `{context.get('input_root', '/work/validation/inputs')}/`,
 write a fresh request using `{context.get('request_template', '/work/validation/execution/request-template.json')}`,
 then call `{context.get('runner', '/work/validation/run-input')} REQUEST.json`.
+This phase permits at most {max(1, min(int(max_iterations), 100))} input requests. One
+`run-input` submission consumes one numbered validation round, including controls
+and variants. Submit one request, inspect its clean result and any
+`ready_feedback`, then decide the next request. The Harness enforces this limit;
+after it is reached, further requests receive `iteration_limit_reached` and are
+not executed. Stop submitting inputs when that status appears.
 The call waits only for that exact input's ordinary-target result. The Harness
 queues the prebuilt SymCC execution in the background, so continue source
 analysis and constructing/testing inputs rather than waiting for it. At a useful

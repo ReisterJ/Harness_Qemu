@@ -97,6 +97,8 @@ def test_prebuilt_symcc_protocol_is_the_final_dynamic_prompt_override():
     assert "queues the prebuilt SymCC execution in the background" in prompt
     assert "its response may include `ready_feedback`" in prompt
     assert "mandatory" in prompt and "inspect it before choosing the next" in prompt
+    assert "at most 8 input requests" in prompt
+    assert "iteration_limit_reached" in prompt
     assert "preserve and print a concise" in prompt
     assert "summary of every `ready_feedback` record" in prompt
     assert "Do not filter" in prompt

@@ -142,7 +142,9 @@ async def run_dynamic_validation(
         )
         symbolic_feedback_runtime: dict[str, Any] | None = None
         symbolic_context = (
-            _prepare_prebuilt_symcc_protocol(container, target, candidate)
+            _prepare_prebuilt_symcc_protocol(
+                container, target, candidate, max_requests=iteration_limit
+            )
             if symbolic_provider == "symcc"
             else symbolic_session.prepare_agent(container) if symbolic_session else None
         )
@@ -204,6 +206,7 @@ async def run_dynamic_validation(
                 progress_prefix=progress_prefix,
                 result_path=symbolic_execution_result_path,
                 feedback_runtime=symbolic_feedback_runtime,
+                max_iterations=iteration_limit,
             )
             timings.update(protocol_timings)
         else:
@@ -1237,7 +1240,8 @@ def _symcc_hidden_path(binary_path: str, role: str) -> str:
 
 
 def _prepare_prebuilt_symcc_protocol(
-    container: str, target: TargetConfig, candidate: StaticFinding | None = None
+    container: str, target: TargetConfig, candidate: StaticFinding | None = None,
+    *, max_requests: int = _DEFAULT_MAX_ITERATIONS,
 ) -> dict[str, Any]:
     """Validate prebuilt executables and expose the request/response client."""
     config = target.symcc_runtime or {}
@@ -1347,7 +1351,8 @@ def _prepare_prebuilt_symcc_protocol(
         container, REQUEST_TEMPLATE_PATH, protocol_template(symcc_args)
     )
     docker_ops.write_file(
-        container, EXECUTION_README_PATH, protocol_readme(symbolic_enabled=True)
+        container, EXECUTION_README_PATH,
+        protocol_readme(symbolic_enabled=True, max_requests=max_requests),
     )
     feedback_runtime = _load_symcc_feedback_runtime(
         container=container, target=target, candidate=candidate
@@ -1978,7 +1983,9 @@ async def _prebuilt_protocol_worker(
     *, container: str, target: TargetConfig, stop: asyncio.Event,
     result_path: str | None,
     feedback_runtime: dict[str, Any] | None = None,
+    max_requests: int = _DEFAULT_MAX_ITERATIONS,
 ) -> dict[str, Any]:
+    request_limit = max(1, min(int(max_requests), _MAX_ITERATION_RECORDS))
     max_inflight_symcc_jobs = 2
     seen: set[str] = set()
     records: list[dict[str, Any]] = []
@@ -1988,6 +1995,7 @@ async def _prebuilt_protocol_worker(
         "symcc_errors": 0, "symcc_skipped_busy": 0,
         "symcc_abandoned": 0, "symcc_duration_s": 0.0,
         "feedback_auto_delivered": 0,
+        "iteration_limit_rejections": 0,
     }
     feedback_delivered: set[str] = set()
     command = (
@@ -2075,6 +2083,36 @@ async def _prebuilt_protocol_worker(
                 seen.add(name)
                 try:
                     raw = await asyncio.to_thread(docker_ops.read_file, container, path)
+                    if stats["processed"] >= request_limit:
+                        request_id = name.removesuffix(".json")
+                        response = {
+                            "schema_version": 1,
+                            "protocol": "dynamic-execution",
+                            "status": "iteration_limit_reached",
+                            "request_id": request_id,
+                            "iteration_limit": request_limit,
+                            "accepted_requests": stats["processed"],
+                            "message": (
+                                "The Harness-enforced dynamic iteration limit has been "
+                                "reached. This input was not run by the clean target or "
+                                "SymCC; stop submitting requests and report the evidence "
+                                "collected so far."
+                            ),
+                        }
+                        delivered_ids = attach_ready_feedback(response)
+                        await asyncio.to_thread(
+                            docker_ops.write_file, container,
+                            f"{RESPONSE_ROOT}/{name}",
+                            (json.dumps(response, indent=2, ensure_ascii=False) + "\n").encode(),
+                        )
+                        mark_feedback_delivered(delivered_ids)
+                        await asyncio.to_thread(
+                            docker_ops.exec_sh, container,
+                            f"mv -- {shlex.quote(path)} {shlex.quote(PROCESSED_ROOT + '/' + name)}",
+                            timeout=15,
+                        )
+                        stats["iteration_limit_rejections"] += 1
+                        continue
                     response, job = await asyncio.to_thread(
                         _prepare_prebuilt_protocol_request,
                         container=container, target=target, raw=raw,
@@ -2168,7 +2206,9 @@ async def _prebuilt_protocol_worker(
     summary = {
         "schema_version": 1, "provider": "symcc-prebuilt",
         "status": "incomplete" if unfinished else "completed",
+        "iteration_limit": request_limit,
         "requests": stats["processed"], "invalid_requests": stats["invalid"],
+        "iteration_limit_rejections": stats["iteration_limit_rejections"],
         "errors": stats["errors"], "symcc_errors": stats["symcc_errors"],
         "symcc_skipped_busy": stats["symcc_skipped_busy"],
         "symcc_abandoned": stats["symcc_abandoned"],
@@ -2192,12 +2232,14 @@ async def _run_prebuilt_symcc_agent(
     transcript_path: str | None, progress_prefix: str | None,
     result_path: str | None,
     feedback_runtime: dict[str, Any] | None = None,
+    max_iterations: int = _DEFAULT_MAX_ITERATIONS,
 ) -> tuple[AgentResult, dict[str, float], dict[str, Any]]:
     started = time.time()
     stop = asyncio.Event()
     worker = asyncio.create_task(_prebuilt_protocol_worker(
         container=container, target=target, stop=stop, result_path=result_path,
         feedback_runtime=feedback_runtime,
+        max_requests=max_iterations,
     ))
     try:
         result = await run_agent(
@@ -2224,6 +2266,9 @@ async def _run_prebuilt_symcc_agent(
     return result, {
         "dynamic_validation": time.time() - started,
         "execution_protocol_requests": float(summary.get("requests", 0)),
+        "execution_protocol_limit_rejections": float(
+            summary.get("iteration_limit_rejections", 0)
+        ),
         "execution_protocol_invalid": float(summary.get("invalid_requests", 0)),
         "execution_protocol_errors": float(summary.get("errors", 0)),
         "symbolic_execution_session": float(summary.get("symcc_execution_s", 0)),
