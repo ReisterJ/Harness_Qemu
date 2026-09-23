@@ -350,6 +350,7 @@ def test_compact_protocol_feedback_keeps_facts_and_bounds_observations():
                 "symcc_observation": {
                     "trace_status": "completed", "target_reached": False,
                     "distance": 7,
+                    "observed_locations": [{"line": line} for line in range(30)],
                 },
             }
             for index in range(10)
@@ -361,6 +362,12 @@ def test_compact_protocol_feedback_keeps_facts_and_bounds_observations():
     assert compact["symcc_observation"]["observed_location_count"] == 30
     assert len(compact["symcc_observation"]["observed_locations"]) == 16
     assert len(compact["generated_replays"]) == 8
+    assert compact["generated_replays"][0]["symcc_observation"][
+        "observed_location_count"
+    ] == 30
+    assert "observed_locations" not in compact["generated_replays"][0][
+        "symcc_observation"
+    ]
     assert "stderr" not in compact["symcc"]
     assert "stdout" not in compact["generated_replays"][0]["clean_replay"]
 

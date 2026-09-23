@@ -1903,7 +1903,9 @@ def _execute_prebuilt_protocol_request(
 
 def _compact_protocol_feedback(record: dict[str, Any]) -> dict[str, Any]:
     """为下一次 agent 请求准备紧凑的异步反馈，不复制原始求解器日志。"""
-    def compact_observation(value: Any) -> dict[str, Any] | None:
+    def compact_observation(
+        value: Any, *, include_locations: bool = True
+    ) -> dict[str, Any] | None:
         if not isinstance(value, dict):
             return None
         keys = (
@@ -1916,8 +1918,9 @@ def _compact_protocol_feedback(record: dict[str, Any]) -> dict[str, Any]:
         compact = {key: value[key] for key in keys if key in value}
         locations = value.get("observed_locations")
         if isinstance(locations, list):
-            compact["observed_locations"] = locations[:16]
             compact["observed_location_count"] = len(locations)
+            if include_locations:
+                compact["observed_locations"] = locations[:16]
         return compact
 
     clean = record.get("clean") if isinstance(record.get("clean"), dict) else {}
@@ -1938,7 +1941,7 @@ def _compact_protocol_feedback(record: dict[str, Any]) -> dict[str, Any]:
                     ("status", "exit_code", "sanitizer_event") if key in replay
                 },
                 "symcc_observation": compact_observation(
-                    item.get("symcc_observation")
+                    item.get("symcc_observation"), include_locations=False
                 ),
             })
 
