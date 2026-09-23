@@ -52,7 +52,7 @@ def _crash_result_xml() -> bytes:
   <candidate_id>candidate_001</candidate_id>
   <poc_path>/work/poc.rb</poc_path>
   <reproduction_command>/out/mruby_fuzzer /work/poc.rb</reproduction_command>
-  <poc_kind>crash</poc_kind>
+  <poc_kind>ruby</poc_kind>
   <crash_type>heap-use-after-free</crash_type>
   <exit_code>1</exit_code>
   <crash_output>AddressSanitizer: heap-use-after-free</crash_output>
@@ -96,6 +96,7 @@ def test_dynamic_prompt_contains_candidate_and_no_static_result_is_grade_input()
 def test_crash_poc_kind_aliases_are_normalized_to_file():
     assert _normalize_poc_kind("ruby", "asan") == "file"
     assert _normalize_poc_kind("python", "asan") == "file"
+    assert _normalize_poc_kind("crash", "asan") == "file"
     assert _normalize_poc_kind("ruby_source", "asan") == "file"
     assert _normalize_poc_kind("ruby_source_via_mrb_load_string", "asan") == "file"
     assert _normalize_poc_kind("shell_script", "asan") == "file"
@@ -354,7 +355,7 @@ def test_dynamic_validation_parses_logic_submission(monkeypatch):
     candidate = _finding()
     message = """<dynamic_status>validated</dynamic_status>
 <candidate_id>candidate_001</candidate_id>
-<reached_functions>prompt text accidentally copied into metadata</reached_functions>
+<reached_functions>xmlXIncludeLoadTxt,xmlNodeAddContentLen</reached_functions>
 <reachability_evidence>public XML XInclude input</reachability_evidence>
 <poc_path>/tmp/poc.sh</poc_path>
 <reproduction_command>sh /tmp/poc.sh</reproduction_command>
@@ -438,7 +439,7 @@ def test_dynamic_validation_normalizes_crash_label_to_file_poc(monkeypatch):
 <reached_functions>quoted prompt text, not runtime evidence</reached_functions>
 <poc_path>/work/poc.rb</poc_path>
 <reproduction_command>/out/mruby_fuzzer /work/poc.rb</reproduction_command>
-<poc_kind>crash</poc_kind>
+<poc_kind>ruby</poc_kind>
 <crash_type>heap-use-after-free</crash_type>
 <exit_code>1</exit_code>
 <crash_output>AddressSanitizer: heap-use-after-free</crash_output>

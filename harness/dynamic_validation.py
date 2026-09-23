@@ -2506,8 +2506,10 @@ def _normalize_poc_kind(value: str, detector: str) -> str:
     Some agents use ``crash`` to mean "this is a crash PoC", although the
     field describes the input artifact's format. At this boundary, the PoC
     has already been materialized as one file at ``poc_path``; for crash
-    detectors, interpret that label as the default file artifact. Keep logic
-    submissions strict, since they may represent non-file service requests.
+    detectors, interpret that label as the default file artifact. A source
+    language label such as ``ruby`` also describes file content, not a distinct
+    transport kind. Keep logic submissions strict, since they may represent
+    non-file service requests.
     """
     kind = value.strip().lower()
     if detector != "logic" and (
