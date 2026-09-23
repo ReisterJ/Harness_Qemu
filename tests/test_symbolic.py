@@ -94,7 +94,10 @@ def test_prebuilt_symcc_protocol_is_the_final_dynamic_prompt_override():
             "request_template": "/work/validation/execution/request-template.json",
         },
     )
-    assert "Harness runs both prebuilt binaries on the same input" in prompt
+    assert "queues the prebuilt SymCC execution in the background" in prompt
+    assert "read-feedback" in prompt
+    assert "`skipped_busy` means" in prompt and "no feedback for that request" in prompt
+    assert "If the reader returns `pending`, do" in prompt
     assert "Do not compile a source slice" in prompt
     assert prompt.rfind("Harness execution override") > prompt.rfind(
         "Dynamic-validation scope"

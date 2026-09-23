@@ -420,7 +420,7 @@ not a successful PoC; the final grader must still reproduce the claimed effect.
     if context.get("orchestration") == "prebuilt_protocol":
         return f"""
 
-## Harness execution override — prebuilt SymCC is mandatory feedback
+## Harness execution override — prebuilt SymCC feedback is asynchronous
 
 This is the final execution instruction and overrides any general build/run
 examples above. Do not compile a source slice and do not invoke either target
@@ -428,10 +428,15 @@ binary directly. For every candidate input, save it under
 `{context.get('input_root', '/work/validation/inputs')}/`, create a fresh JSON
 request from `{context.get('request_template', '/work/validation/execution/request-template.json')}`,
 and run `{context.get('runner', '/work/validation/run-input')} REQUEST.json`.
-Wait for and inspect its JSON response before deciding the next input. The
-Harness runs both prebuilt binaries on the same input and replays SymCC outputs
-on the ordinary target. Read source between iterations and use those concrete
-observations to refine the input. SymCC output is feedback only: it is not
+The response waits only for the ordinary target run; SymCC is queued in the
+background. Inspect the clean-target result, then continue source analysis and
+input iteration without waiting for SymCC. At a useful decision point, query
+`{context.get('feedback_reader', '/work/validation/read-feedback')} REQUEST_ID`.
+Only query when the run response says SymCC is `queued`; `skipped_busy` means
+there will be no feedback for that request. If the reader returns `pending`, do
+not poll or wait—continue working and check later.
+When ready, the feedback contains the SymCC run and replays of its generated
+inputs on the ordinary target. SymCC output is advisory only: it is not
 reachability proof or a PoC. Preserve the existing final crash-result or logic
 submission contract; Grade remains the final reproduction check.
 """
@@ -549,10 +554,16 @@ build a source slice and do not invoke a compiler for SymCC.
 Create each candidate input under `{context.get('input_root', '/work/validation/inputs')}/`,
 write a fresh request using `{context.get('request_template', '/work/validation/execution/request-template.json')}`,
 then call `{context.get('runner', '/work/validation/run-input')} REQUEST.json`.
-The Harness runs that exact input against the ordinary target and the prebuilt
-SymCC target, then replays SymCC-generated inputs through the ordinary target.
-Read the JSON response and compare the concrete execution with generated-input
-replays before revising your hypothesis. Configured SymCC arguments are
+The call waits only for that exact input's ordinary-target result. The Harness
+queues the prebuilt SymCC execution in the background, so continue source
+analysis and constructing/testing inputs rather than waiting for it. At a useful
+decision point, query
+`{context.get('feedback_reader', '/work/validation/read-feedback')} REQUEST_ID`.
+Only query when the response says SymCC is `queued`; `skipped_busy` means no
+feedback will be produced for that request. If the reader returns `pending`, do
+not poll or wait; continue work and check later. Once ready, compare the clean
+execution with SymCC-generated-input replays before revising your hypothesis.
+Configured SymCC arguments are
 `{json.dumps(context.get('symcc_program_args', ['{input_file}']), ensure_ascii=False)}`.
 
 You remain responsible for reading source and constructing semantically valid

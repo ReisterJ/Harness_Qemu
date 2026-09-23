@@ -15,8 +15,10 @@ INPUT_ROOT = "/work/validation/inputs"
 REQUEST_ROOT = f"{PROTOCOL_ROOT}/requests"
 PENDING_ROOT = f"{PROTOCOL_ROOT}/pending"
 RESPONSE_ROOT = f"{PROTOCOL_ROOT}/responses"
+FEEDBACK_ROOT = f"{PROTOCOL_ROOT}/feedback"
 PROCESSED_ROOT = f"{PROTOCOL_ROOT}/processed"
 RUNNER_PATH = "/work/validation/run-input"
+FEEDBACK_READER_PATH = "/work/validation/read-feedback"
 REQUEST_TEMPLATE_PATH = f"{PROTOCOL_ROOT}/request-template.json"
 README_PATH = f"{PROTOCOL_ROOT}/README.md"
 
@@ -160,6 +162,23 @@ exit 124
 '''
 
 
+def protocol_feedback_reader_script() -> bytes:
+    return b'''#!/bin/sh
+set -eu
+[ "$#" -eq 1 ] || { echo "usage: /work/validation/read-feedback REQUEST_ID" >&2; exit 2; }
+id=$1
+case "$id" in [A-Za-z0-9]*) ;; *) echo "unsafe request id" >&2; exit 2;; esac
+case "$id" in *[!A-Za-z0-9_.-]*) echo "unsafe request id" >&2; exit 2;; esac
+[ "${#id}" -le 80 ] || { echo "request id is too long" >&2; exit 2; }
+feedback="/work/validation/execution/feedback/$id.json"
+if [ -f "$feedback" ]; then
+  cat -- "$feedback"
+else
+  printf '{"schema_version":1,"status":"pending","request_id":"%s"}\\n' "$id"
+fi
+'''
+
+
 def protocol_template(default_args: list[str] | None = None) -> bytes:
     return (json.dumps({
         "schema_version": 1,
@@ -173,9 +192,18 @@ def protocol_template(default_args: list[str] | None = None) -> bytes:
 
 def protocol_readme(*, symbolic_enabled: bool) -> bytes:
     symbolic = (
-        "The Harness also runs this same input through the configured prebuilt SymCC binary, "
-        "then replays generated inputs on the ordinary target. Treat those results as feedback, not proof."
+        "After the ordinary target result returns, the Harness queues this input for the configured "
+        "prebuilt SymCC binary in the background and later replays generated inputs on the ordinary "
+        "target. `run-input` does not wait for SymCC. Treat its result as feedback, not proof."
         if symbolic_enabled else "Only the ordinary target is run."
+    )
+    feedback = (
+        f"For a request id, check `{FEEDBACK_READER_PATH} round-001` when convenient. It returns "
+        "`pending` immediately if the background job is still running. Do not poll in a tight loop "
+        "or wait on it; continue source analysis and input work, then check again at a useful decision point. "
+        "At most two SymCC jobs run concurrently; an input submitted above that limit is marked "
+        "`skipped_busy` and will not have feedback."
+        if symbolic_enabled else ""
     )
     return f'''# Dynamic execution protocol
 
@@ -187,6 +215,7 @@ Put each candidate below `{INPUT_ROOT}/`, create a JSON request below
 The request uses `schema_version`, a fresh unique `request_id`, `input_path`,
 `program_args` (with `{{input_file}}` exactly once), and optional `timeout_s`/`env`.
 The Harness owns the executable selection and execution. {symbolic}
+{feedback}
 Request ids are single-use; use a fresh id for every candidate. Reproduce the final PoC through the
 ordinary target and satisfy the normal crash-result contract.
 '''.encode()

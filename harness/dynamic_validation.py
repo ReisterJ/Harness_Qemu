@@ -26,6 +26,8 @@ from .artifacts import (
 )
 from .config import TargetConfig
 from .execution_protocol import (
+    FEEDBACK_READER_PATH,
+    FEEDBACK_ROOT,
     INPUT_ROOT,
     PENDING_ROOT,
     PROCESSED_ROOT,
@@ -37,6 +39,7 @@ from .execution_protocol import (
     ExecutionRequest,
     ExecutionRequestError,
     parse_request,
+    protocol_feedback_reader_script,
     protocol_readme,
     protocol_runner_script,
     protocol_template,
@@ -1315,6 +1318,19 @@ def _prepare_prebuilt_symcc_protocol(
     )
     if rc:
         raise RuntimeError(f"cannot enable execution protocol client: {err[-300:]}")
+    docker_ops.write_file(container, FEEDBACK_READER_PATH, protocol_feedback_reader_script())
+    rc, _out, err = docker_ops.exec_sh(
+        container, f"chmod 0555 -- {shlex.quote(FEEDBACK_READER_PATH)}", timeout=15
+    )
+    if rc:
+        raise RuntimeError(f"cannot enable feedback reader: {err[-300:]}")
+    rc, _out, err = docker_ops.exec_sh(
+        container,
+        f"mkdir -p -- {shlex.quote(FEEDBACK_ROOT)} {shlex.quote(PROCESSED_ROOT)}",
+        timeout=15,
+    )
+    if rc:
+        raise RuntimeError(f"cannot initialize execution protocol directories: {err[-300:]}")
     docker_ops.write_file(container, REQUEST_TEMPLATE_PATH, protocol_template())
     docker_ops.write_file(
         container, EXECUTION_README_PATH, protocol_readme(symbolic_enabled=True)
@@ -1325,9 +1341,11 @@ def _prepare_prebuilt_symcc_protocol(
         "status": "ready",
         "orchestration": "prebuilt_protocol",
         "runner": RUNNER_PATH,
+        "feedback_reader": FEEDBACK_READER_PATH,
         "input_root": INPUT_ROOT,
         "request_root": REQUEST_ROOT,
         "response_root": RESPONSE_ROOT,
+        "feedback_root": FEEDBACK_ROOT,
         "prebuilt_binary": True,
         "artifact_commit": artifact_commit,
         "symcc_program_args": symcc_args,
@@ -1386,14 +1404,14 @@ def _run_protocol_binary(
         }
 
 
-def _execute_prebuilt_protocol_request(
+def _prepare_prebuilt_protocol_request(
     *, container: str, target: TargetConfig, raw: bytes, filename: str,
     round_id: int,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
     try:
         request = parse_request(raw, filename=filename)
     except (ExecutionRequestError, UnicodeDecodeError) as exc:
-        return {"schema_version": 1, "status": "invalid_request", "errors": [str(exc)]}
+        return {"schema_version": 1, "status": "invalid_request", "errors": [str(exc)]}, None
     try:
         rc, resolved_input, err = docker_ops.exec_sh(
             container,
@@ -1430,15 +1448,50 @@ def _execute_prebuilt_protocol_request(
         return {
             "schema_version": 1, "status": "invalid_request",
             "request_id": request.request_id, "errors": [str(exc)],
-        }
+        }, None
     digest = hashlib.sha256(input_bytes).hexdigest()
     clean_binary = _symcc_hidden_path(target.binary_path, "clean")
-    symcc_cfg = target.symcc_runtime or {}
-    symcc_binary = _symcc_hidden_path(str(symcc_cfg["binary_path"]), "symcc")
     clean = _run_protocol_binary(
         container=container, binary=clean_binary, request=request,
         input_path=request.input_path,
     )
+
+    immediate = {
+        "schema_version": 1,
+        "protocol": "dynamic-execution",
+        "status": "submitted",
+        "request_id": request.request_id,
+        "round_id": round_id,
+        "input_path": request.input_path,
+        "input_size": len(input_bytes),
+        "input_sha256": digest,
+        "clean": clean,
+        "symcc": {"status": "queued", "feedback_path": f"{FEEDBACK_ROOT}/{request.request_id}.json"},
+        "generated_replays": [],
+        "site_reached": None,
+        "site_reachability_note": (
+            "The clean target was run synchronously. SymCC execution and generated-input "
+            "replays are queued asynchronously; no source-site reachability is inferred."
+        ),
+    }
+    job = {
+        "request": request,
+        "round_id": round_id,
+        "input_size": len(input_bytes),
+        "input_sha256": digest,
+        "clean": clean,
+    }
+    return immediate, job
+
+
+def _execute_prebuilt_protocol_symcc_request(
+    *, container: str, target: TargetConfig, job: dict[str, Any],
+) -> dict[str, Any]:
+    request: ExecutionRequest = job["request"]
+    round_id = int(job["round_id"])
+    symcc_cfg = target.symcc_runtime or {}
+    clean_binary = _symcc_hidden_path(target.binary_path, "clean")
+    symcc_binary = _symcc_hidden_path(str(symcc_cfg["binary_path"]), "symcc")
     out_dir = f"/work/validation/symcc-results/{request.request_id}"
     rc, _out, err = docker_ops.exec_sh(
         container, f"rm -rf -- {shlex.quote(out_dir)} && mkdir -p -- {shlex.quote(out_dir)}",
@@ -1518,9 +1571,9 @@ def _execute_prebuilt_protocol_request(
         "request_id": request.request_id,
         "round_id": round_id,
         "input_path": request.input_path,
-        "input_size": len(input_bytes),
-        "input_sha256": digest,
-        "clean": clean,
+        "input_size": job["input_size"],
+        "input_sha256": job["input_sha256"],
+        "clean": job["clean"],
         "symcc": symcc,
         "generated_replays": replays,
         "site_reached": None,
@@ -1531,17 +1584,87 @@ def _execute_prebuilt_protocol_request(
     }
 
 
+def _execute_prebuilt_protocol_request(
+    *, container: str, target: TargetConfig, raw: bytes, filename: str,
+    round_id: int,
+) -> dict[str, Any]:
+    """Synchronous convenience wrapper retained for focused unit tests."""
+    immediate, job = _prepare_prebuilt_protocol_request(
+        container=container, target=target, raw=raw, filename=filename,
+        round_id=round_id,
+    )
+    if job is None:
+        return immediate
+    return _execute_prebuilt_protocol_symcc_request(
+        container=container, target=target, job=job,
+    )
+
+
 async def _prebuilt_protocol_worker(
     *, container: str, target: TargetConfig, stop: asyncio.Event,
     result_path: str | None,
 ) -> dict[str, Any]:
+    max_inflight_symcc_jobs = 2
     seen: set[str] = set()
     records: list[dict[str, Any]] = []
-    stats = {"processed": 0, "invalid": 0, "errors": 0, "symcc_duration_s": 0.0}
+    jobs: set[asyncio.Task] = set()
+    stats = {
+        "processed": 0, "invalid": 0, "errors": 0,
+        "symcc_errors": 0, "symcc_skipped_busy": 0,
+        "symcc_abandoned": 0, "symcc_duration_s": 0.0,
+    }
     command = (
         f"find {shlex.quote(PENDING_ROOT)} -maxdepth 1 -type f "
         "-name '*.json' -print | sort"
     )
+
+    async def run_feedback_job(job: dict[str, Any], record: dict[str, Any]) -> None:
+        request: ExecutionRequest = job["request"]
+        feedback_path = f"{FEEDBACK_ROOT}/{request.request_id}.json"
+        temp_path = feedback_path + ".tmp"
+        started = time.monotonic()
+        try:
+            result = await asyncio.to_thread(
+                _execute_prebuilt_protocol_symcc_request,
+                container=container, target=target, job=job,
+            )
+            symcc = result.get("symcc") or {}
+            stats["symcc_duration_s"] += float(symcc.get("duration_s") or 0.0)
+            if symcc.get("status") != "completed":
+                stats["symcc_errors"] += 1
+        except Exception as exc:
+            stats["symcc_errors"] += 1
+            result = {
+                "schema_version": 1,
+                "protocol": "dynamic-execution-feedback",
+                "status": "execution_error",
+                "request_id": request.request_id,
+                "round_id": job["round_id"],
+                "input_path": request.input_path,
+                "input_sha256": job["input_sha256"],
+                "error": f"{type(exc).__name__}: {exc}",
+                "symcc": {"status": "execution_error"},
+                "generated_replays": [],
+            }
+        result["feedback_status"] = "ready"
+        record.update(result)
+        try:
+            payload = (json.dumps(result, indent=2, ensure_ascii=False) + "\n").encode()
+            await asyncio.to_thread(docker_ops.write_file, container, temp_path, payload)
+            rc, _out, err = await asyncio.to_thread(
+                docker_ops.exec_sh,
+                container,
+                f"mv -- {shlex.quote(temp_path)} {shlex.quote(feedback_path)}",
+                timeout=15,
+            )
+            if rc:
+                raise RuntimeError(f"cannot publish SymCC feedback: {err[-300:]}")
+        except Exception as exc:
+            stats["errors"] += 1
+            record["feedback_status"] = "publish_error"
+            record["feedback_error"] = f"{type(exc).__name__}: {exc}"
+        record["feedback_wall_time_s"] = round(time.monotonic() - started, 3)
+
     while not stop.is_set():
         try:
             rc, listing, _err = await asyncio.to_thread(
@@ -1558,17 +1681,29 @@ async def _prebuilt_protocol_worker(
                 seen.add(name)
                 try:
                     raw = await asyncio.to_thread(docker_ops.read_file, container, path)
-                    response = await asyncio.to_thread(
-                        _execute_prebuilt_protocol_request,
+                    response, job = await asyncio.to_thread(
+                        _prepare_prebuilt_protocol_request,
                         container=container, target=target, raw=raw,
                         filename=name, round_id=stats["processed"] + 1,
                     )
                     if response.get("status") == "invalid_request":
                         stats["invalid"] += 1
-                    elif response.get("status") != "completed":
-                        stats["errors"] += 1
-                    symcc = response.get("symcc") or {}
-                    stats["symcc_duration_s"] += float(symcc.get("duration_s") or 0)
+                    elif job is not None and sum(not task.done() for task in jobs) >= max_inflight_symcc_jobs:
+                        response["symcc"] = {
+                            "status": "skipped_busy",
+                            "message": (
+                                "two background SymCC jobs are already running; this input "
+                                "will not receive SymCC feedback"
+                            ),
+                        }
+                        response["site_reachability_note"] = (
+                            "The clean target was run synchronously. SymCC feedback was "
+                            "skipped because the background concurrency limit was reached."
+                        )
+                        job = None
+                        stats["symcc_skipped_busy"] += 1
+                    records.append(response)
+                    stats["processed"] += 1
                     await asyncio.to_thread(
                         docker_ops.write_file, container,
                         f"{RESPONSE_ROOT}/{name}",
@@ -1579,8 +1714,10 @@ async def _prebuilt_protocol_worker(
                         f"mv -- {shlex.quote(path)} {shlex.quote(PROCESSED_ROOT + '/' + name)}",
                         timeout=15,
                     )
-                    records.append(response)
-                    stats["processed"] += 1
+                    if job is not None:
+                        task = asyncio.create_task(run_feedback_job(job, response))
+                        jobs.add(task)
+                        task.add_done_callback(jobs.discard)
                 except Exception as exc:
                     stats["errors"] += 1
                     response = {
@@ -1607,10 +1744,31 @@ async def _prebuilt_protocol_worker(
             await asyncio.wait_for(stop.wait(), timeout=0.25)
         except asyncio.TimeoutError:
             pass
+
+    # No agent remains to consume feedback after exploration ends. Cancel
+    # outstanding work instead of extending the dynamic phase just to wait for
+    # SymCC; already-published feedback remains available in the result files.
+    unfinished = [task for task in jobs if not task.done()]
+    if unfinished:
+        for task in unfinished:
+            task.cancel()
+        await asyncio.gather(*unfinished, return_exceptions=True)
+        stats["symcc_abandoned"] = len(unfinished)
+        for record in records:
+            if (record.get("symcc") or {}).get("status") == "queued":
+                record["feedback_status"] = "abandoned_agent_finished"
+                record["symcc"] = {
+                    "status": "abandoned",
+                    "message": "agent finished before background feedback was ready",
+                }
     summary = {
-        "schema_version": 1, "provider": "symcc-prebuilt", "status": "completed",
+        "schema_version": 1, "provider": "symcc-prebuilt",
+        "status": "incomplete" if unfinished else "completed",
         "requests": stats["processed"], "invalid_requests": stats["invalid"],
-        "errors": stats["errors"], "symcc_execution_s": round(stats["symcc_duration_s"], 3),
+        "errors": stats["errors"], "symcc_errors": stats["symcc_errors"],
+        "symcc_skipped_busy": stats["symcc_skipped_busy"],
+        "symcc_abandoned": stats["symcc_abandoned"],
+        "symcc_execution_s": round(stats["symcc_duration_s"], 3),
         "records": records,
     }
     if result_path:

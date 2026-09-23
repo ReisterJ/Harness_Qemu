@@ -1,5 +1,7 @@
 """Tests for harness-owned dynamic input requests and prebuilt SymCC runs."""
+import asyncio
 import json
+import threading
 
 import pytest
 
@@ -8,12 +10,17 @@ from harness.artifacts import StaticFinding
 from harness.config import TargetConfig
 from harness.dynamic_validation import (
     _execute_prebuilt_protocol_request,
+    _prebuilt_protocol_worker,
     _prepare_prebuilt_symcc_protocol,
 )
 from harness.execution_protocol import (
+    FEEDBACK_ROOT,
     INPUT_ROOT,
+    PENDING_ROOT,
+    RESPONSE_ROOT,
     ExecutionRequestError,
     parse_request,
+    protocol_feedback_reader_script,
     target_argv,
 )
 
@@ -145,6 +152,166 @@ def test_protocol_runs_same_input_through_both_binaries_and_replays_generated(
     assert any("/out/.harness-clean-target" in command for command in commands)
 
 
+def test_prebuilt_protocol_returns_clean_result_while_symcc_runs_in_background(
+    monkeypatch,
+):
+    target = _target()
+    pending_path = f"{PENDING_ROOT}/round-001.json"
+    response_path = f"{RESPONSE_ROOT}/round-001.json"
+    feedback_path = f"{FEEDBACK_ROOT}/round-001.json"
+    writes = {}
+    pending_moved = threading.Event()
+    response_written = threading.Event()
+    symcc_started = threading.Event()
+    symcc_release = threading.Event()
+    feedback_written = threading.Event()
+
+    def fake_exec(_container, command, timeout=0):
+        if command.startswith(f"find {PENDING_ROOT}"):
+            return (0, "" if pending_moved.is_set() else pending_path + "\n", "")
+        if command.startswith("readlink -f"):
+            return 0, f"{INPUT_ROOT}/candidate.bin\n", ""
+        if command.startswith("stat -c"):
+            return 0, "4\n", ""
+        if command.startswith("test -f"):
+            return 0, "", ""
+        if "find /work/validation/symcc-results/round-001" in command:
+            return 0, "", ""
+        if "timeout --signal=KILL" in command:
+            if ".harness-symcc-target-symcc" in command:
+                symcc_started.set()
+                if not symcc_release.wait(timeout=5):
+                    return 124, "", "test SymCC wait timed out"
+                return 0, "symcc complete", ""
+            return 0, "clean target complete", ""
+        if command.startswith(f"mv -- {PENDING_ROOT}/"):
+            pending_moved.set()
+            return 0, "", ""
+        if command.startswith(f"mv -- {feedback_path}.tmp "):
+            writes[feedback_path] = writes.pop(feedback_path + ".tmp")
+            feedback_written.set()
+            return 0, "", ""
+        return 0, "", ""
+
+    def fake_read(_container, path):
+        if path == pending_path:
+            return json.dumps(_request()).encode()
+        if path == f"{INPUT_ROOT}/candidate.bin":
+            return b"seed"
+        return b""
+
+    def fake_write(_container, path, data):
+        writes[path] = data
+        if path == response_path:
+            response_written.set()
+
+    monkeypatch.setattr(docker_ops, "exec_sh", fake_exec)
+    monkeypatch.setattr(docker_ops, "read_file", fake_read)
+    monkeypatch.setattr(docker_ops, "write_file", fake_write)
+
+    async def exercise():
+        stop = asyncio.Event()
+        worker = asyncio.create_task(_prebuilt_protocol_worker(
+            container="target", target=target, stop=stop, result_path=None,
+        ))
+        assert await asyncio.to_thread(response_written.wait, 3)
+        immediate = json.loads(writes[response_path])
+        assert immediate["status"] == "submitted"
+        assert immediate["clean"]["status"] == "completed"
+        assert immediate["symcc"]["status"] == "queued"
+
+        assert await asyncio.to_thread(symcc_started.wait, 3)
+        assert not feedback_written.is_set()
+
+        symcc_release.set()
+        assert await asyncio.to_thread(feedback_written.wait, 3)
+        feedback = json.loads(writes[feedback_path])
+        assert feedback["feedback_status"] == "ready"
+        assert feedback["symcc"]["status"] == "completed"
+
+        stop.set()
+        summary = await asyncio.wait_for(worker, timeout=3)
+        assert summary["requests"] == 1
+        assert summary["symcc_errors"] == 0
+
+    asyncio.run(exercise())
+
+
+def test_feedback_reader_is_nonblocking_and_validates_request_id():
+    script = protocol_feedback_reader_script().decode()
+    assert '"status":"pending"' in script
+    assert "sleep" not in script
+    assert '[ "${#id}" -le 80 ]' in script
+    assert "read-feedback REQUEST_ID" in script
+
+
+def test_protocol_worker_does_not_wait_for_unused_symcc_after_agent_finishes(
+    monkeypatch,
+):
+    target = _target()
+    pending_path = f"{PENDING_ROOT}/round-001.json"
+    response_path = f"{RESPONSE_ROOT}/round-001.json"
+    pending_moved = threading.Event()
+    response_written = threading.Event()
+    symcc_started = threading.Event()
+    symcc_release = threading.Event()
+    writes = {}
+
+    def fake_exec(_container, command, timeout=0):
+        if command.startswith(f"find {PENDING_ROOT}"):
+            return (0, "" if pending_moved.is_set() else pending_path + "\n", "")
+        if command.startswith("readlink -f"):
+            return 0, f"{INPUT_ROOT}/candidate.bin\n", ""
+        if command.startswith("stat -c"):
+            return 0, "4\n", ""
+        if command.startswith("test -f"):
+            return 0, "", ""
+        if "timeout --signal=KILL" in command:
+            return 0, "clean target complete", ""
+        if command.startswith(f"mv -- {PENDING_ROOT}/"):
+            pending_moved.set()
+        return 0, "", ""
+
+    def fake_read(_container, path):
+        if path == pending_path:
+            return json.dumps(_request()).encode()
+        return b"seed"
+
+    def fake_write(_container, path, data):
+        writes[path] = data
+        if path == response_path:
+            response_written.set()
+
+    def blocking_symcc(**_kwargs):
+        symcc_started.set()
+        symcc_release.wait(timeout=5)
+        return {"symcc": {"status": "completed"}}
+
+    monkeypatch.setattr(docker_ops, "exec_sh", fake_exec)
+    monkeypatch.setattr(docker_ops, "read_file", fake_read)
+    monkeypatch.setattr(docker_ops, "write_file", fake_write)
+    monkeypatch.setattr(
+        "harness.dynamic_validation._execute_prebuilt_protocol_symcc_request",
+        blocking_symcc,
+    )
+
+    async def exercise():
+        stop = asyncio.Event()
+        worker = asyncio.create_task(_prebuilt_protocol_worker(
+            container="target", target=target, stop=stop, result_path=None,
+        ))
+        assert await asyncio.to_thread(response_written.wait, 3)
+        assert await asyncio.to_thread(symcc_started.wait, 3)
+        stop.set()
+        summary = await asyncio.wait_for(worker, timeout=3)
+        assert summary["status"] == "incomplete"
+        assert summary["symcc_abandoned"] == 1
+        assert summary["records"][0]["feedback_status"] == "abandoned_agent_finished"
+        symcc_release.set()
+
+    asyncio.run(exercise())
+
+
 def test_prebuilt_symcc_config_is_exposed_as_runtime_contract():
     assert _target().symcc_runtime == {
         "binary_path": "/out/target-symcc",
@@ -214,6 +381,8 @@ def test_symcc_protocol_preflights_binaries_and_installs_runner(monkeypatch):
     assert context["orchestration"] == "prebuilt_protocol"
     assert context["artifact_commit"] == target.commit
     assert "/work/validation/run-input" in writes
+    assert "/work/validation/read-feedback" in writes
+    assert context["feedback_reader"] == "/work/validation/read-feedback"
     assert any(
         "mv -- /out/target /out/.harness-clean-target" in command for command in calls
     )

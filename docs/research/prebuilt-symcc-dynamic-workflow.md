@@ -42,15 +42,20 @@ construct inputs normally. It writes each input under
 `/work/validation/inputs/`, creates a request from
 `/work/validation/execution/request-template.json`, and invokes the client.
 
-For each request, the harness:
+For each request, the harness synchronously runs the exact input against the
+ordinary target executable.
 
-1. Runs the exact input against the ordinary target executable.
-2. Runs that same input against the prebuilt SymCC executable.
-3. Collects bounded generated files and replays them against the ordinary
-   executable.
-4. Returns exit status, bounded output, testcase hashes, and replay outcomes to
-   the agent; it records the full request observations under the optional
-   symbolic-results directory.
+It then returns that result immediately and runs the same input against the
+prebuilt SymCC executable in a background task. The agent can proceed with
+source analysis and its next inputs while SymCC runs. It can query
+`/work/validation/read-feedback REQUEST_ID` at a useful point; the command is
+non-blocking and reports `pending` if the task has not completed. Once SymCC
+finishes, the harness collects bounded generated files, replays them against
+the ordinary executable, and publishes the feedback JSON. The harness also
+records observations under the optional symbolic-results directory. At most
+two SymCC jobs run concurrently; inputs submitted above this limit are marked
+`skipped_busy` instead of delaying the ordinary PoC loop. Any work still in
+flight when the agent ends is marked abandoned rather than extending the phase.
 
 SymCC testcase generation is advisory feedback, not reachability or
 vulnerability proof. Source-site reach is not inferred from testcase count.
