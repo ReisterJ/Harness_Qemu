@@ -94,7 +94,8 @@ def test_prebuilt_symcc_protocol_is_the_final_dynamic_prompt_override():
             "request_template": "/work/validation/execution/request-template.json",
         },
     )
-    assert "queues the prebuilt SymCC execution in the background" in prompt
+    assert "Every accepted input is queued" in prompt
+    assert "additional jobs wait asynchronously rather than being dropped" in prompt
     assert "its response may include `ready_feedback`" in prompt
     assert "mandatory" in prompt and "inspect it before choosing the next" in prompt
     assert "at most 8 input requests" in prompt
@@ -104,13 +105,15 @@ def test_prebuilt_symcc_protocol_is_the_final_dynamic_prompt_override():
     assert "Do not filter" in prompt
     assert "output or silently discard" in prompt
     assert "read-feedback" in prompt
-    assert "`skipped_busy` means" in prompt and "no feedback for that request" in prompt
+    assert "excess jobs wait, not skip" in prompt
+    assert "concrete trace" in prompt and "symbolic-exploration" in prompt
+    assert "snapshots its bytes before execution" in prompt
     assert "If the reader returns `pending`, do" in prompt
     assert "Do not compile a source slice" in prompt
     assert prompt.rfind("Harness execution override") > prompt.rfind(
         "Dynamic-validation scope"
     )
-    assert prompt.rstrip().endswith("Grade remains the final reproduction check.")
+    assert prompt.rstrip().endswith("remains the final reproduction check.")
 
 
 def test_ready_symbolic_context_teaches_the_tool_contract_not_the_answer():

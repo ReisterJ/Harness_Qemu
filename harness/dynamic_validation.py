@@ -36,6 +36,7 @@ from .execution_protocol import (
     REQUEST_TEMPLATE_PATH,
     RESPONSE_ROOT,
     RUNNER_PATH,
+    SNAPSHOT_ROOT,
     ExecutionRequest,
     ExecutionRequestError,
     parse_request,
@@ -1635,10 +1636,35 @@ def _prepare_prebuilt_protocol_request(
             "request_id": request.request_id, "errors": [str(exc)],
         }, None
     digest = hashlib.sha256(input_bytes).hexdigest()
+    snapshot_path = f"{SNAPSHOT_ROOT}/{request.request_id}.bin"
+    try:
+        rc, _out, err = docker_ops.exec_sh(
+            container,
+            f"mkdir -p -- {shlex.quote(SNAPSHOT_ROOT)} && "
+            f"test ! -e {shlex.quote(snapshot_path)}",
+            timeout=15,
+        )
+        if rc:
+            raise RuntimeError(f"cannot reserve request snapshot: {err[-300:]}")
+        docker_ops.write_file(container, snapshot_path, input_bytes)
+        rc, _out, err = docker_ops.exec_sh(
+            container, f"chmod 0444 -- {shlex.quote(snapshot_path)}", timeout=15
+        )
+        if rc:
+            raise RuntimeError(f"cannot protect request snapshot: {err[-300:]}")
+    except Exception as exc:
+        return {
+            "schema_version": 1,
+            "protocol": "dynamic-execution",
+            "status": "execution_error",
+            "request_id": request.request_id,
+            "input_sha256": digest,
+            "errors": [f"{type(exc).__name__}: {exc}"],
+        }, None
     clean_binary = _symcc_hidden_path(target.binary_path, "clean")
     clean = _run_protocol_binary(
         container=container, binary=clean_binary, request=request,
-        input_path=request.input_path,
+        input_path=snapshot_path,
     )
 
     immediate = {
@@ -1652,6 +1678,7 @@ def _prepare_prebuilt_protocol_request(
         "target_commit": target.commit,
         "round_id": round_id,
         "input_path": request.input_path,
+        "snapshot_path": snapshot_path,
         "input_size": len(input_bytes),
         "input_sha256": digest,
         "clean": clean,
@@ -1669,6 +1696,7 @@ def _prepare_prebuilt_protocol_request(
         "input_size": len(input_bytes),
         "input_sha256": digest,
         "input_id": digest,
+        "snapshot_path": snapshot_path,
         "clean": clean,
     }
     return immediate, job
@@ -1683,6 +1711,7 @@ def _execute_prebuilt_protocol_symcc_request(
     symcc_cfg = target.symcc_runtime or {}
     clean_binary = _symcc_hidden_path(target.binary_path, "clean")
     symcc_binary = _symcc_hidden_path(str(symcc_cfg["binary_path"]), "symcc")
+    snapshot_path = str(job.get("snapshot_path") or request.input_path)
     out_dir = f"/work/validation/symcc-results/{request.request_id}"
     trace_dir = f"/work/validation/symcc-feedback/{request.request_id}"
     rc, _out, err = docker_ops.exec_sh(
@@ -1697,37 +1726,70 @@ def _execute_prebuilt_protocol_symcc_request(
         )
     if rc:
         symcc = {"status": "setup_failed", "errors": [err[-500:]], "testcase_count": 0}
+        input_trace_execution = {"status": "not_run", "exit_code": None}
         replays = []
         initial_observation = {
             "status": "unavailable", "target_reached": None,
             "target_reachability": "unknown", "reason": "cannot create feedback directories",
         }
     else:
-        symcc_request = ExecutionRequest(
-            request.request_id, request.input_path,
-            tuple(symcc_cfg.get("program_args") or request.program_args),
+        symcc_args = tuple(symcc_cfg.get("program_args") or request.program_args)
+        concrete_request = ExecutionRequest(
+            request.request_id, snapshot_path,
+            symcc_args,
             request.timeout_s, request.env,
         )
+        input_trace_output_dir = f"{out_dir}/concrete-input"
+        rc, _out, err = docker_ops.exec_sh(
+            container,
+            f"mkdir -p -- {shlex.quote(input_trace_output_dir)}",
+            timeout=15,
+        )
+        trace_dir_ready = rc == 0
+        if not trace_dir_ready:
+            err = err[-500:]
         target_ids = (feedback_runtime or {}).get("marker_ids", [])
-        symcc_env = {
+        trace_env = {
             "SYMCC_FEEDBACK_TRACE": f"{trace_dir}/input.trace",
             "SYMCC_FEEDBACK_CAPACITY": str(
                 (symcc_cfg.get("feedback_capacity") or 65536)
             ),
+            "SYMCC_NO_SYMBOLIC_INPUT": "1",
         }
         if target_ids:
-            symcc_env["SYMCC_FEEDBACK_TARGET_IDS"] = ",".join(
+            trace_env["SYMCC_FEEDBACK_TARGET_IDS"] = ",".join(
                 str(site_id) for site_id in target_ids
             )
+        if trace_dir_ready:
+            input_trace_execution = _run_protocol_binary(
+                container=container, binary=symcc_binary,
+                request=concrete_request, input_path=snapshot_path,
+                symcc_output=input_trace_output_dir, extra_env=trace_env,
+            )
+            initial_observation = _read_symcc_trace_feedback(
+                container=container,
+                path=f"{trace_dir}/input.trace",
+                feedback_runtime=feedback_runtime,
+            )
+        else:
+            input_trace_execution = {
+                "status": "setup_failed", "exit_code": None,
+                "duration_s": 0.0, "error": f"cannot create concrete trace output: {err}",
+            }
+            initial_observation = {
+                "status": "unavailable", "target_reached": None,
+                "target_reachability": "unknown",
+                "reason": "cannot create concrete trace output directory",
+            }
+
+        symcc_request = ExecutionRequest(
+            request.request_id, snapshot_path,
+            symcc_args,
+            request.timeout_s, request.env,
+        )
         symcc = _run_protocol_binary(
             container=container, binary=symcc_binary, request=symcc_request,
-            input_path=request.input_path, symcc_output=out_dir,
-            extra_env=symcc_env,
-        )
-        initial_observation = _read_symcc_trace_feedback(
-            container=container,
-            path=f"{trace_dir}/input.trace",
-            feedback_runtime=feedback_runtime,
+            input_path=snapshot_path, symcc_output=out_dir,
         )
         list_cmd = (
             f"find {shlex.quote(out_dir)} -maxdepth 1 -type f "
@@ -1757,7 +1819,7 @@ def _execute_prebuilt_protocol_symcc_request(
                 docker_ops.write_file(container, replay_path, data)
                 replay_request = ExecutionRequest(
                     request.request_id,
-                    request.input_path,
+                    snapshot_path,
                     request.program_args,
                     min(request.timeout_s, 10),
                     request.env,
@@ -1769,8 +1831,8 @@ def _execute_prebuilt_protocol_symcc_request(
                 candidate_trace_path = f"{trace_dir}/generated-{generated_index:03d}.trace"
                 candidate_symcc_request = ExecutionRequest(
                     request.request_id,
-                    request.input_path,
-                    tuple(symcc_cfg.get("program_args") or request.program_args),
+                    snapshot_path,
+                    symcc_args,
                     min(request.timeout_s, 10),
                     request.env,
                 )
@@ -1781,7 +1843,14 @@ def _execute_prebuilt_protocol_symcc_request(
                     input_path=replay_path,
                     symcc_output=f"{out_dir}/concrete-{generated_index:03d}",
                     extra_env={
-                        **symcc_env,
+                        "SYMCC_FEEDBACK_CAPACITY": str(
+                            (symcc_cfg.get("feedback_capacity") or 65536)
+                        ),
+                        **({
+                            "SYMCC_FEEDBACK_TARGET_IDS": ",".join(
+                                str(site_id) for site_id in target_ids
+                            )
+                        } if target_ids else {}),
                         "SYMCC_NO_SYMBOLIC_INPUT": "1",
                         "SYMCC_FEEDBACK_TRACE": candidate_trace_path,
                     },
@@ -1819,6 +1888,7 @@ def _execute_prebuilt_protocol_symcc_request(
         "request_id": request.request_id,
         "round_id": round_id,
         "input_path": request.input_path,
+        "snapshot_path": snapshot_path,
         "input_size": job["input_size"],
         "job_id": f"symcc-{request.request_id}",
         "input_id": job["input_id"],
@@ -1826,6 +1896,7 @@ def _execute_prebuilt_protocol_symcc_request(
         "target_commit": target.commit,
         "input_sha256": job["input_sha256"],
         "clean": job["clean"],
+        "input_trace_execution": input_trace_execution,
         "symcc": symcc,
         "symcc_observation": initial_observation,
         "generated_replays": replays,
@@ -1956,6 +2027,7 @@ def _compact_protocol_feedback(record: dict[str, Any]) -> dict[str, Any]:
         "round_id": record.get("round_id"),
         "input_id": record.get("input_id"),
         "input_sha256": record.get("input_sha256"),
+        "snapshot_path": record.get("snapshot_path"),
         "parent_input_id": record.get("parent_input_id"),
         "target_commit": record.get("target_commit"),
         "feedback_status": record.get("feedback_status"),
@@ -1967,6 +2039,12 @@ def _compact_protocol_feedback(record: dict[str, Any]) -> dict[str, Any]:
             key: symcc[key] for key in
             ("status", "duration_s", "testcase_count", "errors") if key in symcc
         },
+        "input_trace_execution": {
+            key: record["input_trace_execution"][key]
+            for key in ("status", "exit_code", "duration_s")
+            if key in record.get("input_trace_execution", {})
+        },
+        "symcc_queue_wait_s": record.get("symcc_queue_wait_s"),
         "symcc_observation": compact_observation(
             record.get("symcc_observation")
         ),
@@ -1987,6 +2065,7 @@ async def _prebuilt_protocol_worker(
 ) -> dict[str, Any]:
     request_limit = max(1, min(int(max_requests), _MAX_ITERATION_RECORDS))
     max_inflight_symcc_jobs = 2
+    symcc_slots = asyncio.Semaphore(max_inflight_symcc_jobs)
     seen: set[str] = set()
     records: list[dict[str, Any]] = []
     jobs: set[asyncio.Task] = set()
@@ -1994,6 +2073,7 @@ async def _prebuilt_protocol_worker(
         "processed": 0, "invalid": 0, "errors": 0,
         "symcc_errors": 0, "symcc_skipped_busy": 0,
         "symcc_abandoned": 0, "symcc_duration_s": 0.0,
+        "symcc_queued": 0, "symcc_queue_wait_s": 0.0,
         "feedback_auto_delivered": 0,
         "iteration_limit_rejections": 0,
     }
@@ -2067,6 +2147,15 @@ async def _prebuilt_protocol_worker(
             record["feedback_error"] = f"{type(exc).__name__}: {exc}"
         record["feedback_wall_time_s"] = round(time.monotonic() - started, 3)
 
+    async def run_queued_feedback_job(
+        job: dict[str, Any], record: dict[str, Any], enqueued_at: float
+    ) -> None:
+        async with symcc_slots:
+            queue_wait = max(0.0, time.monotonic() - enqueued_at)
+            record["symcc_queue_wait_s"] = round(queue_wait, 3)
+            stats["symcc_queue_wait_s"] += queue_wait
+            await run_feedback_job(job, record)
+
     while not stop.is_set():
         try:
             rc, listing, _err = await asyncio.to_thread(
@@ -2120,26 +2209,6 @@ async def _prebuilt_protocol_worker(
                     )
                     if response.get("status") == "invalid_request":
                         stats["invalid"] += 1
-                    elif job is not None and sum(not task.done() for task in jobs) >= max_inflight_symcc_jobs:
-                        response["symcc"] = {
-                            "status": "skipped_busy",
-                            "message": (
-                                "two background SymCC jobs are already running; this input "
-                                "will not receive SymCC feedback"
-                            ),
-                        }
-                        response["site_reachability_note"] = (
-                            "The clean target was run synchronously. SymCC feedback was "
-                            "skipped because the background concurrency limit was reached."
-                        )
-                        response["symcc_observation"] = {
-                            "status": "unavailable",
-                            "target_reached": None,
-                            "target_reachability": "unknown",
-                            "reason": "background SymCC concurrency limit reached",
-                        }
-                        job = None
-                        stats["symcc_skipped_busy"] += 1
                     delivered_ids = attach_ready_feedback(response)
                     records.append(response)
                     stats["processed"] += 1
@@ -2155,8 +2224,12 @@ async def _prebuilt_protocol_worker(
                         timeout=15,
                     )
                     if job is not None:
-                        task = asyncio.create_task(run_feedback_job(job, response))
+                        enqueued_at = time.monotonic()
+                        task = asyncio.create_task(
+                            run_queued_feedback_job(job, response, enqueued_at)
+                        )
                         jobs.add(task)
+                        stats["symcc_queued"] += 1
                         task.add_done_callback(jobs.discard)
                 except Exception as exc:
                     stats["errors"] += 1
@@ -2210,6 +2283,8 @@ async def _prebuilt_protocol_worker(
         "requests": stats["processed"], "invalid_requests": stats["invalid"],
         "iteration_limit_rejections": stats["iteration_limit_rejections"],
         "errors": stats["errors"], "symcc_errors": stats["symcc_errors"],
+        "symcc_queued": stats["symcc_queued"],
+        "symcc_queue_wait_s": round(stats["symcc_queue_wait_s"], 3),
         "symcc_skipped_busy": stats["symcc_skipped_busy"],
         "symcc_abandoned": stats["symcc_abandoned"],
         "feedback_auto_delivered": stats["feedback_auto_delivered"],
@@ -2537,7 +2612,7 @@ def _prepare_iteration_workspace(
                     "trigger_condition": "current trigger hypothesis",
                 },
                 "observations": {
-                    "site_reached": False,
+                    "site_reached": None,
                     "sanitizer_event": False,
                     "bad_state_observed": False,
                     "bad_effect_observed": False,
@@ -2567,8 +2642,10 @@ def _prepare_iteration_workspace(
             "# Dynamic validation iterations\n\n"
             "Write one JSON record per validation round as "
             "`/work/validation/iterations/round-NNN.json`.\n"
-            "Use `round_id` (not `round`) and put the five boolean evidence "
-            "fields inside the `observations` object. For this " + candidate_kind +
+            "Use `round_id` (not `round`) and put the evidence fields inside "
+            "the `observations` object. Four fields are boolean; `site_reached` "
+            "is tri-state: true only for an exact runtime hit, false only for a "
+            "complete trace proving a miss, and null when unknown. For this " + candidate_kind +
             " candidate, a successful record must set `decision` to "
             "`candidate_ready` and set " + readiness +
             " to true based on command output. The exact "

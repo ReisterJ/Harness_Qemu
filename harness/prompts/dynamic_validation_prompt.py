@@ -430,16 +430,22 @@ binary directly. For every candidate input, save it under
 request from `{context.get('request_template', '/work/validation/execution/request-template.json')}`,
 and run `{context.get('runner', '/work/validation/run-input')} REQUEST.json`.
 The response waits only for the ordinary target run; SymCC is queued in the
-background. Inspect the clean-target result, then continue source analysis and
-input iteration without waiting for SymCC. At a useful decision point, query
+background. Every accepted input is queued; only two SymCC jobs run at once and
+additional jobs wait asynchronously rather than being dropped. The Harness
+snapshots each request's bytes, so later edits to the candidate file cannot
+change which input that request validates. Inspect the clean-target result,
+then continue source analysis and input iteration without waiting for SymCC. At a useful decision point, query
 `{context.get('feedback_reader', '/work/validation/read-feedback')} REQUEST_ID`.
-Only query when the run response says SymCC is `queued`; `skipped_busy` means
-there will be no feedback for that request. If the reader returns `pending`, do
-not poll or wait—continue working and check later.
-When ready, the feedback contains the SymCC run and replays of its generated
-inputs on the ordinary target. SymCC output is advisory only: it is not
-reachability proof or a PoC. Preserve the existing final crash-result or logic
-submission contract; Grade remains the final reproduction check.
+Only query when the run response says SymCC is `queued`. If the reader returns
+`pending`, do not poll or wait—continue working and check later. The feedback
+separately reports (1) one concrete, non-symbolic execution of the submitted
+input, which is the authoritative per-input location trace, and (2) the
+symbolic exploration status and its generated seeds. A symbolic exploration
+timeout does not invalidate a completed concrete trace. Generated inputs each
+have their own clean replay and concrete trace; never attribute their hits to
+the submitted input. SymCC output is advisory for input selection, not a PoC.
+Preserve the existing final crash-result or logic submission contract; Grade
+remains the final reproduction check.
 """
     if context.get("orchestration") != "harness":
         return ""
@@ -563,17 +569,19 @@ and variants. Submit one request, inspect its clean result and any
 after it is reached, further requests receive `iteration_limit_reached` and are
 not executed. Stop submitting inputs when that status appears.
 The call waits only for that exact input's ordinary-target result. The Harness
-queues the prebuilt SymCC execution in the background, so continue source
-analysis and constructing/testing inputs rather than waiting for it. At a useful
-decision point, query
+snapshots its bytes before execution and queues every accepted SymCC job in a
+bounded background queue (two run concurrently; excess jobs wait, not skip),
+so continue source analysis and constructing/testing inputs rather than
+waiting for it. At a useful decision point, query
 `{context.get('feedback_reader', '/work/validation/read-feedback')} REQUEST_ID`.
-Only query when the response says SymCC is `queued`; `skipped_busy` means no
-feedback will be produced for that request. If the reader returns `pending`, do
+Only query when the response says SymCC is `queued`. If the reader returns `pending`, do
 not poll or wait; continue work and check later. Set `parent_input_id` when a
 candidate derives from a previous request or generated seed. Once ready,
-distinguish the submitted input's trace from each generated seed's separate
-trace. `target_reached=true` is an exact positive for that run; `false` is
-exact only when the trace is complete; `unknown` cannot establish a negative.
+use `symcc_observation` for the submitted input's separate concrete trace and
+distinguish it from each generated seed's trace. The symbolic-exploration
+process may time out; that must not be confused with the concrete trace status.
+`target_reached=true` is an exact positive for that run; `false` is exact only
+when the concrete trace is complete; `unknown` cannot establish a negative.
 Use `observed_locations` as observed source positions. `distance` is only a
 static CFG/call-graph heuristic, never a proof of reachability or
 non-reachability. If an input reaches the target, continue source reasoning and
@@ -902,7 +910,7 @@ At the end of every round, write a bounded JSON record to
   "candidate_id": "{candidate_id}",
   "hypothesis": {{"entry_point": "...", "target_site": "...", "trigger_condition": "..."}},
   "observations": {{
-    "site_reached": false,
+    "site_reached": null,
     "sanitizer_event": false,
     "bad_state_observed": false,
     "bad_effect_observed": false,
@@ -915,6 +923,10 @@ At the end of every round, write a bounded JSON record to
 
 The observation fields must come from commands or provider reports; do not set
 them merely because the static report or model reasoning predicts them.
+`site_reached` is tri-state: use `true` only for an exact runtime hit, `false`
+only for a complete trace proving this execution missed, and `null` when the
+trace is incomplete, unavailable, or ambiguous. A heuristic distance or source
+reasoning cannot convert `null` to `false` or `true`.
 Write each record immediately after its probe and before launching the next
 search; do not defer all round records until the end of the phase.
 For memory bugs, a sanitizer event from a different function is a wrong path,

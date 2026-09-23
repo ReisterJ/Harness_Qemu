@@ -45,11 +45,11 @@ Harness 对事实和估算分开处理：
 
 当动态阶段显式启用 `--symbolic-execution symcc` 时，Harness 在容器准备阶段验证预构建二进制、source commit 和 feedback map，并把普通目标与 SymCC 二进制移入受保护路径，防止 agent 绕过协议直接调用。agent 使用执行协议提交请求，不能自行选择/替换 Harness 管理的可执行文件。
 
-请求包括唯一 `request_id`、输入路径、输入摘要、父输入 ID、目标 commit、程序参数、超时和环境变量。Harness 将该输入先交给普通目标运行，随后把相同字节交给后台 SymCC worker；普通目标执行结果及时返回，SymCC 分析不占住 agent 的工具调用。反馈使用相同 request ID 发布，允许乱序完成。每个请求最多复用唯一 ID 一次；后台并发上限为 2，超过时显式返回 `skipped_busy`，不伪造负反馈。agent 可以继续阅读源码、构造其他输入，稍后读取 `pending` 或完成反馈。
+请求包括唯一 `request_id`、输入路径、输入摘要、父输入 ID、目标 commit、程序参数、超时和环境变量。Harness 在接收时立即将输入字节复制到该 request 专属、只读快照；普通目标运行、SymCC 具体输入轨迹和符号探索都引用这份快照，后续覆盖 agent 的候选文件不会改变已提交请求。普通目标执行结果及时返回，SymCC 分析不占住 agent 的工具调用。反馈使用相同 request ID 发布，允许乱序完成。每个请求最多复用唯一 ID 一次；后台最多并行运行 2 个 SymCC job，额外已接受的 job 排队等待，不会因为队列繁忙而丢弃。agent 可以继续阅读源码、构造其他输入，稍后读取 `pending` 或完成反馈。
 
 为了不把“是否记得调用查询工具”变成实验变量，下一次 `run-input` 响应会附带此前已完成、尚未呈现给 agent 的 `ready_feedback` 摘要。摘要保留输入身份、普通目标结果、原始输入的精确位点命中与 heuristic 距离、候选输入的独立回放状态和位点观察，不复制无界的 solver stdout/stderr。原请求的早期响应不会被异步改写；若 agent 暂时没有新输入，仍可用 `read-feedback REQUEST_ID` 非阻塞查询。
 
-SymCC 运行使用 `SYMCC_INPUT_FILE` 将本次文件读操作标记为符号输入，并将 solver 产物写入独立输出目录。Harness 对每个产物执行有界的普通二进制重放，并用 `SYMCC_NO_SYMBOLIC_INPUT=1` 获取该具体产物自己的代码位置轨迹。候选输入的 reach 结果不能冒充原始输入的 reach 结果。
+每个已提交输入会先以 `SYMCC_NO_SYMBOLIC_INPUT=1` 单独运行一次 SymCC 二进制，得到该输入本身的具体执行轨迹；因此该轨迹的目标命中/未命中不受后续符号探索是否超时或轨迹是否截断影响。随后 Harness 再以 `SYMCC_INPUT_FILE` 将本次文件读操作标记为符号输入，探索路径并把 solver 产物写入独立输出目录。Harness 对每个产物执行有界的普通二进制重放，并为每个产物单独采集具体轨迹。候选种子的 reach 结果不能冒充原始输入的 reach 结果。
 
 如果 agent 在后台任务完成前结束，Harness 不延长 PoC 阶段等待 SymCC；未完成任务标成 `abandoned_agent_finished`。这保留了异步目标，但也意味着非常慢的求解任务可能没有机会反馈给当前 agent。
 
