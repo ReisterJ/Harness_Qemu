@@ -68,6 +68,12 @@ Harness 对事实和估算分开处理：
 
 为了不把“是否记得调用查询工具”变成实验变量，下一次 `run-input` 响应会附带此前已完成、尚未呈现给 agent 的 `ready_feedback` 摘要。摘要保留输入身份、普通目标结果、原始输入的精确位点命中与 heuristic 距离、候选输入的独立回放状态和位点观察，不复制无界的 solver stdout/stderr。原请求的早期响应不会被异步改写；若 agent 暂时没有新输入，仍可用 `read-feedback REQUEST_ID` 非阻塞查询。
 
+迭代记录中的模型判断不是执行事实的权威来源。SymCC 模式下，agent 必须在每条记录中携带对应执行响应的 `request_id` 和 `input_id`；Harness 在最终汇总时将其与协议记录关联，并覆盖 agent 写入的 `site_reached`、`sanitizer_event`。只有目标 ID 配置/映射有效且具体轨迹确实观察到目标 marker，才是精确命中；完整轨迹未观察到 marker 才是精确未命中，其他情况为 `unknown`。模型的 `matched_candidate` 只能作为语义解释的一部分，不能把 heuristic distance、邻近 block 或 sanitizer 栈提升成位点命中事实。若确有 ASan 崩溃但精确目标 marker 未命中，结果记为 `wrong_path`，不进入 Grade。
+
+另外单独报告 `target_block_reached`：它表示这次轨迹是否进入了静态目标所在的基本块；它不等同于精确 source-location marker 命中。因而 `target_block_reached=true`、`distance=0` 与 `target_reached=false` 可以同时成立，表示执行到达了目标所在块，但没有证据证明目标行/指令 marker 被执行。agent 不得将前两者解释成精确命中。
+
+执行协议只用于动态阶段探索。最终 `crash-result.xml` 的 `reproduction_command` 仍必须是 runtime contract 中 Grade 可在新容器执行的普通目标命令，并包含字面 `poc_path`；不能填写 `run-input` 或阶段内 request JSON 路径，因为这些 request 文件不会传给 Grade。受保护的动态容器内最后一次确认则另用新的 `run-input` 请求完成。这样保持原有 Grade 验收契约不变，同时区分“探索命令”和“独立重放命令”。
+
 每个已提交输入会先以 `SYMCC_NO_SYMBOLIC_INPUT=1` 单独运行一次 SymCC 二进制，得到该输入本身的具体执行轨迹；这与后续符号探索分开。随后 Harness 再以 `SYMCC_INPUT_FILE` 将本次文件读操作标记为符号输入，探索路径并把 solver 产物写入独立输出目录。Harness 对每个产物执行有界的普通二进制重放，并为每个产物单独采集具体轨迹。若具体轨迹完整且未截断，可精确判断本次命中/未命中；若截断但 runtime 命中标志为真，可精确报告命中，否则为 `unknown`。候选种子的 reach 结果不能冒充原始输入的 reach 结果。
 
 SymCC runtime 以 `0600` 权限创建 trace 文件；sidecar 保持该权限，不向宿主机放宽文件可读性。Harness 通过 Docker exec 在 sidecar 内读取 trace，避免宿主非特权用户把权限错误误判为“trace 缺失”。单次符号探索到达 timeout 时显式记为 `timed_out`；若 cgroup 证实 OOM，则优先标为 `resource_exhausted`。

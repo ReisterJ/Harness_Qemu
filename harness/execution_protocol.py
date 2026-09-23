@@ -253,5 +253,12 @@ candidate was derived from a prior candidate or generated seed.
 The Harness owns the executable selection and execution. {symbolic}
 {feedback}
 Request ids are single-use; use a fresh id for every candidate. Reproduce the final PoC through the
-ordinary target and satisfy the normal crash-result contract.
+ordinary target and satisfy the normal crash-result contract. The `run-input`
+wrapper is only for exploration and confirmation inside this guarded phase.
+In `crash-result.xml`, `reproduction_command` must be the ordinary target
+invocation from the runtime contract with the literal PoC path; do not put the
+`run-input` wrapper or a request JSON path there because Grade runs in a fresh
+container and receives only the PoC bytes. For the final in-container
+confirmation, submit a fresh request for the saved PoC and run that request
+through `run-input`.
 '''.encode()

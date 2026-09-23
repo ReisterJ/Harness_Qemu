@@ -499,7 +499,11 @@ target internally passes those bytes to `mrb_load_string`.
 `<reproduction_command>` must be the exact command containing that path; do not substitute aliases such as `<repro_command>` or `<reproduce>`.
 <reproduction_command>exact command containing that path</reproduction_command>
 The host parses this file strictly and reads the PoC bytes from that path.
-Save and reread `crash-result.xml`, then run the exact command one final time.
+Save and reread `crash-result.xml`, then perform one final reproduction using
+the target's declared execution contract. If this phase is running behind a
+guarded execution protocol, use a fresh protocol request for that rerun; do not
+substitute the protocol wrapper for the Grade-compatible
+`reproduction_command`.
 
 For an unreachable or non-crashing candidate, do not create this file. Emit
 the normal inline `<dynamic_status>`, `<candidate_id>`,
@@ -599,6 +603,15 @@ response down to only the clean-target output or silently discard
 `ready_feedback`. The original response is not rewritten after the job
 finishes. This is a nonblocking delivery mechanism, not a reason to wait before
 continuing.
+For every submitted input, write an iteration JSON record containing its exact
+`request_id` and `input_id` from the protocol response. Treat
+`symcc_observation.target_reached` as authoritative: `false` plus a complete,
+valid trace is a confirmed miss; do not turn `distance: 0`, a closest block, or
+`target_block_reached: true` into an exact source-marker hit. A block-level hit
+only means execution entered the basic block containing the target; it does not
+prove the target's source-location marker fired. The Harness will reconcile your iteration's
+site/sanitizer flags against that request's machine record before accepting a
+candidate.
 Configured SymCC arguments are
 `{json.dumps(context.get('symcc_program_args', ['{input_file}']), ensure_ascii=False)}`.
 
@@ -607,6 +620,16 @@ inputs. A generated testcase is not a PoC; use its per-run source trace to know
 whether that concrete input hit the configured static target. Keep the original
 candidate and final crash-result/logic-response contract; final acceptance
 remains the Grade phase's responsibility.
+
+The dynamic `run-input` wrapper is only for exploration and in-container
+confirmation. In `crash-result.xml`, `reproduction_command` must instead be the
+ordinary target invocation described by the runtime contract, using the
+literal `poc_path`; Grade runs that command in a fresh container and does not
+receive this phase's request JSON files. Do not put a `run-input` command or a
+request JSON path in `reproduction_command`. To perform the last confirmation
+inside this guarded dynamic container, create a fresh execution request for the
+saved PoC and use `run-input`; do not try to bypass the guard by invoking the
+target binary directly.
 """
     if context.get("provider") == "symcc":
         return f"""

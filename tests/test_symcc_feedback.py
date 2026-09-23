@@ -101,6 +101,7 @@ def test_trace_reports_exact_hit_and_heuristic_distance_separately():
     )
     assert result["target_reached"] is False
     assert result["target_reachability"] == "this_execution_missed"
+    assert result["target_block_reached"] is False
     assert result["distance"] == 1
     assert result["distance_is_heuristic"] is True
     assert result["observed_locations"] == [{
@@ -128,6 +129,7 @@ def test_interrupted_run_without_target_hit_is_unknown_not_negative():
     )
     assert result["target_reached"] is None
     assert result["target_reachability"] == "unknown"
+    assert result["target_block_reached"] is None
     assert result["distance"] == 1
 
 
@@ -144,6 +146,7 @@ def test_basic_block_distance_zero_does_not_imply_exact_line_hit():
         target_block_ids=target_blocks,
     )
     assert result["target_reached"] is False
+    assert result["target_block_reached"] is True
     assert result["distance"] == 0
     assert result["distance_granularity"] == "basic_block"
     assert "does not prove an exact source-line marker" in result["distance_note"]

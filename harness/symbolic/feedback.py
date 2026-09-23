@@ -378,6 +378,13 @@ def summarize_trace(
         event.site_id for event in trace.events
         if event.kind == 1 and event.site_id in graph["nodes"]
     }
+    observed_target_blocks = reached_blocks.intersection(targets)
+    if observed_target_blocks:
+        target_block_reached: bool | None = True
+    elif trace.complete and not trace.truncated and targets:
+        target_block_reached = False
+    else:
+        target_block_reached = None
     best = min(
         ((distances[site_id], site_id) for site_id in reached_blocks if site_id in distances),
         default=None,
@@ -404,6 +411,7 @@ def summarize_trace(
         "observed_locations": _observed_locations(graph, trace.events),
         "unknown_site_ids": unknown_ids[:64],
         "target_reached": target_reached,
+        "target_block_reached": target_block_reached,
         "target_reachability": (
             "this_execution_hit" if target_reached is True
             else "this_execution_missed" if target_reached is False

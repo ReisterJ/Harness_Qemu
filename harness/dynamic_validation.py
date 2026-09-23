@@ -261,6 +261,14 @@ async def run_dynamic_validation(
         iterations, iteration_errors = _collect_iteration_records(
             container, candidate.candidate_id, iteration_limit
         )
+        if symbolic_provider == "symcc":
+            iterations, symcc_iteration_errors = _reconcile_symcc_iterations(
+                iterations,
+                symbolic_result or {},
+                candidate_id=candidate.candidate_id,
+                detector=target.detector,
+            )
+            iteration_errors.extend(symcc_iteration_errors)
         _persist_iteration_records(
             iterations, iteration_errors, instrumentation_result_path
         )
@@ -454,13 +462,19 @@ async def run_dynamic_validation(
         dup_check = result_data["dup_check"]
 
         if not _has_candidate_ready_iteration(iterations, target.detector):
+            wrong_path = _has_crash_without_candidate_site(iterations)
             return dynamic_result(
                 candidate_id=selected_id,
-                status="invalid_submission",
+                status="wrong_path" if wrong_path else "invalid_submission",
                 reached_functions=reached,
                 reachability_evidence=reachability,
                 reason=(
-                    "successful PoC requires a candidate_ready iteration with "
+                    "the submitted crash PoC reproduced a sanitizer event, but the "
+                    "complete SymCC trace for that input did not hit the exact "
+                    "candidate target marker; a distance estimate or nearby basic "
+                    "block is not evidence of a hit"
+                    if wrong_path
+                    else "successful PoC requires a candidate_ready iteration with "
                     "machine-observable evidence for the candidate"
                 ),
             ), result, timings
@@ -2094,7 +2108,8 @@ def _compact_protocol_feedback(record: dict[str, Any]) -> dict[str, Any]:
         keys = (
             "status", "trace_status", "trace_complete", "trace_truncated",
             "target_ids_configured", "target_ids_valid", "target_reached",
-            "target_reachability", "observed_block_count", "distance",
+            "target_block_reached", "target_reachability",
+            "observed_block_count", "distance",
             "distance_kind", "distance_is_heuristic", "distance_note",
             "closest_observed_location", "unresolved_call_count", "reason",
         )
@@ -2753,6 +2768,8 @@ def _prepare_iteration_workspace(
             "record_example": {
                 "schema_version": 1,
                 "round_id": 1,
+                "request_id": "round-001",
+                "input_id": "copy the input_id from run-input response",
                 "candidate_id": candidate.candidate_id,
                 "hypothesis": {
                     "entry_point": "external input entry",
@@ -2760,6 +2777,9 @@ def _prepare_iteration_workspace(
                     "trigger_condition": "current trigger hypothesis",
                 },
                 "observations": {
+                    # The host replaces these two values from the request's
+                    # concrete execution record; the model must not infer a
+                    # hit from location proximity or distance.
                     "site_reached": None,
                     "sanitizer_event": False,
                     "bad_state_observed": False,
@@ -2790,13 +2810,20 @@ def _prepare_iteration_workspace(
             "# Dynamic validation iterations\n\n"
             "Write one JSON record per validation round as "
             "`/work/validation/iterations/round-NNN.json`.\n"
+            "For SymCC protocol runs, copy both `request_id` and `input_id` "
+            "from the exact `run-input` response into the record.\n"
             "Use `round_id` (not `round`) and put the evidence fields inside "
             "the `observations` object. Four fields are boolean; `site_reached` "
-            "is tri-state: true only for an exact runtime hit, false only for a "
-            "complete trace proving a miss, and null when unknown. For this " + candidate_kind +
+            "is tri-state. In SymCC mode, the Harness overwrites `site_reached` "
+            "and `sanitizer_event` using the request-correlated machine result; "
+            "do not infer target reach from `distance`, `closest_observed_location`, "
+            "a stack trace, or a nearby basic block. A false exact result on a "
+            "complete trace is a miss; unavailable or incomplete trace evidence "
+            "is null/unknown. For this " + candidate_kind +
             " candidate, a successful record must set `decision` to "
-            "`candidate_ready` and set " + readiness +
-            " to true based on command output. The exact "
+            "`candidate_ready` and set the required semantic evidence based on "
+            "source and command output. The Harness determines exact site reach "
+            "and requires it to be true. The exact "
             "machine-readable template is in `iteration-contract.json`. "
             "The record does not replace the final PoC XML contract. Do not "
             "put secrets or unbounded command output in it.\n"
@@ -2886,11 +2913,259 @@ def _collect_iteration_records(
     return records, errors
 
 
+def _reconcile_symcc_iterations(
+    agent_iterations: list[dict],
+    symbolic_result: dict,
+    *,
+    candidate_id: str,
+    detector: str,
+) -> tuple[list[dict], list[str]]:
+    """Replace model-authored SymCC facts with request-correlated observations.
+
+    The agent may explain what an execution means, but it cannot promote a
+    nearby block or a distance estimate into an exact target hit. The
+    request-scoped concrete trace is authoritative for ``site_reached``; a
+    model iteration is associated with it only when request and input IDs
+    agree. Missing/incomplete trace evidence remains unknown.
+    """
+    protocol_records = symbolic_result.get("records")
+    if not isinstance(protocol_records, list):
+        protocol_records = []
+
+    agents_by_round: dict[int, list[dict]] = {}
+    for agent_record in agent_iterations:
+        try:
+            round_id = int(agent_record.get("round_id", 0))
+        except (TypeError, ValueError):
+            round_id = 0
+        agents_by_round.setdefault(round_id, []).append(agent_record)
+
+    used_agent_ids: set[int] = set()
+    reconciled: list[dict] = []
+    errors: list[str] = []
+    seen_rounds: set[int] = set()
+
+    for protocol_record in protocol_records:
+        if not isinstance(protocol_record, dict):
+            continue
+        try:
+            round_id = int(protocol_record.get("round_id", 0))
+        except (TypeError, ValueError):
+            round_id = 0
+        if round_id <= 0:
+            errors.append("ignored SymCC protocol record without a valid round_id")
+            continue
+        if round_id in seen_rounds:
+            errors.append(f"duplicate SymCC protocol round_id: {round_id}")
+            continue
+        seen_rounds.add(round_id)
+
+        request_id = str(protocol_record.get("request_id") or "")
+        input_id = str(protocol_record.get("input_id") or "")
+        round_agents = agents_by_round.get(round_id, [])
+        agent_record = round_agents[0] if round_agents else None
+        if agent_record is not None:
+            used_agent_ids.add(id(agent_record))
+
+        agent_observations = (
+            agent_record.get("observations")
+            if isinstance(agent_record, dict)
+            and isinstance(agent_record.get("observations"), dict)
+            else {}
+        )
+        agent_request_id = str((agent_record or {}).get("request_id") or "")
+        agent_input_id = str((agent_record or {}).get("input_id") or "")
+        identity_matches = bool(
+            agent_record is not None
+            and request_id
+            and input_id
+            and agent_request_id == request_id
+            and agent_input_id == input_id
+        )
+        if agent_record is not None and not identity_matches:
+            errors.append(
+                f"round {round_id} agent iteration lacks matching request_id/input_id; "
+                "its semantic claims are retained but cannot authorize candidate readiness"
+            )
+
+        observation = protocol_record.get("symcc_observation")
+        if not isinstance(observation, dict):
+            observation = {}
+        target_ids_valid = (
+            observation.get("target_ids_configured") is True
+            and observation.get("target_ids_valid") is True
+        )
+        raw_reached = observation.get("target_reached")
+        if target_ids_valid and raw_reached is True:
+            site_reached: bool | None = True
+        elif (
+            target_ids_valid
+            and raw_reached is False
+            and observation.get("trace_complete") is True
+            and observation.get("trace_truncated") is False
+        ):
+            site_reached = False
+        else:
+            site_reached = None
+
+        clean = protocol_record.get("clean")
+        if not isinstance(clean, dict):
+            clean = {}
+        sanitizer_event = clean.get("sanitizer_event")
+        if not isinstance(sanitizer_event, bool):
+            sanitizer_event = None
+
+        agent_claims = {
+            key: agent_observations.get(key)
+            for key in (
+                "site_reached", "sanitizer_event", "bad_state_observed",
+                "bad_effect_observed", "matched_candidate",
+            )
+            if key in agent_observations
+        }
+        linked_claim = identity_matches
+        bad_state = (
+            agent_observations.get("bad_state_observed") is True
+            if linked_claim else False
+        )
+        bad_effect = (
+            agent_observations.get("bad_effect_observed") is True
+            if linked_claim else False
+        )
+        agent_matched = (
+            agent_observations.get("matched_candidate") is True
+            if linked_claim else False
+        )
+        if detector == "logic":
+            matched_candidate = bool(
+                site_reached is True and bad_state and bad_effect and agent_matched
+            )
+        else:
+            matched_candidate = bool(
+                site_reached is True
+                and sanitizer_event is True
+                and agent_matched
+            )
+
+        machine_evidence = {
+            "provider": "symcc-prebuilt",
+            "request_id": request_id or None,
+            "input_id": input_id or None,
+            "parent_input_id": protocol_record.get("parent_input_id"),
+            "target_commit": protocol_record.get("target_commit"),
+            "feedback_status": protocol_record.get("feedback_status"),
+            "trace_status": observation.get("trace_status"),
+            "trace_complete": observation.get("trace_complete"),
+            "trace_truncated": observation.get("trace_truncated"),
+            "target_ids_configured": observation.get("target_ids_configured"),
+            "target_ids_valid": observation.get("target_ids_valid"),
+            "target_reached": observation.get("target_reached"),
+            "target_block_reached": observation.get("target_block_reached"),
+            "closest_observed_location": observation.get("closest_observed_location"),
+            "distance": observation.get("distance"),
+            "distance_kind": observation.get("distance_kind"),
+            "distance_is_heuristic": observation.get("distance_is_heuristic"),
+            "symcc_status": (protocol_record.get("symcc") or {}).get("status"),
+            "clean_status": clean.get("status"),
+            "sanitizer_event": sanitizer_event,
+        }
+        record = {
+            "schema_version": 1,
+            "round_id": round_id,
+            "candidate_id": candidate_id,
+            "request_id": request_id or None,
+            "input_id": input_id or None,
+            "parent_input_id": protocol_record.get("parent_input_id"),
+            "target_commit": protocol_record.get("target_commit"),
+            "hypothesis": (
+                agent_record.get("hypothesis")
+                if isinstance(agent_record, dict)
+                and isinstance(agent_record.get("hypothesis"), dict)
+                else {}
+            ),
+            "agent_claims": agent_claims,
+            "association": "request_and_input_id" if identity_matches else (
+                "round_only" if agent_record is not None else "no_agent_record"
+            ),
+            "machine_evidence": machine_evidence,
+            "observations": {
+                "site_reached": site_reached,
+                "sanitizer_event": sanitizer_event,
+                "bad_state_observed": bad_state,
+                "bad_effect_observed": bad_effect,
+                "matched_candidate": matched_candidate,
+            },
+            "decision": "candidate_ready" if matched_candidate else "continue",
+            "reason": str((agent_record or {}).get("reason") or "")[:4_000],
+        }
+        if site_reached is False and agent_claims.get("site_reached") is True:
+            record["reason"] = (
+                record["reason"] + "\nHarness correction: the complete concrete "
+                "SymCC trace did not hit the exact target marker; a nearby block "
+                "or distance estimate is not an exact hit."
+            ).strip()[:4_000]
+        reconciled.append(_bound_iteration(record))
+
+    # Preserve unmatched model records for audit, but strip all authority from
+    # their runtime claims. They cannot satisfy the successful-PoC gate.
+    for agent_record in agent_iterations:
+        if id(agent_record) in used_agent_ids:
+            continue
+        value = dict(agent_record)
+        claims = value.get("observations")
+        if not isinstance(claims, dict):
+            claims = {}
+        value["agent_claims"] = {
+            key: claims[key]
+            for key in (
+                "site_reached", "sanitizer_event", "bad_state_observed",
+                "bad_effect_observed", "matched_candidate",
+            )
+            if key in claims
+        }
+        value["association"] = "unmatched"
+        value["machine_evidence"] = {"provider": "symcc-prebuilt", "status": "missing"}
+        value["observations"] = {
+            "site_reached": None,
+            "sanitizer_event": None,
+            "bad_state_observed": False,
+            "bad_effect_observed": False,
+            "matched_candidate": False,
+        }
+        value["decision"] = "continue"
+        reconciled.append(_bound_iteration(value))
+        errors.append(
+            f"agent iteration round {value.get('round_id', 0)} has no matching "
+            "request-scoped SymCC execution record"
+        )
+
+    reconciled.sort(key=lambda item: (int(item.get("round_id", 0)), str(item)))
+    return reconciled, errors
+
+
+def _has_crash_without_candidate_site(iterations: list[dict]) -> bool:
+    """Detect a sanitizer crash paired with an exact, complete site miss."""
+    for record in iterations:
+        machine = record.get("machine_evidence")
+        observations = record.get("observations")
+        if not isinstance(machine, dict) or not isinstance(observations, dict):
+            continue
+        if (
+            machine.get("provider") == "symcc-prebuilt"
+            and observations.get("site_reached") is False
+            and observations.get("sanitizer_event") is True
+        ):
+            return True
+    return False
+
+
 def _bound_iteration(value: dict) -> dict:
     """Keep model-authored iteration evidence safe to persist and inspect."""
     allowed = {
         "schema_version", "round_id", "candidate_id", "hypothesis",
-        "observations", "decision", "reason",
+        "observations", "decision", "reason", "request_id", "input_id",
+        "parent_input_id", "target_commit", "agent_claims", "machine_evidence",
+        "association",
     }
     bounded = {key: value.get(key) for key in allowed if key in value}
     # Early dynamic agents emitted the same fields with a shorter schema:
@@ -2932,13 +3207,18 @@ def _bound_iteration(value: dict) -> dict:
             fallback_reason = "; ".join(str(item) for item in fallback_reason[:20])
         if fallback_reason:
             bounded["reason"] = str(fallback_reason)[:4_000]
-    for key in ("hypothesis", "observations"):
+    for key in (
+        "hypothesis", "observations", "agent_claims", "machine_evidence",
+    ):
         if isinstance(bounded.get(key), dict):
             bounded[key] = {
                 str(k)[:100]: _bound_json_value(v)
                 for k, v in list(bounded[key].items())[:50]
             }
-    for key in ("reason", "decision"):
+    for key in (
+        "reason", "decision", "request_id", "input_id", "parent_input_id",
+        "target_commit", "association",
+    ):
         if key in bounded:
             bounded[key] = str(bounded[key])[:4_000]
     try:
