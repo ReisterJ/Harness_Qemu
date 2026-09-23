@@ -94,12 +94,15 @@ def test_dynamic_prompt_contains_candidate_and_no_static_result_is_grade_input()
 
 
 def test_crash_poc_kind_aliases_are_normalized_to_file():
+    assert _normalize_poc_kind("ruby", "asan") == "file"
+    assert _normalize_poc_kind("python", "asan") == "file"
     assert _normalize_poc_kind("ruby_source", "asan") == "file"
     assert _normalize_poc_kind("ruby_source_via_mrb_load_string", "asan") == "file"
     assert _normalize_poc_kind("shell_script", "asan") == "file"
     assert _normalize_poc_kind("raw-binary", "asan") == "file"
     assert _normalize_poc_kind("program", "asan") == "program"
     assert _normalize_poc_kind("ruby_source", "logic") == "ruby_source"
+    assert _normalize_poc_kind("ruby", "logic") == "ruby"
     assert _normalize_poc_kind("ruby_source_via_mrb_load_string", "logic") == "ruby_source_via_mrb_load_string"
 
 
@@ -351,7 +354,7 @@ def test_dynamic_validation_parses_logic_submission(monkeypatch):
     candidate = _finding()
     message = """<dynamic_status>validated</dynamic_status>
 <candidate_id>candidate_001</candidate_id>
-<reached_functions>xmlXIncludeLoadTxt,xmlNodeAddContentLen</reached_functions>
+<reached_functions>prompt text accidentally copied into metadata</reached_functions>
 <reachability_evidence>public XML XInclude input</reachability_evidence>
 <poc_path>/tmp/poc.sh</poc_path>
 <reproduction_command>sh /tmp/poc.sh</reproduction_command>
@@ -432,6 +435,7 @@ def test_dynamic_validation_normalizes_crash_label_to_file_poc(monkeypatch):
     )
     message = """<dynamic_status>validated</dynamic_status>
 <candidate_id>candidate_001</candidate_id>
+<reached_functions>quoted prompt text, not runtime evidence</reached_functions>
 <poc_path>/work/poc.rb</poc_path>
 <reproduction_command>/out/mruby_fuzzer /work/poc.rb</reproduction_command>
 <poc_kind>crash</poc_kind>
@@ -492,6 +496,7 @@ def test_dynamic_validation_normalizes_crash_label_to_file_poc(monkeypatch):
     assert outcome.crash is not None
     assert outcome.crash.poc_kind == "file"
     assert outcome.crash.poc_bytes == b"puts 'trigger'\n"
+    assert outcome.reached_functions == []
 
 
 def _fake_agent_result(message: str) -> AgentResult:

@@ -344,11 +344,15 @@ async def run_dynamic_validation(
                     reason=crash_xml_error or "invalid crash result file",
                 ), result, timings
             if crash_xml_present:
+                # The XML file is the authoritative crash submission. Keep
+                # textual reachability evidence as context, but do not treat
+                # inline reached_functions as execution evidence: a previous
+                # assistant message can contain copied prompt text or stale
+                # metadata. Actual instrumentation evidence is appended below.
                 result_data = dict(inline_data)
                 result_data.update(crash_data or {})
-                result_data["dynamic_status"] = (
-                    result_data["dynamic_status"] or "validated"
-                )
+                result_data["reached_functions"] = ""
+                result_data["dynamic_status"] = "validated"
             else:
                 if inline_data["poc_path"]:
                     return dynamic_result(
@@ -2513,7 +2517,7 @@ def _normalize_poc_kind(value: str, detector: str) -> str:
         or kind in {"raw-binary", "raw_binary", "binary", "raw_file"}
         or kind in {
             "crash", "input", "raw_input", "ruby_source", "python_source",
-            "shell_script", "script",
+            "ruby", "python", "shell", "shell_script", "script",
         }
     ):
         return "file"
