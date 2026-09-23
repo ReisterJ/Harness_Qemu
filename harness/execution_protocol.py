@@ -214,9 +214,11 @@ def protocol_readme(*, symbolic_enabled: bool) -> bytes:
         if symbolic_enabled else "Only the ordinary target is run."
     )
     feedback = (
-        f"For a request id, check `{FEEDBACK_READER_PATH} round-001` when convenient. It returns "
+        "A later run-input response includes a `ready_feedback` array for earlier jobs that "
+        "finished since your previous submission; review it before choosing the next input. "
+        f"For an individual request, `{FEEDBACK_READER_PATH} round-001` remains available and returns "
         "`pending` immediately if the background job is still running. Do not poll in a tight loop "
-        "or wait on it; continue source analysis and input work, then check again at a useful decision point. "
+        "or wait on it; continue source analysis and input work. "
         "At most two SymCC jobs run concurrently; an input submitted above that limit is marked "
         "`skipped_busy` and will not have feedback."
         if symbolic_enabled else ""

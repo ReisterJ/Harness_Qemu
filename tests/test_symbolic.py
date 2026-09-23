@@ -95,6 +95,8 @@ def test_prebuilt_symcc_protocol_is_the_final_dynamic_prompt_override():
         },
     )
     assert "queues the prebuilt SymCC execution in the background" in prompt
+    assert "its response may include `ready_feedback`" in prompt
+    assert "Review and use those results" in prompt
     assert "read-feedback" in prompt
     assert "`skipped_busy` means" in prompt and "no feedback for that request" in prompt
     assert "If the reader returns `pending`, do" in prompt

@@ -571,6 +571,11 @@ static CFG/call-graph heuristic, never a proof of reachability or
 non-reachability. If an input reaches the target, continue source reasoning and
 clean-target tests to derive the crash/invalid-effect condition; a site hit is
 not a PoC.
+When you submit a later input, its response may include `ready_feedback` for
+earlier SymCC jobs that completed asynchronously. Review and use those results
+before deciding the next input; the original response is not rewritten after
+the job finishes. `ready_feedback` is a nonblocking delivery mechanism, not a
+reason to wait before continuing.
 Configured SymCC arguments are
 `{json.dumps(context.get('symcc_program_args', ['{input_file}']), ensure_ascii=False)}`.
 

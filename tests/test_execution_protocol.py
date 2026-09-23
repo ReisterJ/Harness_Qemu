@@ -9,6 +9,7 @@ from harness import docker_ops
 from harness.artifacts import StaticFinding
 from harness.config import TargetConfig
 from harness.dynamic_validation import (
+    _compact_protocol_feedback,
     _execute_prebuilt_protocol_request,
     _prebuilt_protocol_worker,
     _prepare_prebuilt_symcc_protocol,
@@ -21,6 +22,7 @@ from harness.execution_protocol import (
     ExecutionRequestError,
     parse_request,
     protocol_feedback_reader_script,
+    protocol_readme,
     target_argv,
 )
 from harness.symbolic.feedback import (
@@ -324,12 +326,168 @@ def test_prebuilt_protocol_returns_clean_result_while_symcc_runs_in_background(
     asyncio.run(exercise())
 
 
+def test_compact_protocol_feedback_keeps_facts_and_bounds_observations():
+    record = {
+        "request_id": "round-001",
+        "input_id": "a" * 64,
+        "feedback_status": "ready",
+        "clean": {"status": "completed", "exit_code": 0, "sanitizer_event": False},
+        "symcc": {"status": "completed", "duration_s": 1.2, "testcase_count": 10,
+                  "stderr": "large solver log"},
+        "symcc_observation": {
+            "trace_status": "completed", "target_reached": False,
+            "target_reachability": "this_execution_missed", "distance": 7,
+            "distance_is_heuristic": True,
+            "observed_locations": [{"line": line} for line in range(30)],
+        },
+        "generated_replays": [
+            {
+                "path": f"/work/validation/inputs/seed-{index}",
+                "size": 4,
+                "sha256": str(index),
+                "replay": {"status": "completed", "exit_code": 0,
+                           "sanitizer_event": False, "stdout": "unbounded"},
+                "symcc_observation": {
+                    "trace_status": "completed", "target_reached": False,
+                    "distance": 7,
+                },
+            }
+            for index in range(10)
+        ],
+    }
+    compact = _compact_protocol_feedback(record)
+    assert compact["symcc_observation"]["target_reached"] is False
+    assert compact["symcc_observation"]["distance_is_heuristic"] is True
+    assert compact["symcc_observation"]["observed_location_count"] == 30
+    assert len(compact["symcc_observation"]["observed_locations"]) == 16
+    assert len(compact["generated_replays"]) == 8
+    assert "stderr" not in compact["symcc"]
+    assert "stdout" not in compact["generated_replays"][0]["clean_replay"]
+
+
+def test_next_protocol_response_auto_delivers_completed_symcc_feedback(monkeypatch):
+    target = _target()
+    writes = {}
+    pending_ids = ["round-001"]
+    pending_lock = threading.Lock()
+    responses_written = {request_id: threading.Event() for request_id in (
+        "round-001", "round-002"
+    )}
+    feedback_written = {request_id: threading.Event() for request_id in (
+        "round-001", "round-002"
+    )}
+    request_values = {
+        request_id: _request(
+            request_id=request_id,
+            input_path=f"{INPUT_ROOT}/candidate.bin",
+            parent_input_id="round-001" if request_id == "round-002" else None,
+        )
+        for request_id in ("round-001", "round-002")
+    }
+
+    def fake_exec(_container, command, timeout=0):
+        if command.startswith(f"find {PENDING_ROOT}"):
+            with pending_lock:
+                listing = "".join(f"{PENDING_ROOT}/{item}.json\n" for item in pending_ids)
+            return 0, listing, ""
+        if command.startswith("readlink -f"):
+            return 0, f"{INPUT_ROOT}/candidate.bin\n", ""
+        if command.startswith("stat -c"):
+            return 0, "4\n", ""
+        if command.startswith("test -f"):
+            return 0, "", ""
+        if command.startswith("timeout --signal=KILL"):
+            return 0, "clean target complete", ""
+        if command.startswith(f"mv -- {PENDING_ROOT}/"):
+            request_id = command.rsplit("/", 1)[-1].removesuffix(".json")
+            with pending_lock:
+                if request_id in pending_ids:
+                    pending_ids.remove(request_id)
+            return 0, "", ""
+        if command.startswith("mv -- ") and ".tmp " in command:
+            source, destination = command.removeprefix("mv -- ").split(" ", 1)
+            writes[destination] = writes.pop(source)
+            if destination.startswith(FEEDBACK_ROOT + "/"):
+                request_id = destination.rsplit("/", 1)[-1].removesuffix(".json")
+                feedback_written[request_id].set()
+            return 0, "", ""
+        return 0, "", ""
+
+    def fake_read(_container, path):
+        if path.startswith(PENDING_ROOT + "/"):
+            request_id = path.rsplit("/", 1)[-1].removesuffix(".json")
+            return json.dumps(request_values[request_id]).encode()
+        if path == f"{INPUT_ROOT}/candidate.bin":
+            return b"seed"
+        return b""
+
+    def fake_write(_container, path, data):
+        writes[path] = data
+        if path.startswith(RESPONSE_ROOT + "/"):
+            request_id = path.rsplit("/", 1)[-1].removesuffix(".json")
+            responses_written[request_id].set()
+
+    def fake_symcc(**job_args):
+        request = job_args["job"]["request"]
+        return {
+            "schema_version": 1,
+            "protocol": "dynamic-execution",
+            "status": "completed",
+            "request_id": request.request_id,
+            "round_id": job_args["job"]["round_id"],
+            "input_id": job_args["job"]["input_id"],
+            "target_commit": target.commit,
+            "clean": job_args["job"]["clean"],
+            "symcc": {"status": "completed", "duration_s": 1.0,
+                      "testcase_count": 1},
+            "symcc_observation": {
+                "trace_status": "completed", "trace_complete": True,
+                "target_reached": True, "target_reachability": "this_execution_hit",
+                "distance": 0, "distance_is_heuristic": True,
+            },
+            "generated_replays": [],
+        }
+
+    monkeypatch.setattr(docker_ops, "exec_sh", fake_exec)
+    monkeypatch.setattr(docker_ops, "read_file", fake_read)
+    monkeypatch.setattr(docker_ops, "write_file", fake_write)
+    monkeypatch.setattr(
+        "harness.dynamic_validation._execute_prebuilt_protocol_symcc_request",
+        fake_symcc,
+    )
+
+    async def exercise():
+        stop = asyncio.Event()
+        worker = asyncio.create_task(_prebuilt_protocol_worker(
+            container="target", target=target, stop=stop, result_path=None,
+        ))
+        assert await asyncio.to_thread(responses_written["round-001"].wait, 3)
+        assert await asyncio.to_thread(feedback_written["round-001"].wait, 3)
+
+        with pending_lock:
+            pending_ids.append("round-002")
+        assert await asyncio.to_thread(responses_written["round-002"].wait, 3)
+        response = json.loads(writes[f"{RESPONSE_ROOT}/round-002.json"])
+        assert response["ready_feedback"][0]["request_id"] == "round-001"
+        assert response["ready_feedback"][0]["symcc_observation"]["target_reached"] is True
+        assert response["ready_feedback"][0]["symcc_observation"]["distance"] == 0
+        assert await asyncio.to_thread(feedback_written["round-002"].wait, 3)
+
+        stop.set()
+        summary = await asyncio.wait_for(worker, timeout=3)
+        assert summary["feedback_auto_delivered"] == 1
+        assert summary["requests"] == 2
+
+    asyncio.run(exercise())
+
+
 def test_feedback_reader_is_nonblocking_and_validates_request_id():
     script = protocol_feedback_reader_script().decode()
     assert '"status":"pending"' in script
     assert "sleep" not in script
     assert '[ "${#id}" -le 80 ]' in script
     assert "read-feedback REQUEST_ID" in script
+    assert "ready_feedback" in protocol_readme(symbolic_enabled=True).decode()
 
 
 def test_protocol_worker_does_not_wait_for_unused_symcc_after_agent_finishes(

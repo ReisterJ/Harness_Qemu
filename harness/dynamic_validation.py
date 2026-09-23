@@ -1901,6 +1901,76 @@ def _execute_prebuilt_protocol_request(
     )
 
 
+def _compact_protocol_feedback(record: dict[str, Any]) -> dict[str, Any]:
+    """为下一次 agent 请求准备紧凑的异步反馈，不复制原始求解器日志。"""
+    def compact_observation(value: Any) -> dict[str, Any] | None:
+        if not isinstance(value, dict):
+            return None
+        keys = (
+            "status", "trace_status", "trace_complete", "trace_truncated",
+            "target_ids_configured", "target_ids_valid", "target_reached",
+            "target_reachability", "observed_block_count", "distance",
+            "distance_kind", "distance_is_heuristic", "distance_note",
+            "closest_observed_location", "unresolved_call_count", "reason",
+        )
+        compact = {key: value[key] for key in keys if key in value}
+        locations = value.get("observed_locations")
+        if isinstance(locations, list):
+            compact["observed_locations"] = locations[:16]
+            compact["observed_location_count"] = len(locations)
+        return compact
+
+    clean = record.get("clean") if isinstance(record.get("clean"), dict) else {}
+    symcc = record.get("symcc") if isinstance(record.get("symcc"), dict) else {}
+    generated = record.get("generated_replays")
+    compact_generated: list[dict[str, Any]] = []
+    if isinstance(generated, list):
+        for item in generated[:8]:
+            if not isinstance(item, dict):
+                continue
+            replay = item.get("replay") if isinstance(item.get("replay"), dict) else {}
+            compact_generated.append({
+                "path": item.get("path"),
+                "size": item.get("size"),
+                "sha256": item.get("sha256"),
+                "clean_replay": {
+                    key: replay[key] for key in
+                    ("status", "exit_code", "sanitizer_event") if key in replay
+                },
+                "symcc_observation": compact_observation(
+                    item.get("symcc_observation")
+                ),
+            })
+
+    compact: dict[str, Any] = {
+        "schema_version": 1,
+        "request_id": record.get("request_id"),
+        "round_id": record.get("round_id"),
+        "input_id": record.get("input_id"),
+        "input_sha256": record.get("input_sha256"),
+        "parent_input_id": record.get("parent_input_id"),
+        "target_commit": record.get("target_commit"),
+        "feedback_status": record.get("feedback_status"),
+        "clean": {
+            key: clean[key] for key in
+            ("status", "exit_code", "sanitizer_event") if key in clean
+        },
+        "symcc": {
+            key: symcc[key] for key in
+            ("status", "duration_s", "testcase_count", "errors") if key in symcc
+        },
+        "symcc_observation": compact_observation(
+            record.get("symcc_observation")
+        ),
+        "generated_replays": compact_generated,
+    }
+    if record.get("feedback_error"):
+        compact["feedback_error"] = str(record["feedback_error"])[:500]
+    if record.get("error"):
+        compact["error"] = str(record["error"])[:500]
+    return compact
+
+
 async def _prebuilt_protocol_worker(
     *, container: str, target: TargetConfig, stop: asyncio.Event,
     result_path: str | None,
@@ -1914,11 +1984,29 @@ async def _prebuilt_protocol_worker(
         "processed": 0, "invalid": 0, "errors": 0,
         "symcc_errors": 0, "symcc_skipped_busy": 0,
         "symcc_abandoned": 0, "symcc_duration_s": 0.0,
+        "feedback_auto_delivered": 0,
     }
+    feedback_delivered: set[str] = set()
     command = (
         f"find {shlex.quote(PENDING_ROOT)} -maxdepth 1 -type f "
         "-name '*.json' -print | sort"
     )
+
+    def attach_ready_feedback(response: dict[str, Any]) -> list[str]:
+        """把此前完成的异步结果压缩后附加到下一次请求响应。"""
+        ready = [
+            record for record in records
+            if record.get("request_id") not in feedback_delivered
+            and record.get("feedback_status") in {"ready", "publish_error"}
+        ]
+        response["ready_feedback"] = [
+            _compact_protocol_feedback(record) for record in ready
+        ]
+        return [str(record["request_id"]) for record in ready if record.get("request_id")]
+
+    def mark_feedback_delivered(request_ids: list[str]) -> None:
+        feedback_delivered.update(request_ids)
+        stats["feedback_auto_delivered"] += len(request_ids)
 
     async def run_feedback_job(job: dict[str, Any], record: dict[str, Any]) -> None:
         request: ExecutionRequest = job["request"]
@@ -2011,6 +2099,7 @@ async def _prebuilt_protocol_worker(
                         }
                         job = None
                         stats["symcc_skipped_busy"] += 1
+                    delivered_ids = attach_ready_feedback(response)
                     records.append(response)
                     stats["processed"] += 1
                     await asyncio.to_thread(
@@ -2018,6 +2107,7 @@ async def _prebuilt_protocol_worker(
                         f"{RESPONSE_ROOT}/{name}",
                         (json.dumps(response, indent=2, ensure_ascii=False) + "\n").encode(),
                     )
+                    mark_feedback_delivered(delivered_ids)
                     await asyncio.to_thread(
                         docker_ops.exec_sh, container,
                         f"mv -- {shlex.quote(path)} {shlex.quote(PROCESSED_ROOT + '/' + name)}",
@@ -2035,6 +2125,7 @@ async def _prebuilt_protocol_worker(
                         "request_file": name,
                         "errors": [f"{type(exc).__name__}: {exc}"],
                     }
+                    delivered_ids = attach_ready_feedback(response)
                     records.append(response)
                     try:
                         await asyncio.to_thread(
@@ -2042,6 +2133,7 @@ async def _prebuilt_protocol_worker(
                             f"{RESPONSE_ROOT}/{name}",
                             (json.dumps(response, indent=2) + "\n").encode(),
                         )
+                        mark_feedback_delivered(delivered_ids)
                         await asyncio.to_thread(
                             docker_ops.exec_sh, container,
                             f"mv -- {shlex.quote(path)} {shlex.quote(PROCESSED_ROOT + '/' + name)}",
@@ -2077,6 +2169,7 @@ async def _prebuilt_protocol_worker(
         "errors": stats["errors"], "symcc_errors": stats["symcc_errors"],
         "symcc_skipped_busy": stats["symcc_skipped_busy"],
         "symcc_abandoned": stats["symcc_abandoned"],
+        "feedback_auto_delivered": stats["feedback_auto_delivered"],
         "symcc_execution_s": round(stats["symcc_duration_s"], 3),
         "records": records,
     }
