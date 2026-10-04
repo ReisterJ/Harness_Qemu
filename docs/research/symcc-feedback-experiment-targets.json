@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "description": "Targets selected for SymCC feedback stabilization paired experiments. Ready targets have a target config, prebuilt SymCC configuration, and a static report suitable for dynamic-pairs.",
+  "default_command_template": ".venv/bin/python -m harness.cli dynamic-pairs {target_path} --static-report {static_report} --model deepseek-flash --runs 3 --phase-timeout 3600 --max-iterations 8 --results-dir results/experiments --experiment-name {experiment_name} --dangerously-no-sandbox",
+  "targets": [
+    {
+      "id": "mruby-57672",
+      "label": "MRuby ARVO 57672 environment write-barrier UAF",
+      "target_path": "targets/mruby-arvo-feedback",
+      "static_report": "targets/mruby-arvo-feedback/static-report-57672-v2.json",
+      "status": "ready",
+      "category": "complex object lifetime / GC state",
+      "reason": "Known complex lifecycle case used for feedback-stabilization smoke tests; has precise target_operation anchor and prebuilt source-location feedback map.",
+      "experiment_name": "mruby-57672-feedback-paired"
+    },
+    {
+      "id": "arvo-62290",
+      "label": "ARVO 62290 SVC inter-layer prediction candidate",
+      "target_path": "targets/arvo-62290-experiment",
+      "static_report": "results/experiments/symcc-target-site-feedback-20260924/shared/arvo-62290-static-report.json",
+      "status": "ready",
+      "category": "video decoder state / additional-crash noise",
+      "reason": "Previously exposed target-anchor, PIE/noise, and additional-crash issues; useful for testing failure-category and additional-finding handling.",
+      "experiment_name": "arvo-62290-feedback-paired"
+    },
+    {
+      "id": "arvo-38283",
+      "label": "ARVO 38283 FreeRADIUS TACACS decoder",
+      "target_path": "results/experiments/cybergym-symcc-followup-20260928/targets/arvo-38283",
+      "static_report": "results/experiments/cybergym-symcc-followup-20260928/targets/arvo-38283/static_analysis.json",
+      "status": "ready",
+      "category": "protocol parser structured input",
+      "reason": "CyberGym/ARVO target with prebuilt SymCC binary and feedback map; broadens sample set beyond MRuby/libavc.",
+      "experiment_name": "arvo-38283-feedback-paired"
+    },
+    {
+      "id": "arvo-55020",
+      "label": "ARVO 55020 binutils COFF AArch64 relocation",
+      "target_path": "results/experiments/cybergym-symcc-followup-20260928/targets/arvo-55020",
+      "static_report": "results/experiments/cybergym-symcc-followup-20260928/targets/arvo-55020/static_analysis.json",
+      "status": "ready",
+      "category": "binary format / relocation handling",
+      "reason": "CyberGym/ARVO target with prebuilt SymCC binary and feedback map; exercises a different input domain and target codebase.",
+      "experiment_name": "arvo-55020-feedback-paired"
+    },
+    {
+      "id": "ghostscript-51089",
+      "label": "Ghostscript TYPE 2 charstring operand stack",
+      "target_path": "targets/ghostscript-type2-51089-manual",
+      "static_report": "results/experiments/ghostscript-type2-51089/static-report.json",
+      "status": "deferred",
+      "category": "structured PostScript / font interpreter",
+      "reason": "Useful case study, but current target config uses a manual/build-style SymCC setup rather than the stabilized prebuilt feedback contract; keep out of the first controlled dynamic-pairs batch."
+    }
+  ]
+}

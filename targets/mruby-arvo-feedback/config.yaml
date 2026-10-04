@@ -1,0 +1,17 @@
+# MRuby ARVO 57672 target with prebuilt SymCC source-location feedback.
+image_tag: local/arvo-57672-site-feedback-nogit:20260924-sitefix1
+github_url: https://github.com/mruby/mruby
+commit: 2de602b8696bc21e4cbc2c6e08e2fae27b1ad79b
+binary_path: /out/mruby_fuzzer
+source_root: /src/mruby
+detector: asan
+memory_limit: 4g
+symbolic_execution:
+  default: off
+  providers:
+    - symcc
+  symcc:
+    binary_path: /out/mruby_fuzzer_symcc
+    commit: 2de602b8696bc21e4cbc2c6e08e2fae27b1ad79b
+    feedback_map_path: /out/symcc-feedback-map.jsonl
+    feedback_capacity: 1000000

@@ -31,6 +31,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass, field
+from typing import Callable
 
 from . import docker_ops
 
@@ -204,6 +205,14 @@ class AgentResult:
         return [_truncate_event(m) for m in self.messages]
 
 
+class _AgentProgressNudge(Exception):
+    """Internal control-flow exception for resuming with a corrective prompt."""
+
+    def __init__(self, prompt: str):
+        super().__init__(prompt)
+        self.prompt = prompt
+
+
 def _is_unbounded_helper_process(line: str) -> bool:
     """Whether a process line looks like an ad-hoc local test service.
 
@@ -273,8 +282,8 @@ async def _agent_watchdog(
     activity: dict[str, float],
     state: dict[str, str | None],
     *,
-    phase_timeout_s: float,
-    idle_timeout_s: float,
+    phase_timeout_s: float | None,
+    idle_timeout_s: float | None,
     helper_timeout_s: float,
     interval_s: float,
 ) -> None:
@@ -282,15 +291,15 @@ async def _agent_watchdog(
 
     ``opencode`` does not expose a model-request timeout.  The stream watcher
     therefore distinguishes a quiet model request (no child tool process) from
-    a quiet Bash command by probing the container process table.  Unbounded
-    ad-hoc helper servers get a shorter dedicated deadline, while a bounded
-    command can use the full 1800-second phase budget.
+    a quiet Bash command by probing the container process table.  Phase and
+    idle deadlines are optional; the separate helper deadline still catches
+    unbounded ad-hoc helper servers.
     """
     helper_since: float | None = None
     while proc.returncode is None:
         await asyncio.sleep(max(0.05, interval_s))
         now = time.monotonic()
-        if now - activity["started"] > phase_timeout_s:
+        if phase_timeout_s is not None and now - activity["started"] > phase_timeout_s:
             state["error"] = (
                 f"agent/model_blocked: phase exceeded {phase_timeout_s:.0f}s"
             )
@@ -311,11 +320,15 @@ async def _agent_watchdog(
             elif processes:
                 # A normal target command (for example a bounded curl or
                 # QEMU invocation) is still active.  It may legitimately be
-                # quiet for a while; the phase deadline remains the bound.
+                # quiet for a while; an explicitly configured phase deadline
+                # remains the bound.
                 helper_since = None
             else:
                 helper_since = None
-                if now - activity["last_event"] > idle_timeout_s:
+                if (
+                    idle_timeout_s is not None
+                    and now - activity["last_event"] > idle_timeout_s
+                ):
                     state["error"] = (
                         "agent/model_blocked: no streamed agent event and no active "
                         f"tool process for {idle_timeout_s:.0f}s"
@@ -468,13 +481,16 @@ async def run_agent(
     progress_prefix: str | None = None,
     tools: list[str] | None = None,
     system_prompt: str | None = None,
-    phase_timeout_s: float = 1800.0,
-    # A quiet model request may legitimately take as long as the phase.  The
-    # separate helper deadline still prevents an unbounded local server from
-    # consuming that entire budget.
-    idle_timeout_s: float = 1800.0,
+    # Other phases retain the historical watchdog by default. Dynamic
+    # validation passes None unless the user explicitly supplies a deadline.
+    phase_timeout_s: float | None = 1800.0,
+    # A quiet model request may legitimately take as long as the phase. The
+    # helper deadline independently catches an unbounded local server.
+    idle_timeout_s: float | None = 1800.0,
     helper_timeout_s: float = 120.0,
     watchdog_interval_s: float = 5.0,
+    progress_nudge: Callable[[AgentResult], str | None] | None = None,
+    completion_predicate: Callable[[AgentResult], bool] | None = None,
 ) -> AgentResult:
     """Run an opencode agent session inside ``container``.
 
@@ -618,6 +634,20 @@ async def run_agent(
                             and (tool_call_count + assistant_count) > 0:
                         print(f"  [agent] {tool_call_count} tool calls "
                               f"({assistant_count} msgs)")
+                    if (
+                        completion_predicate is not None
+                        and completion_predicate(result)
+                    ):
+                        if proc.returncode is None:
+                            proc.terminate()
+                            with contextlib.suppress(Exception):
+                                await proc.wait()
+                        result.result_message = last_event
+                        return result
+                    if progress_nudge is not None:
+                        nudge = progress_nudge(result)
+                        if nudge:
+                            raise _AgentProgressNudge(nudge)
 
                 rc = await proc.wait()
                 if result.messages:
@@ -664,6 +694,27 @@ async def run_agent(
                         )
                         continue
                 return result
+
+            except _AgentProgressNudge as e:
+                if proc.returncode is None:
+                    proc.terminate()
+                    with contextlib.suppress(Exception):
+                        await proc.wait()
+                attempt += 1
+                if result.session_id is None or attempt > max_resume_attempts:
+                    result.error = (
+                        "agent/model_blocked: progress nudge could not resume "
+                        "the session"
+                    )
+                    return result
+                result.resume_count = attempt
+                prompt = e.prompt
+                print(
+                    f"[agent] progress nudge after {tool_call_count} tool calls "
+                    f"— resuming session {result.session_id}",
+                    file=sys.stderr,
+                )
+                continue
 
             except Exception as e:
                 if watchdog_state["error"]:

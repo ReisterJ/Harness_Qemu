@@ -72,6 +72,7 @@ async def run_find(
     symbolic_execution: str | None = None,
     symbolic_execution_result_path: str | None = None,
     max_iterations: int = DEFAULT_DYNAMIC_MAX_ITERATIONS,
+    phase_timeout_s: float | None = None,
 ) -> FindPhaseResult:
     """Run static analysis followed by dynamic validation.
 
@@ -172,6 +173,7 @@ async def run_find(
             if dynamic_result_path else None
         ),
         max_iterations=max_iterations,
+        phase_timeout_s=phase_timeout_s,
     )
     timings.update(dynamic_timings)
     timings["find"] = timings.get("static_analysis", 0.0) + timings.get(

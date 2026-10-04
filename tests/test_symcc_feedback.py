@@ -108,6 +108,11 @@ def test_trace_reports_exact_hit_and_heuristic_distance_separately():
         "source_file": "src/parser.c", "source_function": "parse",
         "line": 10, "column": 1,
     }]
+    assert result["observed_location_count"] == 1
+    assert result["observed_locations_ordered"] is False
+    assert result["observed_locations_selection"] == (
+        "target_function_then_target_file_then_other_sites"
+    )
 
     hit = summarize_trace(
         graph, parse_trace(_trace([(200, 1), (2000, 2)], target=True)),
@@ -116,6 +121,43 @@ def test_trace_reports_exact_hit_and_heuristic_distance_separately():
     assert hit["target_reached"] is True
     assert hit["target_reachability"] == "this_execution_hit"
     assert hit["distance"] == 0
+
+
+def test_actual_target_context_locations_are_prioritized_without_graph_distance():
+    graph = _map()
+    events = []
+    for index in range(260):
+        block_id = 10_000 + index
+        location_id = 20_000 + index
+        graph["nodes"][block_id] = {
+            "id": block_id, "function": f"startup_{index}",
+            "source_file": f"src/init_{index}.c",
+        }
+        graph["locations"][location_id] = {
+            "id": location_id, "source_file": f"src/init_{index}.c",
+            "source_function": f"startup_{index}", "line": 5,
+            "column": 1, "block_id": block_id,
+        }
+        graph["successors"][block_id] = set()
+        events.extend([(block_id, 1), (location_id, 2)])
+    events.extend([(100, 1), (1000, 2)])
+    marker_ids, target_blocks = resolve_target_ids(
+        graph, {"targets": [{"source_file": "src/parser.c", "line": 20}]}
+    )
+
+    result = summarize_trace(
+        graph,
+        parse_trace(_trace(events, complete=True)),
+        marker_ids=marker_ids,
+        target_block_ids=target_blocks,
+    )
+
+    assert result["observed_location_count"] == 261
+    assert len(result["observed_locations"]) == 256
+    assert result["observed_locations_limited"] is True
+    assert result["observed_locations"][0]["source_function"] == "parse"
+    assert result["observed_locations_ordered"] is False
+    assert result["target_reached"] is False
 
 
 def test_interrupted_run_without_target_hit_is_unknown_not_negative():
@@ -152,6 +194,27 @@ def test_basic_block_distance_zero_does_not_imply_exact_line_hit():
     assert "does not prove an exact source-line marker" in result["distance_note"]
 
 
+def test_function_only_target_is_not_an_exact_operation_hit():
+    graph = _map()
+    marker_ids, target_blocks = resolve_target_ids(
+        graph,
+        {"targets": [{"function": "parse"}]},
+    )
+    result = summarize_trace(
+        graph,
+        parse_trace(_trace([(100, 1)], target=True, complete=True)),
+        marker_ids=marker_ids,
+        target_block_ids=target_blocks,
+    )
+    assert result["target_anchor_granularity"] == "basic_block_or_function"
+    assert result["target_function_entered"] is True
+    assert result["target_block_entered"] is True
+    assert result["exact_target_reached"] is None
+    assert result["target_operation_reached"] is None
+    assert result["target_reached"] is None
+    assert "no precise source-location operation marker" in result["allowed_conclusion"]
+
+
 def test_runtime_target_flag_preserves_positive_hit_when_trace_truncated():
     graph = _map()
     marker_ids, target_blocks = resolve_target_ids(
@@ -164,6 +227,7 @@ def test_runtime_target_flag_preserves_positive_hit_when_trace_truncated():
         target_block_ids=target_blocks,
     )
     assert result["target_reached"] is True
+    assert result["exact_target_reached"] is True
 
 
 def test_truncated_trace_without_target_hit_is_unknown_not_a_false_miss():

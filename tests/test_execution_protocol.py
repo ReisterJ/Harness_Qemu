@@ -7,12 +7,23 @@ from pathlib import Path
 import pytest
 
 from harness import docker_ops
+from harness.agent import AgentResult
 from harness.artifacts import StaticFinding
 from harness.config import TargetConfig
 from harness.dynamic_validation import (
+    _agent_tool_calls_before_timestamp_ms,
+    _annotate_first_request_policy,
     _compact_protocol_feedback,
     _execute_prebuilt_protocol_request,
+    _execution_protocol_request_ids,
+    _prebuilt_first_request_nudge,
+    _prebuilt_feedback_followup_nudge,
+    _prebuilt_feedback_ready_nudge,
+    _prebuilt_progress_nudge,
+    _prebuilt_protocol_evidence_ledger,
+    _prebuilt_protocol_metrics,
     _prebuilt_protocol_worker,
+    _prepare_iteration_workspace,
     _prepare_prebuilt_symcc_protocol,
     _run_protocol_binary,
     _symcc_sidecar_settings,
@@ -20,8 +31,10 @@ from harness.dynamic_validation import (
 from harness import dynamic_validation
 from harness.execution_protocol import (
     FEEDBACK_ROOT,
+    FEEDBACK_READ_LOG,
     INPUT_ROOT,
     PENDING_ROOT,
+    PROCESSED_ROOT,
     RESPONSE_ROOT,
     SNAPSHOT_ROOT,
     ExecutionRequestError,
@@ -70,6 +83,22 @@ def _target():
                 "program_args": ["--input", "{input_file}"],
             }
         },
+    )
+
+
+def _finding(candidate_id="candidate_001"):
+    return StaticFinding(
+        candidate_id=candidate_id,
+        bug_class="heap-use-after-free",
+        location="src/vm.c:398",
+        static_call_chain="main -> target",
+        entry_points="fuzzer input",
+        attacker_controlled_data="bytes",
+        reachability_evidence="static report",
+        required_conditions="condition",
+        root_cause="root",
+        verification_plan="run target",
+        confidence=0.8,
     )
 
 
@@ -365,8 +394,12 @@ def test_protocol_returns_exact_target_hit_and_source_distance_per_input(monkeyp
     assert response["parent_input_id"] == "round-000"
     assert response["target_commit"] == target.commit
     assert response["site_reached"] is True
+    assert response["symcc_observation"]["feedback_schema_version"] == 2
+    assert response["symcc_observation"]["exact_target_reached"] is True
+    assert response["symcc_observation"]["target_operation_reached"] is True
     assert response["symcc_observation"]["distance"] == 0
     assert response["generated_replays"][0]["symcc_observation"]["target_reached"] is True
+    assert response["generated_replays"][0]["symcc_observation"]["exact_target_reached"] is True
     assert any(
         call["extra_env"].get("SYMCC_FEEDBACK_TARGET_IDS") == "2000"
         for call in binary_calls
@@ -484,10 +517,20 @@ def test_compact_protocol_feedback_keeps_facts_and_bounds_observations():
         "symcc": {"status": "completed", "duration_s": 1.2, "testcase_count": 10,
                   "stderr": "large solver log"},
         "symcc_observation": {
-            "trace_status": "completed", "target_reached": False,
+            "feedback_schema_version": 2,
+            "trace_status": "completed",
+            "exact_target_reached": False,
+            "target_operation_reached": False,
+            "target_function_entered": True,
+            "target_block_entered": True,
+            "target_reached": False,
             "target_reachability": "this_execution_missed", "distance": 7,
             "distance_is_heuristic": True,
-            "observed_locations": [{"line": line} for line in range(30)],
+            "allowed_conclusion": "entered target code but missed operation",
+            "observed_location_count": 40,
+            "observed_locations_limited": False,
+            "observed_locations_ordered": False,
+            "observed_locations": [{"line": line} for line in range(40)],
         },
         "generated_replays": [
             {
@@ -497,28 +540,109 @@ def test_compact_protocol_feedback_keeps_facts_and_bounds_observations():
                 "replay": {"status": "completed", "exit_code": 0,
                            "sanitizer_event": False, "stdout": "unbounded"},
                 "symcc_observation": {
-                    "trace_status": "completed", "target_reached": False,
+                    "feedback_schema_version": 2,
+                    "trace_status": "completed",
+                    "exact_target_reached": False,
+                    "target_operation_reached": False,
+                    "target_reached": False,
                     "distance": 7,
-                    "observed_locations": [{"line": line} for line in range(30)],
+                    "allowed_conclusion": "generated seed missed operation",
+                    "observed_location_count": 40,
+                    "observed_locations_limited": False,
+                    "observed_locations_ordered": False,
+                    "observed_locations": [{"line": line} for line in range(40)],
                 },
             }
             for index in range(10)
         ],
     }
     compact = _compact_protocol_feedback(record)
+    assert compact["symcc_observation"]["feedback_schema_version"] == 2
+    assert compact["symcc_observation"]["exact_target_reached"] is False
+    assert compact["symcc_observation"]["target_operation_reached"] is False
+    assert compact["symcc_observation"]["target_function_entered"] is True
+    assert compact["symcc_observation"]["target_block_entered"] is True
+    assert compact["symcc_observation"]["allowed_conclusion"] == (
+        "entered target code but missed operation"
+    )
     assert compact["symcc_observation"]["target_reached"] is False
-    assert compact["symcc_observation"]["distance_is_heuristic"] is True
-    assert compact["symcc_observation"]["observed_location_count"] == 30
-    assert len(compact["symcc_observation"]["observed_locations"]) == 16
+    assert "distance" not in compact["symcc_observation"]
+    assert compact["symcc_observation"]["observed_location_count"] == 40
+    assert compact["symcc_observation"]["observed_locations_included"] == 32
+    assert compact["symcc_observation"]["observed_locations_limited"] is True
+    assert len(compact["symcc_observation"]["observed_locations"]) == 32
     assert len(compact["generated_replays"]) == 8
     assert compact["generated_replays"][0]["symcc_observation"][
         "observed_location_count"
-    ] == 30
-    assert "observed_locations" not in compact["generated_replays"][0][
-        "symcc_observation"
-    ]
+    ] == 40
+    assert compact["generated_replays"][0]["symcc_observation"][
+        "observed_locations_included"
+    ] == 12
+    assert len(compact["generated_replays"][0]["symcc_observation"][
+        "observed_locations"
+    ]) == 12
+    assert compact["generated_replays"][0]["symcc_observation"][
+        "observed_locations_limited"
+    ] is True
+    assert compact["generated_replays"][0]["symcc_observation"][
+        "allowed_conclusion"
+    ] == "generated seed missed operation"
     assert "stderr" not in compact["symcc"]
     assert "stdout" not in compact["generated_replays"][0]["clean_replay"]
+
+
+def test_prebuilt_protocol_metrics_split_feedback_and_poc_signals():
+    metrics = _prebuilt_protocol_metrics([
+        {
+            "request_wall_time_s": 3.0,
+            "feedback_status": "ready",
+            "feedback_ready_wall_time_s": 9.0,
+            "clean": {"sanitizer_event": False},
+            "symcc": {"status": "completed"},
+            "symcc_observation": {
+                "exact_target_reached": False,
+                "target_reachability": "this_execution_missed",
+            },
+            "generated_replays": [
+                {"symcc_observation": {"exact_target_reached": True}},
+                {"symcc_observation": {"exact_target_reached": False}},
+            ],
+        },
+        {
+            "request_wall_time_s": 11.0,
+            "feedback_status": "ready",
+            "feedback_ready_wall_time_s": 22.0,
+            "clean": {"sanitizer_event": True},
+            "symcc": {"status": "timed_out"},
+            "symcc_observation": {
+                "exact_target_reached": True,
+                "target_reachability": "this_execution_hit",
+            },
+            "generated_replays": [],
+        },
+        {
+            "request_wall_time_s": 30.0,
+            "feedback_status": "ready",
+            "feedback_ready_wall_time_s": 40.0,
+            "clean": {"sanitizer_event": False},
+            "symcc": {"status": "execution_error"},
+            "symcc_observation": {
+                "exact_target_reached": None,
+                "target_reachability": "unknown",
+            },
+        },
+    ])
+
+    assert metrics["time_to_first_feedback_s"] == 9.0
+    assert metrics["time_to_first_exact_target_reach_s"] == 22.0
+    assert metrics["time_to_first_sanitizer_s"] == 11.0
+    assert metrics["exact_target_hit_records"] == 1
+    assert metrics["unknown_trace_records"] == 1
+    assert metrics["symcc_completed_jobs"] == 1
+    assert metrics["symcc_timed_out_jobs"] == 1
+    assert metrics["symcc_crashed_jobs"] == 1
+    assert metrics["generated_replays"] == 2
+    assert metrics["generated_replay_exact_hits"] == 1
 
 
 def test_next_protocol_response_auto_delivers_completed_symcc_feedback(monkeypatch):
@@ -577,6 +701,11 @@ def test_next_protocol_response_auto_delivers_completed_symcc_feedback(monkeypat
             return json.dumps(request_values[request_id]).encode()
         if path == f"{INPUT_ROOT}/candidate.bin":
             return b"seed"
+        if path == FEEDBACK_READ_LOG:
+            return (
+                b'{"request_id":"round-001","status":"ready"}\n'
+                b'{"request_id":"round-002","status":"pending"}\n'
+            )
         return b""
 
     def fake_write(_container, path, data):
@@ -629,7 +758,7 @@ def test_next_protocol_response_auto_delivers_completed_symcc_feedback(monkeypat
         response = json.loads(writes[f"{RESPONSE_ROOT}/round-002.json"])
         assert response["ready_feedback"][0]["request_id"] == "round-001"
         assert response["ready_feedback"][0]["symcc_observation"]["target_reached"] is True
-        assert response["ready_feedback"][0]["symcc_observation"]["distance"] == 0
+        assert "distance" not in response["ready_feedback"][0]["symcc_observation"]
         assert await asyncio.to_thread(feedback_written["round-002"].wait, 3)
 
         with pending_lock:
@@ -643,6 +772,9 @@ def test_next_protocol_response_auto_delivers_completed_symcc_feedback(monkeypat
         stop.set()
         summary = await asyncio.wait_for(worker, timeout=3)
         assert summary["feedback_auto_delivered"] == 2
+        assert summary["feedback_ready"] == 2
+        assert summary["feedback_ready_not_auto_delivered"] == 0
+        assert summary["feedback_ready_not_auto_delivered_ids"] == []
         assert summary["requests"] == 2
         assert summary["iteration_limit"] == 2
         assert summary["iteration_limit_rejections"] == 1
@@ -707,6 +839,11 @@ def test_protocol_worker_queues_all_inputs_with_bounded_symcc_concurrency(monkey
             return json.dumps(request_values[request_id]).encode()
         if path == f"{INPUT_ROOT}/candidate.bin":
             return b"seed"
+        if path == FEEDBACK_READ_LOG:
+            return (
+                b'{"request_id":"round-001","status":"ready"}\n'
+                b'{"request_id":"round-002","status":"pending"}\n'
+            )
         return b""
 
     def fake_write(_container, path, data):
@@ -774,15 +911,247 @@ def test_protocol_worker_queues_all_inputs_with_bounded_symcc_concurrency(monkey
         assert summary["symcc_queued"] == 3
         assert summary["symcc_skipped_busy"] == 0
         assert summary["symcc_abandoned"] == 0
+        assert summary["time_to_first_request_s"] is not None
+        assert summary["time_to_first_request_s"] >= 0
+        assert summary["feedback_ready"] == 3
+        assert summary["feedback_ready_not_auto_delivered"] == 3
+        assert summary["feedback_ready_not_auto_delivered_ids"] == request_ids
+        assert summary["feedback_manual_reads"] == 2
+        assert summary["feedback_manually_read_ids"] == ["round-001", "round-002"]
+        assert summary["feedback_ready_manually_read"] == 1
+        assert summary["feedback_ready_manually_read_ids"] == ["round-001"]
+        assert summary["feedback_ready_unconsumed"] == 2
+        assert summary["feedback_ready_unconsumed_ids"] == ["round-002", "round-003"]
 
     asyncio.run(exercise())
+
+
+def test_first_request_policy_counts_tool_calls_before_request():
+    result = AgentResult(
+        messages=[
+            {
+                "type": "tool_use",
+                "timestamp": 10_000,
+                "part": {"type": "tool", "tool": "bash"},
+            },
+            {
+                "type": "tool_use",
+                "timestamp": 11_000,
+                "part": {"type": "tool", "tool": "bash"},
+            },
+            {
+                "type": "tool_use",
+                "timestamp": 21_000,
+                "part": {"type": "tool", "tool": "bash"},
+            },
+        ]
+    )
+    assert _agent_tool_calls_before_timestamp_ms(result, 15_000) == 2
+
+    summary = {
+        "worker_started_wall_time_s": 10.0,
+        "time_to_first_request_s": 5.0,
+    }
+    _annotate_first_request_policy(summary, result)
+    assert summary["first_request_policy"]["status"] == "evaluated"
+    assert summary["first_request_policy"]["time_ok"] is True
+    assert summary["first_request_policy"]["tool_call_ok"] is True
+    assert summary["first_request_policy"]["satisfied"] is True
+    assert summary["first_request_policy"]["first_request_tool_calls"] == 2
+
+
+def test_first_request_policy_warns_on_late_tool_count():
+    result = AgentResult(
+        messages=[
+            {
+                "type": "tool_use",
+                "timestamp": 12_000,
+                "part": {"type": "tool", "tool": "bash"},
+            }
+            for _ in range(26)
+        ]
+    )
+    summary = {
+        "worker_started_wall_time_s": 10.0,
+        "time_to_first_request_s": 5.0,
+    }
+    _annotate_first_request_policy(summary, result)
+    assert summary["first_request_policy"]["time_ok"] is True
+    assert summary["first_request_policy"]["tool_call_ok"] is False
+    assert summary["first_request_policy"]["satisfied"] is False
+    assert summary["first_request_policy"]["first_request_tool_calls"] == 26
+    assert any("first executable input missed" in item for item in summary["warnings"])
+
+
+def test_prebuilt_first_request_nudge_fires_once_without_protocol_request(monkeypatch):
+    monkeypatch.setattr(docker_ops, "exec_sh", lambda *a, **k: (0, "", ""))
+    nudge = _prebuilt_first_request_nudge("target")
+    early = AgentResult(tool_call_count=19)
+    late = AgentResult(tool_call_count=20)
+
+    assert nudge(early) is None
+    message = nudge(late)
+    assert message is not None
+    assert "first-input tool-call deadline" in message
+    assert "run-input" in message
+    assert nudge(AgentResult(tool_call_count=30)) is None
+
+
+def test_prebuilt_first_request_nudge_skips_after_protocol_request(monkeypatch):
+    monkeypatch.setattr(
+        docker_ops, "exec_sh",
+        lambda *a, **k: (0, f"{RESPONSE_ROOT}/round-001.json\n", ""),
+    )
+    nudge = _prebuilt_first_request_nudge("target")
+    assert nudge(AgentResult(tool_call_count=25)) is None
+
+
+def test_execution_protocol_request_ids_deduplicate_same_request(monkeypatch):
+    monkeypatch.setattr(
+        docker_ops,
+        "exec_sh",
+        lambda *a, **k: (
+            0,
+            "\n".join([
+                f"{PROCESSED_ROOT}/round-001.json",
+                f"{RESPONSE_ROOT}/round-001.json",
+                f"{PENDING_ROOT}/round-002.json",
+            ]),
+            "",
+        ),
+    )
+
+    assert _execution_protocol_request_ids("target") == ["round-001", "round-002"]
+
+
+def test_prebuilt_feedback_ready_nudge_requires_feedback_before_followup(monkeypatch):
+    def fake_exec_sh(_container, command, **_kwargs):
+        if FEEDBACK_ROOT in command:
+            return 0, f"{FEEDBACK_ROOT}/round-001.json\n", ""
+        return (
+            0,
+            "\n".join([
+                f"{PROCESSED_ROOT}/round-001.json",
+                f"{RESPONSE_ROOT}/round-001.json",
+            ]),
+            "",
+        )
+
+    monkeypatch.setattr(docker_ops, "exec_sh", fake_exec_sh)
+    nudge = _prebuilt_feedback_ready_nudge("target")
+
+    assert nudge(AgentResult(tool_call_count=8)) is None
+    assert nudge(AgentResult(tool_call_count=24)) is None
+    message = nudge(AgentResult(tool_call_count=25))
+    assert message is not None
+    assert "read-feedback round-001" in message
+    assert "exact_target_reached" in message
+    assert nudge(AgentResult(tool_call_count=31)) is None
+
+
+def test_prebuilt_feedback_ready_nudge_skips_after_followup_request(monkeypatch):
+    def fake_exec_sh(_container, command, **_kwargs):
+        if FEEDBACK_ROOT in command:
+            return 0, f"{FEEDBACK_ROOT}/round-001.json\n", ""
+        return (
+            0,
+            "\n".join([
+                f"{RESPONSE_ROOT}/round-001.json",
+                f"{RESPONSE_ROOT}/round-002.json",
+            ]),
+            "",
+        )
+
+    monkeypatch.setattr(docker_ops, "exec_sh", fake_exec_sh)
+    nudge = _prebuilt_feedback_ready_nudge("target")
+
+    assert nudge(AgentResult(tool_call_count=30)) is None
+
+
+def test_prebuilt_feedback_followup_nudge_after_ready_read_without_followup(monkeypatch):
+    monkeypatch.setattr(
+        docker_ops,
+        "exec_sh",
+        lambda *a, **k: (0, f"{RESPONSE_ROOT}/round-001.json\n", ""),
+    )
+    monkeypatch.setattr(
+        docker_ops,
+        "read_file",
+        lambda *a, **k: b'{"request_id":"round-001","status":"ready"}\n',
+    )
+    nudge = _prebuilt_feedback_followup_nudge("target")
+
+    assert nudge(AgentResult(tool_call_count=30)) is None
+    assert nudge(AgentResult(tool_call_count=49)) is None
+    message = nudge(AgentResult(tool_call_count=50))
+    assert message is not None
+    assert "already consumed ready SymCC feedback" in message
+    assert "round-002" in message
+    assert "run-input" in message
+    assert nudge(AgentResult(tool_call_count=80)) is None
+
+
+def test_prebuilt_feedback_followup_nudge_skips_after_followup_request(monkeypatch):
+    monkeypatch.setattr(
+        docker_ops,
+        "exec_sh",
+        lambda *a, **k: (
+            0,
+            "\n".join([
+                f"{RESPONSE_ROOT}/round-001.json",
+                f"{RESPONSE_ROOT}/round-002.json",
+            ]),
+            "",
+        ),
+    )
+    monkeypatch.setattr(
+        docker_ops,
+        "read_file",
+        lambda *a, **k: b'{"request_id":"round-001","status":"ready"}\n',
+    )
+    nudge = _prebuilt_feedback_followup_nudge("target")
+
+    assert nudge(AgentResult(tool_call_count=80)) is None
+
+
+def test_prebuilt_progress_nudge_prefers_first_request_deadline(monkeypatch):
+    monkeypatch.setattr(docker_ops, "exec_sh", lambda *a, **k: (0, "", ""))
+    nudge = _prebuilt_progress_nudge("target")
+
+    message = nudge(AgentResult(tool_call_count=20))
+    assert message is not None
+    assert "first-input tool-call deadline" in message
+
+
+def test_iteration_workspace_readme_documents_final_status_tags(monkeypatch):
+    writes = {}
+    monkeypatch.setattr(docker_ops, "exec_sh", lambda *a, **k: (0, "", ""))
+    monkeypatch.setattr(
+        docker_ops,
+        "write_file",
+        lambda _container, path, content: writes.__setitem__(path, content),
+    )
+
+    _prepare_iteration_workspace(
+        "target", _finding("candidate_xml"), max_iterations=2, detector="asan"
+    )
+
+    readme = writes["/work/validation/README.md"].decode()
+    assert "<dynamic_status>iteration_exhausted</dynamic_status>" in readme
+    assert "<candidate_id>candidate_xml</candidate_id>" in readme
+    assert "<reached_functions>" in readme
+    assert "Allowed dynamic_status values" in readme
 
 
 def test_feedback_reader_is_nonblocking_and_validates_request_id():
     script = protocol_feedback_reader_script().decode()
     assert '"status":"pending"' in script
+    assert '"wall_time_s":%s' in script
     assert "sleep" not in script
     assert '[ "${#id}" -le 80 ]' in script
+    assert "feedback-reads.jsonl" in script
+    assert '"status":"ready"' in script
+    assert '"status":"pending"' in script
     assert "read-feedback REQUEST_ID" in script
     readme = protocol_readme(symbolic_enabled=True).decode()
     assert "ready_feedback" in readme
@@ -792,6 +1161,72 @@ def test_feedback_reader_is_nonblocking_and_validates_request_id():
     assert "request-scoped copy" in readme
     assert "mandatory evidence for the next input" in readme
     assert "preserve and print a concise summary" in readme
+    assert "Before ending the dynamic phase" in readme
+    assert "Do not run `sleep`" in readme
+    assert "emit the final status immediately" in readme
+
+
+def test_prebuilt_protocol_evidence_ledger_separates_execution_feedback_and_reads():
+    records = [
+        {
+            "request_id": "round-001",
+            "round_id": 1,
+            "input_id": "a" * 64,
+            "input_size": 4,
+            "status": "submitted",
+            "request_wall_time_s": 5.25,
+            "clean": {
+                "status": "completed",
+                "exit_code": 0,
+                "duration_s": 0.1,
+                "sanitizer_event": False,
+            },
+            "feedback_status": "ready",
+            "feedback_ready_wall_time_s": 12.5,
+            "symcc": {"status": "completed", "duration_s": 7.0},
+            "symcc_observation": {
+                "exact_target_reached": False,
+                "target_operation_reached": False,
+                "target_function_entered": True,
+                "target_block_entered": False,
+                "target_reachability": "this_execution_missed",
+                "allowed_conclusion": (
+                    "entered target function but missed operation marker"
+                ),
+            },
+            "generated_replays": [
+                {
+                    "sha256": "b" * 64,
+                    "replay": {"sanitizer_event": True},
+                    "symcc_observation": {"exact_target_reached": True},
+                }
+            ],
+        }
+    ]
+    reads = [
+        {"request_id": "round-001", "status": "ready", "wall_time_s": 115.0}
+    ]
+
+    ledger = _prebuilt_protocol_evidence_ledger(
+        records, reads, worker_started_wall_time_s=100.0
+    )
+
+    assert [event["event"] for event in ledger] == [
+        "execution_request_accepted",
+        "ordinary_execution_done",
+        "symcc_feedback_ready",
+        "agent_feedback_read",
+    ]
+    feedback = next(event for event in ledger if event["event"] == "symcc_feedback_ready")
+    assert feedback["exact_target_reached"] is False
+    assert feedback["target_function_entered"] is True
+    assert feedback["generated_replays"] == 1
+    assert feedback["generated_replay_exact_hits"] == 1
+    assert feedback["generated_replay_crashes"] == 1
+    read = ledger[-1]
+    assert read["feedback_read_status"] == "ready"
+    assert read["t"] == 15.0
+    assert [event["seq"] for event in ledger] == [1, 2, 3, 4]
 
 
 def test_protocol_worker_does_not_wait_for_unused_symcc_after_agent_finishes(
@@ -944,3 +1379,39 @@ def test_symcc_protocol_preflights_binaries_and_installs_runner(monkeypatch):
         "mv -- /out/target-symcc /out/.harness-symcc-target-symcc" in command
         for command in calls
     )
+
+
+@pytest.mark.parametrize("phase_timeout_s", [None, 75.0])
+def test_prebuilt_symcc_agent_uses_only_explicit_phase_timeout(
+    monkeypatch, phase_timeout_s
+):
+    captured = {}
+
+    async def fake_worker(**_kwargs):
+        return {"requests": 0, "iteration_limit_rejections": 0}
+
+    async def fake_agent(**kwargs):
+        captured.update(kwargs)
+        return AgentResult()
+
+    monkeypatch.setattr(
+        dynamic_validation, "_prebuilt_protocol_worker", fake_worker
+    )
+    monkeypatch.setattr(dynamic_validation, "run_agent", fake_agent)
+
+    asyncio.run(dynamic_validation._run_prebuilt_symcc_agent(
+        prompt="test",
+        target=_target(),
+        container="container",
+        model="model",
+        max_turns=5,
+        system_prompt=None,
+        max_resume_attempts=0,
+        transcript_path=None,
+        progress_prefix=None,
+        result_path=None,
+        phase_timeout_s=phase_timeout_s,
+    ))
+
+    assert captured["phase_timeout_s"] == phase_timeout_s
+    assert captured["idle_timeout_s"] == phase_timeout_s

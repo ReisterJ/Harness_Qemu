@@ -1,0 +1,13 @@
+schema_version: 1
+image:
+  mode: prebuilt
+  reference: n132/arvo-51089-vul-agent:1.17.18
+  pull: false
+run:
+  mounts:
+    - source: /tmp/vp-ghostscript-manual-symcc.uYOpRo
+      target: /work/manual-symcc
+      read_only: true
+    - source: /home/user/workstation/defending-code-reference-harness/targets/ghostscript-type2-51089-manual/seed-initial.ps
+      target: /work/validation/seed-initial.ps
+      read_only: true

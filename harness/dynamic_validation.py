@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
 import time
 import json
 import re
@@ -22,6 +23,7 @@ from . import docker_ops
 from .agent import AgentResult, parse_xml_tag, run_agent
 from .artifacts import (
     POC_KINDS,
+    AdditionalCrashSubmission,
     CrashArtifact,
     DynamicValidationResult,
     LogicArtifact,
@@ -31,6 +33,7 @@ from .config import TargetConfig
 from .docker_params import DockerMount, DockerRunParams
 from .execution_protocol import (
     FEEDBACK_READER_PATH,
+    FEEDBACK_READ_LOG,
     FEEDBACK_ROOT,
     INPUT_ROOT,
     PENDING_ROOT,
@@ -85,8 +88,17 @@ _DYNAMIC_STATUSES = {
 _DEFAULT_MAX_ITERATIONS = 8
 _MAX_ITERATION_RECORDS = 100
 _MAX_ITERATION_BYTES = 50_000
+_FIRST_INPUT_DEADLINE_S = 300.0
+_FIRST_INPUT_TOOL_CALL_LIMIT = 25
+_FIRST_INPUT_NUDGE_TOOL_CALLS = max(1, _FIRST_INPUT_TOOL_CALL_LIMIT - 5)
+_FEEDBACK_READY_NUDGE_GRACE_TOOL_CALLS = 10
+_FEEDBACK_READ_FOLLOWUP_NUDGE_GRACE_TOOL_CALLS = 20
 _CRASH_RESULT_XML_PATH = "/work/validation/crash-result.xml"
 _CRASH_RESULT_TEMPLATE_PATH = "/work/validation/crash-result-template.xml"
+_ADDITIONAL_CRASHES_PATH = "/work/validation/additional-crashes.jsonl"
+_ADDITIONAL_CRASH_ROOT = "/work/validation/additional-crashes"
+_MAX_ADDITIONAL_CRASHES = 10
+_MAX_ADDITIONAL_CRASH_BYTES = 10 * 1024 * 1024
 _CRASH_RESULT_FIELDS = (
     "candidate_id", "poc_path", "reproduction_command", "poc_kind",
     "crash_type", "exit_code", "crash_output", "dup_check",
@@ -114,8 +126,13 @@ async def run_dynamic_validation(
     symbolic_execution_result_path: str | None = None,
     crash_result_path: str | None = None,
     max_iterations: int = _DEFAULT_MAX_ITERATIONS,
+    phase_timeout_s: float | None = None,
 ) -> tuple[DynamicValidationResult, AgentResult, dict[str, float]]:
     """Try to produce a crash or semantic-logic PoC for one static candidate."""
+    if phase_timeout_s is not None and (
+        not math.isfinite(phase_timeout_s) or phase_timeout_s <= 0
+    ):
+        raise ValueError("phase_timeout_s must be a positive finite number or None")
     timings: dict[str, float] = {}
     mounts = [(str(found_bugs_path), "/tmp/found_bugs.jsonl")] if found_bugs_path else None
     provider = select_provider(instrumentation, target.instrumentation)
@@ -199,6 +216,7 @@ async def run_dynamic_validation(
                 instrumentation_context=instrumentation_context,
                 symbolic_context=symbolic_context,
                 max_iterations=iteration_limit,
+                phase_timeout_s=phase_timeout_s,
             )
             result, protocol_timings, symbolic_result = await _run_prebuilt_symcc_agent(
                 prompt=prompt,
@@ -213,6 +231,7 @@ async def run_dynamic_validation(
                 result_path=symbolic_execution_result_path,
                 feedback_runtime=symbolic_feedback_runtime,
                 max_iterations=iteration_limit,
+                phase_timeout_s=phase_timeout_s,
             )
             timings.update(protocol_timings)
         else:
@@ -233,6 +252,7 @@ async def run_dynamic_validation(
                 instrumentation_context=instrumentation_context,
                 symbolic_context=symbolic_context,
                 max_iterations=iteration_limit,
+                phase_timeout_s=phase_timeout_s,
             )
             result = await run_agent(
                 prompt=prompt,
@@ -244,6 +264,9 @@ async def run_dynamic_validation(
                 system_prompt=system_prompt,
                 max_resume_attempts=max_resume_attempts,
                 tools=["Read", "Write", "Bash"],
+                phase_timeout_s=phase_timeout_s,
+                idle_timeout_s=phase_timeout_s,
+                completion_predicate=_dynamic_completion_predicate,
             )
             timings["dynamic_validation"] = time.time() - started
         timings["dynamic_agent_tool_calls"] = float(result.tool_call_count)
@@ -297,6 +320,13 @@ async def run_dynamic_validation(
                     if function not in observed_reached:
                         observed_reached.append(function)
 
+        if target.detector == "logic":
+            additional_crashes, additional_crash_errors = [], []
+        else:
+            additional_crashes, additional_crash_errors = _collect_additional_crashes(
+                container, target.detector
+            )
+
         def dynamic_result(**kwargs) -> DynamicValidationResult:
             if observed_reached:
                 reported = list(kwargs.get("reached_functions") or [])
@@ -309,7 +339,25 @@ async def run_dynamic_validation(
                 kwargs["symbolic_execution"] = symbolic_result
             kwargs["iterations"] = iterations
             kwargs["iteration_errors"] = iteration_errors
-            return DynamicValidationResult(**kwargs)
+            kwargs["additional_crashes"] = additional_crashes
+            kwargs["additional_crash_errors"] = additional_crash_errors
+            kwargs.setdefault(
+                "status_breakdown",
+                _dynamic_status_breakdown(
+                    status=str(kwargs.get("status") or "unknown"),
+                    detector=target.detector,
+                    iterations=iterations,
+                    symbolic_result=symbolic_result,
+                    additional_crashes=additional_crashes,
+                ),
+            )
+            result_obj = DynamicValidationResult(**kwargs)
+            if symbolic_result is None:
+                _persist_generic_dynamic_evidence_ledger(
+                    symbolic_execution_result_path,
+                    result_obj,
+                )
+            return result_obj
 
         text = result.find_tagged_message("poc_path")
         status_text = result.find_tagged_message("dynamic_status")
@@ -392,24 +440,34 @@ async def run_dynamic_validation(
         reachability = result_data["reachability_evidence"]
         reason = result_data["reason"]
         if not poc_path or not reproduction_command:
+            reported_status = (result_data["dynamic_status"] or "").strip()
             status = (
-                "agent_blocked"
-                if result.error and result.error.startswith("agent/")
-                else "agent_failed"
-                if result.error
-                else result_data["dynamic_status"] or "invalid_submission"
+                reported_status
+                or (
+                    "agent_blocked"
+                    if result.error and result.error.startswith("agent/")
+                    else "agent_failed"
+                    if result.error
+                    else "invalid_submission"
+                )
             )
-            if not result.error:
+            if reported_status or not result.error:
                 status, reason = _status_for_missing_poc_submission(
                     status=status,
                     reason=reason,
                     iterations=iterations,
                     detector=target.detector,
                 )
-            if not iterations and not result.error:
+            if not iterations and (reported_status or not result.error):
                 status, reason = _status_without_iteration_records(status, reason)
             if status not in _DYNAMIC_STATUSES:
                 status = "reached_no_crash"
+            if symbolic_provider == "symcc":
+                status, reason = _status_for_symcc_missing_poc_submission(
+                    status=status,
+                    reason=reason,
+                    iterations=iterations,
+                )
             return dynamic_result(
                 candidate_id=selected_id,
                 status=status,
@@ -561,6 +619,7 @@ async def _run_harness_managed_symcc(
     transcript_path: str | None,
     progress_prefix: str | None,
     symbolic_result_path: str | None,
+    phase_timeout_s: float | None = None,
 ) -> tuple[AgentResult, dict[str, float]]:
     """Run the host-owned SymCC/agent feedback loop.
 
@@ -571,21 +630,25 @@ async def _run_harness_managed_symcc(
     role in source understanding and hypothesis refinement.
     """
     started = time.time()
-    deadline = time.monotonic() + 1800.0
+    deadline = (
+        time.monotonic() + phase_timeout_s if phase_timeout_s is not None else None
+    )
     merged = AgentResult()
     feedback: dict | None = None
     rounds = 0
     time_to_site_reached: float | None = None
     # `max_turns` is deliberately not reduced for the planner.  The caller's
-    # default is 20,000 and the wall-clock deadline below is the real bound;
+    # default is 20,000; an optional wall-clock deadline is the real bound;
     # reducing the step cap here caused the model to stop while it was still
     # staging a real source slice.
     planner_max_turns = max_turns
 
     for round_id in range(1, iteration_limit + 1):
-        remaining = deadline - time.monotonic()
-        if remaining <= 15:
-            merged.error = "agent/model_blocked: phase exceeded 1800s"
+        remaining = deadline - time.monotonic() if deadline is not None else None
+        if remaining is not None and remaining <= 15:
+            merged.error = (
+                f"agent/model_blocked: phase exceeded {phase_timeout_s:g}s"
+            )
             break
 
         prompt = build_symcc_planner_prompt(
@@ -601,11 +664,12 @@ async def _run_harness_managed_symcc(
             round_id=round_id,
         )
         # Give the semantic planner enough time to stage a real source slice.
-        # SymCC and the clean-target PoC phase still need a substantial part of
-        # the fixed 1800-second budget, so this is intentionally a single
-        # bounded planning turn in the normal case rather than eight short
-        # turns that repeatedly rediscover the same source facts.
-        agent_budget = min(600.0, max(90.0, remaining - 900.0))
+        # With no global deadline, do not invent a per-round wall-clock cap.
+        # Under a finite deadline, reserve time for SymCC and PoC validation.
+        agent_budget = (
+            min(600.0, max(90.0, remaining - 900.0))
+            if remaining is not None else None
+        )
         try:
             round_result = await asyncio.wait_for(
                 run_agent(
@@ -621,12 +685,19 @@ async def _run_harness_managed_symcc(
                     phase_timeout_s=agent_budget,
                     idle_timeout_s=agent_budget,
                 ),
-                timeout=min(agent_budget + 30.0, max(15.0, remaining - 5.0)),
+                timeout=(
+                    min(agent_budget + 30.0, max(15.0, remaining - 5.0))
+                    if agent_budget is not None and remaining is not None else None
+                ),
             )
         except asyncio.TimeoutError:
             _terminate_agent_processes(container)
             round_result = AgentResult(
-                error=f"agent/model_blocked: round exceeded {agent_budget:.0f}s"
+                error=(
+                    f"agent/model_blocked: round exceeded {agent_budget:.0f}s"
+                    if agent_budget is not None
+                    else "agent/model_blocked: agent request timed out"
+                )
             )
         if round_result.error and round_result.error.startswith("agent/"):
             _terminate_agent_processes(container)
@@ -707,11 +778,14 @@ async def _run_harness_managed_symcc(
         # `site_reached` here made the planner loop consume the whole phase and
         # discarded the most useful LLM-produced seed information.
         if symbolic_report.get("status") in {"completed", "failed", "unavailable", "invalid_plan"}:
-            remaining = deadline - time.monotonic()
-            if remaining <= 15:
+            remaining = deadline - time.monotonic() if deadline is not None else None
+            if remaining is not None and remaining <= 15:
                 merged.error = "agent/model_blocked: no time left after site reach"
                 break
-            handoff_budget = min(900.0, max(30.0, remaining - 15.0))
+            handoff_budget = (
+                min(900.0, max(30.0, remaining - 15.0))
+                if remaining is not None else None
+            )
             handoff_prompt = build_poc_generation_prompt(
                 candidate=candidate,
                 github_url=target.github_url,
@@ -744,13 +818,21 @@ async def _run_harness_managed_symcc(
                         tools=["Read", "Write", "Bash"],
                         phase_timeout_s=handoff_budget,
                         idle_timeout_s=handoff_budget,
+                        completion_predicate=_dynamic_completion_predicate,
                     ),
-                    timeout=min(handoff_budget + 30.0, max(15.0, remaining - 5.0)),
+                    timeout=(
+                        min(handoff_budget + 30.0, max(15.0, remaining - 5.0))
+                        if handoff_budget is not None and remaining is not None else None
+                    ),
                 )
             except asyncio.TimeoutError:
                 _terminate_agent_processes(container)
                 handoff_result = AgentResult(
-                    error=f"agent/model_blocked: handoff exceeded {handoff_budget:.0f}s"
+                    error=(
+                        f"agent/model_blocked: handoff exceeded {handoff_budget:.0f}s"
+                        if handoff_budget is not None
+                        else "agent/model_blocked: agent handoff timed out"
+                    )
                 )
             if handoff_result.error and handoff_result.error.startswith("agent/"):
                 _terminate_agent_processes(container)
@@ -761,8 +843,10 @@ async def _run_harness_managed_symcc(
         if crash_present:
             break
 
-        if time.monotonic() >= deadline:
-            merged.error = "agent/model_blocked: phase exceeded 1800s"
+        if deadline is not None and time.monotonic() >= deadline:
+            merged.error = (
+                f"agent/model_blocked: phase exceeded {phase_timeout_s:g}s"
+            )
             break
 
     merged.finished_at = time.time()
@@ -1459,27 +1543,59 @@ def _prepare_prebuilt_symcc_protocol(
 
 def _candidate_target_anchors(candidate: StaticFinding) -> list[dict[str, Any]]:
     """Normalize static-report observability anchors without inventing locations."""
-    anchors: list[dict[str, Any]] = []
-    for raw in candidate.observability_targets:
-        file_name = raw.get("source_file", raw.get("file"))
-        function = raw.get("function")
-        line = raw.get("line")
+    def from_parts(
+        *,
+        file_name: Any = None,
+        function: Any = None,
+        line: Any = None,
+    ) -> dict[str, Any] | None:
         if file_name is not None and not isinstance(file_name, str):
-            continue
+            return None
         if function is not None and not isinstance(function, str):
-            continue
+            return None
         if isinstance(line, bool) or (line is not None and not isinstance(line, int)):
-            continue
+            return None
         if (file_name is None) != (line is None):
-            continue
+            return None
         if not file_name and not function:
-            continue
+            return None
         anchor: dict[str, Any] = {}
         if file_name:
             anchor["source_file"] = file_name
             anchor["line"] = line
         if function:
             anchor["function"] = function
+        return anchor
+
+    anchors: list[dict[str, Any]] = []
+    for raw in candidate.observability_targets:
+        operation = raw.get("target_operation")
+        if isinstance(operation, dict):
+            anchor = from_parts(
+                file_name=operation.get("source_file", operation.get("file")),
+                function=operation.get("function"),
+                line=operation.get("line"),
+            )
+            if anchor is not None:
+                anchor["anchor_role"] = "operation"
+                anchors.append(anchor)
+                continue
+
+        anchor = from_parts(
+            file_name=raw.get("source_file", raw.get("file")),
+            function=raw.get("function"),
+            line=raw.get("line"),
+        )
+        if anchor is not None:
+            anchor["anchor_role"] = "legacy_location"
+            anchors.append(anchor)
+            continue
+
+        target_function = raw.get("target_function")
+        anchor = from_parts(function=target_function)
+        if anchor is None:
+            continue
+        anchor.setdefault("anchor_role", "coarse_function")
         anchors.append(anchor)
     if anchors:
         return anchors[:50]
@@ -1988,7 +2104,10 @@ def _execute_prebuilt_protocol_symcc_request(
         "symcc": symcc,
         "symcc_observation": initial_observation,
         "generated_replays": replays,
-        "site_reached": initial_observation.get("target_reached"),
+        "site_reached": initial_observation.get(
+            "exact_target_reached",
+            initial_observation.get("target_reached"),
+        ),
         "site_reachability_note": (
             "site_reached describes the original submitted input's instrumented execution. "
             "Generated testcase observations are reported separately. A negative is exact "
@@ -2033,13 +2152,31 @@ def _summarize_symcc_trace_bytes(
     trace = parse_trace(raw) if raw else None
     if trace is None:
         return {
-            "status": "missing", "target_reached": None,
-            "target_reachability": "unknown", "reason": "runtime trace file is missing",
+            "feedback_schema_version": 2,
+            "status": "missing",
+            "exact_target_reached": None,
+            "target_operation_reached": None,
+            "target_function_entered": None,
+            "target_block_entered": None,
+            "target_reached": None,
+            "target_block_reached": None,
+            "target_reachability": "unknown",
+            "allowed_conclusion": "target reach is unknown because the runtime trace file is missing",
+            "reason": "runtime trace file is missing",
         }
     if feedback_runtime is None:
         return {
-            "status": "map_unavailable", "trace_status": trace.status,
-            "target_reached": None, "target_reachability": "unknown",
+            "feedback_schema_version": 2,
+            "status": "map_unavailable",
+            "trace_status": trace.status,
+            "exact_target_reached": None,
+            "target_operation_reached": None,
+            "target_function_entered": None,
+            "target_block_entered": None,
+            "target_reached": None,
+            "target_block_reached": None,
+            "target_reachability": "unknown",
+            "allowed_conclusion": "target reach is unknown because source/CFG feedback context is unavailable",
             "reason": "source/CFG feedback runtime context is unavailable",
         }
     map_status = feedback_runtime.get("status")
@@ -2048,11 +2185,18 @@ def _summarize_symcc_trace_bytes(
     target_block_ids = feedback_runtime.get("target_block_ids", [])
     if graph is None or not marker_ids:
         return {
+            "feedback_schema_version": 2,
             "status": map_status or "unavailable",
             "trace_status": trace.status,
+            "exact_target_reached": None,
+            "target_operation_reached": None,
+            "target_function_entered": None,
+            "target_block_entered": None,
             "target_reached": None,
+            "target_block_reached": None,
             "target_reachability": "unknown",
             "observed_event_count": len(trace.events),
+            "allowed_conclusion": "target reach is unknown because target anchors could not be resolved",
             "reason": feedback_runtime.get("reason")
             or "target anchors could not be resolved through the versioned map",
         }
@@ -2074,8 +2218,16 @@ def _read_symcc_trace_feedback(
         raw = docker_ops.read_file(container, path)
     except Exception as exc:
         return {
-            "status": "read_error", "target_reached": None,
+            "feedback_schema_version": 2,
+            "status": "read_error",
+            "exact_target_reached": None,
+            "target_operation_reached": None,
+            "target_function_entered": None,
+            "target_block_entered": None,
+            "target_reached": None,
+            "target_block_reached": None,
             "target_reachability": "unknown",
+            "allowed_conclusion": "target reach is unknown because the runtime trace could not be read",
             "reason": f"{type(exc).__name__}: {exc}",
         }
     return _summarize_symcc_trace_bytes(raw, feedback_runtime)
@@ -2101,24 +2253,42 @@ def _execute_prebuilt_protocol_request(
 def _compact_protocol_feedback(record: dict[str, Any]) -> dict[str, Any]:
     """为下一次 agent 请求准备紧凑的异步反馈，不复制原始求解器日志。"""
     def compact_observation(
-        value: Any, *, include_locations: bool = True
+        value: Any, *, location_limit: int = 32
     ) -> dict[str, Any] | None:
         if not isinstance(value, dict):
             return None
         keys = (
+            "feedback_schema_version",
             "status", "trace_status", "trace_complete", "trace_truncated",
-            "target_ids_configured", "target_ids_valid", "target_reached",
-            "target_block_reached", "target_reachability",
-            "observed_block_count", "distance",
-            "distance_kind", "distance_is_heuristic", "distance_note",
-            "closest_observed_location", "unresolved_call_count", "reason",
+            "target_ids_configured", "target_ids_valid",
+            "exact_target_reached", "target_operation_reached",
+            "target_function_entered", "target_block_entered",
+            "target_reached", "target_block_reached", "target_reachability",
+            "target_anchor_granularity", "observed_block_count",
+            "allowed_conclusion", "reason",
         )
         compact = {key: value[key] for key in keys if key in value}
         locations = value.get("observed_locations")
         if isinstance(locations, list):
-            compact["observed_location_count"] = len(locations)
-            if include_locations:
-                compact["observed_locations"] = locations[:16]
+            total = value.get("observed_location_count", len(locations))
+            if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+                total = len(locations)
+            selected = locations[:max(0, location_limit)]
+            compact["observed_location_count"] = total
+            compact["observed_locations_included"] = len(selected)
+            compact["observed_locations_limited"] = bool(
+                value.get("observed_locations_limited")
+                or total > len(selected)
+                or len(locations) > len(selected)
+            )
+            compact["observed_locations_ordered"] = bool(
+                value.get("observed_locations_ordered", False)
+            )
+            if value.get("observed_locations_selection"):
+                compact["observed_locations_selection"] = value[
+                    "observed_locations_selection"
+                ]
+            compact["observed_locations"] = selected
         return compact
 
     clean = record.get("clean") if isinstance(record.get("clean"), dict) else {}
@@ -2139,7 +2309,7 @@ def _compact_protocol_feedback(record: dict[str, Any]) -> dict[str, Any]:
                     ("status", "exit_code", "sanitizer_event") if key in replay
                 },
                 "symcc_observation": compact_observation(
-                    item.get("symcc_observation"), include_locations=False
+                    item.get("symcc_observation"), location_limit=12
                 ),
             })
 
@@ -2193,6 +2363,8 @@ async def _prebuilt_protocol_worker(
     max_requests: int = _DEFAULT_MAX_ITERATIONS,
 ) -> dict[str, Any]:
     request_limit = max(1, min(int(max_requests), _MAX_ITERATION_RECORDS))
+    worker_started = time.monotonic()
+    worker_started_wall_time_s = time.time()
     _memory_limit, _cpus, max_inflight_symcc_jobs = _symcc_sidecar_settings(
         target.symcc_runtime or {}
     )
@@ -2207,6 +2379,7 @@ async def _prebuilt_protocol_worker(
         "symcc_queued": 0, "symcc_queue_wait_s": 0.0,
         "feedback_auto_delivered": 0,
         "iteration_limit_rejections": 0,
+        "time_to_first_request_s": None,
     }
     feedback_delivered: set[str] = set()
     command = (
@@ -2284,6 +2457,9 @@ async def _prebuilt_protocol_worker(
             record["feedback_status"] = "publish_error"
             record["feedback_error"] = f"{type(exc).__name__}: {exc}"
         record["feedback_wall_time_s"] = round(time.monotonic() - started, 3)
+        record["feedback_ready_wall_time_s"] = round(
+            time.monotonic() - worker_started, 3
+        )
 
     async def run_queued_feedback_job(
         job: dict[str, Any], record: dict[str, Any], enqueued_at: float
@@ -2317,6 +2493,10 @@ async def _prebuilt_protocol_worker(
                 if not path.startswith(PENDING_ROOT + "/") or not name.endswith(".json") or name in seen:
                     continue
                 seen.add(name)
+                if stats["time_to_first_request_s"] is None:
+                    stats["time_to_first_request_s"] = round(
+                        time.monotonic() - worker_started, 3
+                    )
                 try:
                     raw = await asyncio.to_thread(docker_ops.read_file, container, path)
                     if stats["processed"] >= request_limit:
@@ -2353,6 +2533,9 @@ async def _prebuilt_protocol_worker(
                         _prepare_prebuilt_protocol_request,
                         container=container, target=target, raw=raw,
                         filename=name, round_id=stats["processed"] + 1,
+                    )
+                    response["request_wall_time_s"] = round(
+                        time.monotonic() - worker_started, 3
                     )
                     if response.get("status") == "invalid_request":
                         stats["invalid"] += 1
@@ -2423,9 +2606,43 @@ async def _prebuilt_protocol_worker(
                     "status": "abandoned",
                     "message": "agent finished before background feedback was ready",
                 }
+    feedback_ready_ids = [
+        str(record.get("request_id"))
+        for record in records
+        if record.get("request_id")
+        and record.get("feedback_status") in {"ready", "publish_error"}
+    ]
+    feedback_read_events = await asyncio.to_thread(
+        _read_feedback_read_events, container
+    )
+    feedback_manually_read_ids = sorted({
+        str(event["request_id"])
+        for event in feedback_read_events
+        if event.get("request_id")
+    })
+    feedback_ready_manually_read_ids = sorted({
+        str(event["request_id"])
+        for event in feedback_read_events
+        if event.get("request_id") and event.get("status") == "ready"
+    })
+    feedback_ready_not_auto_delivered_ids = [
+        request_id for request_id in feedback_ready_ids
+        if request_id not in feedback_delivered
+    ]
+    feedback_ready_unconsumed_ids = [
+        request_id for request_id in feedback_ready_ids
+        if request_id not in feedback_delivered
+        and request_id not in feedback_ready_manually_read_ids
+    ]
+    evidence_ledger = _prebuilt_protocol_evidence_ledger(
+        records,
+        feedback_read_events,
+        worker_started_wall_time_s=worker_started_wall_time_s,
+    )
     summary = {
         "schema_version": 1, "provider": "symcc-prebuilt",
         "status": "incomplete" if unfinished else "completed",
+        "worker_started_wall_time_s": round(worker_started_wall_time_s, 3),
         "iteration_limit": request_limit,
         "requests": stats["processed"], "invalid_requests": stats["invalid"],
         "iteration_limit_rejections": stats["iteration_limit_rejections"],
@@ -2435,17 +2652,467 @@ async def _prebuilt_protocol_worker(
         "symcc_skipped_busy": stats["symcc_skipped_busy"],
         "symcc_abandoned": stats["symcc_abandoned"],
         "feedback_auto_delivered": stats["feedback_auto_delivered"],
+        "feedback_ready": len(feedback_ready_ids),
+        "feedback_ready_not_auto_delivered": len(
+            feedback_ready_not_auto_delivered_ids
+        ),
+        "feedback_ready_not_auto_delivered_ids": (
+            feedback_ready_not_auto_delivered_ids[:20]
+        ),
+        "feedback_manual_reads": len(feedback_read_events),
+        "feedback_manually_read_ids": feedback_manually_read_ids[:20],
+        "feedback_ready_manually_read": len(feedback_ready_manually_read_ids),
+        "feedback_ready_manually_read_ids": (
+            feedback_ready_manually_read_ids[:20]
+        ),
+        "feedback_ready_unconsumed": len(feedback_ready_unconsumed_ids),
+        "feedback_ready_unconsumed_ids": feedback_ready_unconsumed_ids[:20],
+        "time_to_first_request_s": stats["time_to_first_request_s"],
         "symcc_execution_s": round(stats["symcc_duration_s"], 3),
+        "metrics": _prebuilt_protocol_metrics(records),
+        "evidence_ledger": evidence_ledger,
         "records": records,
     }
     if result_path:
         output = Path(result_path)
         output.mkdir(parents=True, exist_ok=True)
         (output / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
+        ledger_text = "".join(
+            json.dumps(event, ensure_ascii=False) + "\n"
+            for event in evidence_ledger
+        )
+        (output / "evidence_ledger.jsonl").write_text(ledger_text)
+        if output.name == "symbolic_execution":
+            (output.parent / "evidence_ledger.jsonl").write_text(ledger_text)
         with (output / "requests.jsonl").open("w") as stream:
             for record in records:
                 stream.write(json.dumps(record, ensure_ascii=False) + "\n")
     return summary
+
+
+def _read_feedback_read_events(container: str) -> list[dict[str, Any]]:
+    """Read the protocol-local audit log written by read-feedback.
+
+    The log is advisory telemetry only.  Missing files, malformed JSONL, and
+    oversized logs must not fail the dynamic phase.
+    """
+    try:
+        raw = docker_ops.read_file(container, FEEDBACK_READ_LOG)
+    except Exception:
+        return []
+    if not raw:
+        return []
+    raw = raw[:1024 * 1024]
+    events: list[dict[str, Any]] = []
+    for line in raw.splitlines()[:2000]:
+        try:
+            item = json.loads(line.decode("utf-8", errors="strict"))
+        except Exception:
+            continue
+        if not isinstance(item, dict):
+            continue
+        request_id = item.get("request_id")
+        status = item.get("status")
+        if (
+            isinstance(request_id, str)
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}", request_id)
+            and status in {"ready", "pending"}
+        ):
+            event: dict[str, Any] = {"request_id": request_id, "status": status}
+            wall_time_s = item.get("wall_time_s")
+            if (
+                isinstance(wall_time_s, (int, float))
+                and not isinstance(wall_time_s, bool)
+                and math.isfinite(float(wall_time_s))
+            ):
+                event["wall_time_s"] = float(wall_time_s)
+            events.append(event)
+    return events
+
+
+def _prebuilt_protocol_evidence_ledger(
+    records: list[dict[str, Any]],
+    feedback_read_events: list[dict[str, Any]],
+    *,
+    worker_started_wall_time_s: float | None = None,
+) -> list[dict[str, Any]]:
+    """Build a compact, chronological evidence ledger for experiment audits.
+
+    The ledger is derived from machine-owned protocol records plus the
+    read-feedback audit log.  It intentionally records observable events instead
+    of agent explanations, so later analysis can distinguish "feedback did not
+    exist", "feedback existed but was not consumed", and "feedback was consumed
+    but did not improve the next input".
+    """
+
+    events: list[dict[str, Any]] = []
+
+    def number(value: Any) -> float | None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        value = float(value)
+        if not math.isfinite(value):
+            return None
+        return round(value, 3)
+
+    def add(event: dict[str, Any]) -> None:
+        event = {key: value for key, value in event.items() if value is not None}
+        events.append(event)
+
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        request_id = record.get("request_id")
+        if not isinstance(request_id, str) or not request_id:
+            request_id = None
+        base = {
+            "request_id": request_id,
+            "round_id": record.get("round_id"),
+            "input_id": record.get("input_id") or record.get("input_sha256"),
+            "parent_input_id": record.get("parent_input_id"),
+        }
+        request_t = number(record.get("request_wall_time_s"))
+        status = record.get("status")
+        add({
+            "t": request_t,
+            "event": (
+                "execution_request_rejected"
+                if status in {"invalid_request", "iteration_limit_reached", "execution_error"}
+                else "execution_request_accepted"
+            ),
+            **base,
+            "status": status,
+            "input_size": record.get("input_size"),
+        })
+
+        clean = record.get("clean")
+        if isinstance(clean, dict):
+            add({
+                "t": request_t,
+                "event": "ordinary_execution_done",
+                **base,
+                "clean_status": clean.get("status"),
+                "exit_code": clean.get("exit_code"),
+                "sanitizer_event": clean.get("sanitizer_event"),
+                "duration_s": clean.get("duration_s"),
+            })
+            if clean.get("sanitizer_event") is True:
+                add({
+                    "t": request_t,
+                    "event": "sanitizer_event_observed",
+                    **base,
+                    "clean_status": clean.get("status"),
+                    "exit_code": clean.get("exit_code"),
+                })
+
+        feedback_status = record.get("feedback_status")
+        feedback_t = number(record.get("feedback_ready_wall_time_s"))
+        observation = (
+            record.get("symcc_observation")
+            if isinstance(record.get("symcc_observation"), dict)
+            else {}
+        )
+        generated = (
+            record.get("generated_replays")
+            if isinstance(record.get("generated_replays"), list)
+            else []
+        )
+        if feedback_status in {"ready", "publish_error"}:
+            generated_exact_hits = 0
+            generated_crashes = 0
+            for item in generated:
+                if not isinstance(item, dict):
+                    continue
+                seed_observation = item.get("symcc_observation")
+                if (
+                    isinstance(seed_observation, dict)
+                    and seed_observation.get("exact_target_reached") is True
+                ):
+                    generated_exact_hits += 1
+                replay = item.get("replay")
+                if isinstance(replay, dict) and replay.get("sanitizer_event") is True:
+                    generated_crashes += 1
+            add({
+                "t": feedback_t,
+                "event": "symcc_feedback_ready",
+                **base,
+                "feedback_status": feedback_status,
+                "symcc_status": (
+                    record.get("symcc", {}).get("status")
+                    if isinstance(record.get("symcc"), dict) else None
+                ),
+                "exact_target_reached": observation.get("exact_target_reached"),
+                "target_operation_reached": observation.get("target_operation_reached"),
+                "target_function_entered": observation.get("target_function_entered"),
+                "target_block_entered": observation.get("target_block_entered"),
+                "target_reachability": observation.get("target_reachability"),
+                "allowed_conclusion": observation.get("allowed_conclusion"),
+                "generated_replays": len(generated),
+                "generated_replay_exact_hits": generated_exact_hits,
+                "generated_replay_crashes": generated_crashes,
+            })
+        elif feedback_status in {"abandoned_agent_finished"}:
+            add({
+                "t": feedback_t,
+                "event": "symcc_feedback_abandoned",
+                **base,
+                "feedback_status": feedback_status,
+                "symcc_status": (
+                    record.get("symcc", {}).get("status")
+                    if isinstance(record.get("symcc"), dict) else None
+                ),
+            })
+
+    for read in feedback_read_events:
+        if not isinstance(read, dict):
+            continue
+        wall_time_s = number(read.get("wall_time_s"))
+        relative_t = None
+        if (
+            wall_time_s is not None
+            and isinstance(worker_started_wall_time_s, (int, float))
+            and not isinstance(worker_started_wall_time_s, bool)
+        ):
+            relative_t = max(0.0, round(wall_time_s - float(worker_started_wall_time_s), 3))
+        add({
+            "t": relative_t,
+            "event": "agent_feedback_read",
+            "request_id": read.get("request_id"),
+            "feedback_read_status": read.get("status"),
+            "wall_time_s": wall_time_s,
+        })
+
+    events.sort(
+        key=lambda item: (
+            float("inf") if item.get("t") is None else float(item.get("t")),
+            str(item.get("event") or ""),
+            str(item.get("request_id") or ""),
+        )
+    )
+    for index, event in enumerate(events, start=1):
+        event["seq"] = index
+    return events
+
+
+def _generic_dynamic_evidence_ledger(
+    result: DynamicValidationResult,
+) -> list[dict[str, Any]]:
+    """Build a provider-neutral ledger from persisted dynamic evidence.
+
+    The prebuilt SymCC protocol writes a richer machine-owned ledger directly
+    from request/feedback records.  Non-SymCC arms still need a comparable
+    audit trail so experiment summaries do not reduce them to only the legacy
+    status string.  This generic ledger is intentionally conservative: it only
+    records bounded iteration records, additional crash submissions, accepted
+    final PoC artifacts, and the final status breakdown.
+    """
+
+    events: list[dict[str, Any]] = []
+
+    def add(event: dict[str, Any]) -> None:
+        event = {key: value for key, value in event.items() if value is not None}
+        events.append(event)
+
+    for record in result.iterations:
+        if not isinstance(record, dict):
+            continue
+        observations = (
+            record.get("observations")
+            if isinstance(record.get("observations"), dict)
+            else {}
+        )
+        machine = (
+            record.get("machine_evidence")
+            if isinstance(record.get("machine_evidence"), dict)
+            else {}
+        )
+        add({
+            "event": "iteration_recorded",
+            "round_id": record.get("round_id"),
+            "candidate_id": record.get("candidate_id"),
+            "request_id": record.get("request_id"),
+            "input_id": record.get("input_id"),
+            "decision": record.get("decision"),
+            "site_reached": observations.get("site_reached"),
+            "sanitizer_event": observations.get("sanitizer_event"),
+            "bad_state_observed": observations.get("bad_state_observed"),
+            "bad_effect_observed": observations.get("bad_effect_observed"),
+            "matched_candidate": observations.get("matched_candidate"),
+            "machine_provider": machine.get("provider"),
+            "exact_target_reached": machine.get("exact_target_reached"),
+            "target_operation_reached": machine.get("target_operation_reached"),
+        })
+
+    for item in result.additional_crashes:
+        add({
+            "event": "additional_crash_recorded",
+            "candidate_id": result.candidate_id,
+            "finding_id": item.finding_id,
+            "summary": item.summary[:500],
+            "poc_path": item.crash.poc_path,
+            "poc_kind": item.crash.poc_kind,
+            "crash_type": item.crash.crash_type,
+            "exit_code": item.crash.exit_code,
+        })
+
+    if result.crash is not None:
+        add({
+            "event": "validated_crash_poc_submitted",
+            "candidate_id": result.candidate_id,
+            "poc_path": result.crash.poc_path,
+            "poc_kind": result.crash.poc_kind,
+            "crash_type": result.crash.crash_type,
+            "exit_code": result.crash.exit_code,
+        })
+    if result.logic is not None:
+        add({
+            "event": "validated_logic_poc_submitted",
+            "candidate_id": result.candidate_id,
+            "poc_path": result.logic.poc_path,
+            "poc_kind": result.logic.poc_kind,
+            "logic_type": result.logic.logic_type,
+            "exit_code": result.logic.exit_code,
+        })
+
+    add({
+        "event": "dynamic_result_finalized",
+        "candidate_id": result.candidate_id,
+        "status": result.status,
+        "target_site_status": result.status_breakdown.get("target_site_status"),
+        "poc_status": result.status_breakdown.get("poc_status"),
+        "grade_status": result.status_breakdown.get("grade_status"),
+        "additional_findings_status": result.status_breakdown.get(
+            "additional_findings_status"
+        ),
+        "feedback_quality_status": result.status_breakdown.get(
+            "feedback_quality_status"
+        ),
+    })
+
+    for index, event in enumerate(events, start=1):
+        event["seq"] = index
+    return events
+
+
+def _persist_generic_dynamic_evidence_ledger(
+    result_path: str | None,
+    result: DynamicValidationResult,
+) -> None:
+    """Persist a minimal evidence ledger for non-SymCC dynamic arms."""
+    if not result_path:
+        return
+    output = Path(result_path)
+    root = output.parent if output.name == "symbolic_execution" else output
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        ledger = _generic_dynamic_evidence_ledger(result)
+        (root / "evidence_ledger.jsonl").write_text(
+            "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in ledger)
+        )
+    except OSError:
+        return
+
+
+def _prebuilt_protocol_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Derive experiment-facing timing and feedback-quality metrics."""
+    first_feedback_s: float | None = None
+    first_exact_target_s: float | None = None
+    first_sanitizer_s: float | None = None
+    completed_jobs = 0
+    timed_out_jobs = 0
+    crashed_jobs = 0
+    unknown_traces = 0
+    exact_hits = 0
+    generated_replays = 0
+    generated_exact_hits = 0
+
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        clean = record.get("clean")
+        if isinstance(clean, dict) and clean.get("sanitizer_event") is True:
+            first_sanitizer_s = _min_optional_float(
+                first_sanitizer_s, record.get("request_wall_time_s")
+            )
+
+        feedback_ready = record.get("feedback_ready_wall_time_s")
+        if record.get("feedback_status") in {"ready", "publish_error"}:
+            first_feedback_s = _min_optional_float(first_feedback_s, feedback_ready)
+
+        observation = record.get("symcc_observation")
+        if isinstance(observation, dict):
+            if observation.get("exact_target_reached") is True:
+                exact_hits += 1
+                first_exact_target_s = _min_optional_float(
+                    first_exact_target_s, feedback_ready
+                )
+            elif observation.get("target_reachability") == "unknown":
+                unknown_traces += 1
+
+        symcc = record.get("symcc")
+        if isinstance(symcc, dict):
+            status = symcc.get("status")
+            if status == "completed":
+                completed_jobs += 1
+            elif status == "timed_out":
+                timed_out_jobs += 1
+            elif status in {"failed", "execution_error", "resource_exhausted"}:
+                crashed_jobs += 1
+
+        generated = record.get("generated_replays")
+        if isinstance(generated, list):
+            generated_replays += sum(1 for item in generated if isinstance(item, dict))
+            for item in generated:
+                if not isinstance(item, dict):
+                    continue
+                seed_observation = item.get("symcc_observation")
+                if (
+                    isinstance(seed_observation, dict)
+                    and seed_observation.get("exact_target_reached") is True
+                ):
+                    generated_exact_hits += 1
+
+    return {
+        "time_to_first_feedback_s": first_feedback_s,
+        "time_to_first_exact_target_reach_s": first_exact_target_s,
+        "time_to_first_sanitizer_s": first_sanitizer_s,
+        "exact_target_hit_records": exact_hits,
+        "unknown_trace_records": unknown_traces,
+        "symcc_completed_jobs": completed_jobs,
+        "symcc_timed_out_jobs": timed_out_jobs,
+        "symcc_crashed_jobs": crashed_jobs,
+        "generated_replays": generated_replays,
+        "generated_replay_exact_hits": generated_exact_hits,
+    }
+
+
+def _min_optional_float(current: float | None, value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return current
+    if not math.isfinite(float(value)):
+        return current
+    candidate = round(float(value), 3)
+    return candidate if current is None else min(current, candidate)
+
+
+def _dynamic_completion_predicate(result: AgentResult) -> bool:
+    """Stop dynamic agents after a complete final status message is visible.
+
+    Some backends keep auto-continuing after emitting valid final XML tags,
+    which can turn a completed validation into a later watchdog error.  This
+    predicate is intentionally conservative: it only accepts assistant-authored
+    status messages with enough surrounding fields to be parseable by the
+    dynamic result contract.
+    """
+    text = result.find_tagged_message("dynamic_status")
+    status = (parse_xml_tag(text, "dynamic_status") or "").strip()
+    if status not in (_DYNAMIC_STATUSES | {"validated"}):
+        return False
+    if parse_xml_tag(text, "candidate_id") is None:
+        return False
+    if status == "validated":
+        return parse_xml_tag(text, "poc_path") is not None
+    return parse_xml_tag(text, "reason") is not None
 
 
 async def _run_prebuilt_symcc_agent(
@@ -2455,6 +3122,7 @@ async def _run_prebuilt_symcc_agent(
     result_path: str | None,
     feedback_runtime: dict[str, Any] | None = None,
     max_iterations: int = _DEFAULT_MAX_ITERATIONS,
+    phase_timeout_s: float | None = None,
 ) -> tuple[AgentResult, dict[str, float], dict[str, Any]]:
     started = time.time()
     stop = asyncio.Event()
@@ -2468,8 +3136,11 @@ async def _run_prebuilt_symcc_agent(
             prompt=prompt, max_turns=max_turns, model=model, container=container,
             transcript_path=transcript_path, progress_prefix=progress_prefix,
             system_prompt=system_prompt, max_resume_attempts=max_resume_attempts,
-            tools=["Read", "Write", "Bash"], phase_timeout_s=1800.0,
-            idle_timeout_s=1800.0,
+            tools=["Read", "Write", "Bash"],
+            phase_timeout_s=phase_timeout_s,
+            idle_timeout_s=phase_timeout_s,
+            progress_nudge=_prebuilt_progress_nudge(container),
+            completion_predicate=_dynamic_completion_predicate,
         )
     finally:
         stop.set()
@@ -2485,6 +3156,13 @@ async def _run_prebuilt_symcc_agent(
                 "schema_version": 1, "provider": "symcc-prebuilt", "status": "incomplete",
                 "errors": ["execution protocol worker did not stop cleanly"],
             }
+    _annotate_first_request_policy(summary, result)
+    if result_path:
+        output = Path(result_path)
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "summary.json").write_text(
+            json.dumps(summary, indent=2, ensure_ascii=False) + "\n"
+        )
     return result, {
         "dynamic_validation": time.time() - started,
         "execution_protocol_requests": float(summary.get("requests", 0)),
@@ -2495,6 +3173,288 @@ async def _run_prebuilt_symcc_agent(
         "execution_protocol_errors": float(summary.get("errors", 0)),
         "symbolic_execution_session": float(summary.get("symcc_execution_s", 0)),
     }, summary
+
+
+def _annotate_first_request_policy(
+    summary: dict[str, Any], result: AgentResult
+) -> None:
+    """Add an auditable first-input deadline check to protocol summaries.
+
+    The prompt requires the first runnable input before both five minutes and
+    25 meaningful tool calls.  The worker can measure wall time, while the
+    transcript provides tool-call timestamps.  This post-process keeps the
+    policy observable without interrupting exploration.
+    """
+    first_request_s = summary.get("time_to_first_request_s")
+    worker_started_s = summary.get("worker_started_wall_time_s")
+    policy: dict[str, Any] = {
+        "time_limit_s": _FIRST_INPUT_DEADLINE_S,
+        "tool_call_limit": _FIRST_INPUT_TOOL_CALL_LIMIT,
+        "status": "unknown",
+        "satisfied": None,
+        "time_ok": None,
+        "tool_call_ok": None,
+        "first_request_tool_calls": None,
+    }
+    warnings = summary.get("warnings")
+    if not isinstance(warnings, list):
+        warnings = []
+
+    if isinstance(first_request_s, (int, float)) and not isinstance(first_request_s, bool):
+        first_request_s = float(first_request_s)
+        policy["time_ok"] = first_request_s <= _FIRST_INPUT_DEADLINE_S
+        policy["status"] = "evaluated"
+    else:
+        policy["status"] = "missing_first_request"
+        warnings.append("no execution-protocol request was submitted")
+
+    if (
+        isinstance(first_request_s, (int, float))
+        and not isinstance(first_request_s, bool)
+        and isinstance(worker_started_s, (int, float))
+        and not isinstance(worker_started_s, bool)
+    ):
+        cutoff_ms = int(round((float(worker_started_s) + float(first_request_s)) * 1000))
+        tool_calls = _agent_tool_calls_before_timestamp_ms(result, cutoff_ms)
+        policy["first_request_tool_calls"] = tool_calls
+        policy["tool_call_ok"] = tool_calls <= _FIRST_INPUT_TOOL_CALL_LIMIT
+
+    if policy["time_ok"] is not None and policy["tool_call_ok"] is not None:
+        policy["satisfied"] = bool(policy["time_ok"] and policy["tool_call_ok"])
+        if not policy["satisfied"]:
+            warnings.append(
+                "first executable input missed the prompt-level deadline "
+                f"(time_ok={policy['time_ok']}, "
+                f"tool_call_ok={policy['tool_call_ok']})"
+            )
+    elif policy["status"] == "evaluated":
+        warnings.append(
+            "first executable input time was measured, but transcript timestamps "
+            "were insufficient to evaluate the tool-call deadline"
+        )
+
+    summary["first_request_policy"] = policy
+    if warnings:
+        summary["warnings"] = warnings
+
+
+def _prebuilt_first_request_nudge(container: str):
+    state = {"nudged": False, "request_seen": False}
+
+    def nudge(result: AgentResult) -> str | None:
+        if state["nudged"] or state["request_seen"]:
+            return None
+        if result.tool_call_count < _FIRST_INPUT_NUDGE_TOOL_CALLS:
+            return None
+        if _execution_protocol_has_request(container):
+            state["request_seen"] = True
+            return None
+        state["nudged"] = True
+        return (
+            "You are at the first-input tool-call deadline and have not yet "
+            "submitted any executable input through the Harness execution "
+            "protocol. Stop further source reconnaissance now. Your next tool "
+            "call must create and run the best runnable "
+            "target-format baseline or candidate input you can, write a fresh "
+            "request JSON under /work/validation/execution/requests, execute it "
+            "with /work/validation/run-input, and record its request_id/input_id. "
+            "After that, continue source analysis using the measured result and "
+            "any asynchronous SymCC feedback. Do not answer or summarize before "
+            "submitting this first request."
+        )
+
+    return nudge
+
+
+def _prebuilt_feedback_ready_nudge(container: str):
+    state = {
+        "nudged": False,
+        "followup_seen": False,
+        "first_request_seen_at_tool_call": None,
+    }
+
+    def nudge(result: AgentResult) -> str | None:
+        if state["nudged"] or state["followup_seen"]:
+            return None
+
+        request_ids = _execution_protocol_request_ids(container)
+        if len(request_ids) == 0:
+            return None
+        if len(request_ids) > 1:
+            state["followup_seen"] = True
+            return None
+        if state["first_request_seen_at_tool_call"] is None:
+            state["first_request_seen_at_tool_call"] = result.tool_call_count
+
+        min_tool_calls = max(
+            _FIRST_INPUT_TOOL_CALL_LIMIT,
+            int(state["first_request_seen_at_tool_call"])
+            + _FEEDBACK_READY_NUDGE_GRACE_TOOL_CALLS,
+        )
+        if result.tool_call_count < min_tool_calls:
+            return None
+
+        ready_ids = [
+            request_id for request_id in _ready_feedback_request_ids(container)
+            if request_id in set(request_ids)
+        ]
+        if not ready_ids:
+            return None
+
+        request_id = ready_ids[0]
+        state["nudged"] = True
+        return (
+            f"SymCC feedback is now ready for request_id={request_id}, but no "
+            "follow-up execution-protocol request has been submitted yet. Stop "
+            "open-ended source reconnaissance. Your next tool call must run "
+            f"`/work/validation/read-feedback {request_id}` and preserve the "
+            "machine fields exactly: exact_target_reached, "
+            "target_operation_reached, target_function_entered, "
+            "allowed_conclusion, best_actual_locations, and any generated "
+            "replay inputs. Then immediately decide one of two actions: submit "
+            "the next improved input through /work/validation/run-input, or "
+            "finalize only if the machine evidence plus a replayable PoC justifies "
+            "that conclusion. Do not keep testing target inputs by invoking the "
+            "target binary directly outside the execution protocol."
+        )
+
+    return nudge
+
+
+def _prebuilt_feedback_followup_nudge(container: str):
+    state = {
+        "nudged": False,
+        "followup_seen": False,
+        "ready_read_seen_at_tool_call": None,
+    }
+
+    def nudge(result: AgentResult) -> str | None:
+        if state["nudged"] or state["followup_seen"]:
+            return None
+
+        request_ids = _execution_protocol_request_ids(container)
+        if len(request_ids) == 0:
+            return None
+        if len(request_ids) > 1:
+            state["followup_seen"] = True
+            return None
+
+        ready_read_ids = {
+            str(event["request_id"])
+            for event in _read_feedback_read_events(container)
+            if event.get("status") == "ready"
+        }
+        actionable_ids = sorted(ready_read_ids.intersection(request_ids))
+        if not actionable_ids:
+            return None
+
+        if state["ready_read_seen_at_tool_call"] is None:
+            state["ready_read_seen_at_tool_call"] = result.tool_call_count
+            return None
+
+        min_tool_calls = (
+            int(state["ready_read_seen_at_tool_call"])
+            + _FEEDBACK_READ_FOLLOWUP_NUDGE_GRACE_TOOL_CALLS
+        )
+        if result.tool_call_count < min_tool_calls:
+            return None
+
+        request_id = actionable_ids[0]
+        state["nudged"] = True
+        return (
+            f"You have already consumed ready SymCC feedback for request_id={request_id}, "
+            "and no follow-up execution-protocol request has been submitted. Stop "
+            "additional source/map reconnaissance now. Your next tool call must "
+            "take one of these bounded actions: either create and run a fresh "
+            "round-002 request through /work/validation/run-input using the best "
+            "current hypothesis or a selected generated replay, or write the "
+            "iteration record and emit final inline dynamic_status tags if you "
+            "can justify stopping with the machine evidence. Do not read more "
+            "source files or inspect more feedback-map entries before taking one "
+            "of those actions."
+        )
+
+    return nudge
+
+
+def _prebuilt_progress_nudge(container: str):
+    first_request_nudge = _prebuilt_first_request_nudge(container)
+    feedback_ready_nudge = _prebuilt_feedback_ready_nudge(container)
+    feedback_followup_nudge = _prebuilt_feedback_followup_nudge(container)
+
+    def nudge(result: AgentResult) -> str | None:
+        message = first_request_nudge(result)
+        if message:
+            return message
+        message = feedback_ready_nudge(result)
+        if message:
+            return message
+        return feedback_followup_nudge(result)
+
+    return nudge
+
+
+def _execution_protocol_request_ids(container: str) -> list[str]:
+    roots = " ".join(
+        shlex.quote(path) for path in (PENDING_ROOT, PROCESSED_ROOT, RESPONSE_ROOT)
+    )
+    rc, out, _err = docker_ops.exec_sh(
+        container,
+        f"find {roots} -maxdepth 1 -type f -name '*.json' -print 2>/dev/null",
+        timeout=10,
+    )
+    if rc != 0:
+        return []
+    request_ids: set[str] = set()
+    for line in out.splitlines():
+        name = Path(line.strip()).name
+        if name.endswith(".json"):
+            request_ids.add(name[:-5])
+    return sorted(request_ids)
+
+
+def _execution_protocol_has_request(container: str) -> bool:
+    return bool(_execution_protocol_request_ids(container))
+
+
+def _ready_feedback_request_ids(container: str) -> list[str]:
+    rc, out, _err = docker_ops.exec_sh(
+        container,
+        (
+            f"find {shlex.quote(FEEDBACK_ROOT)} -maxdepth 1 -type f "
+            "-name '*.json' -print 2>/dev/null"
+        ),
+        timeout=10,
+    )
+    if rc != 0:
+        return []
+    request_ids: set[str] = set()
+    for line in out.splitlines():
+        name = Path(line.strip()).name
+        if name.endswith(".json"):
+            request_ids.add(name[:-5])
+    return sorted(request_ids)
+
+
+def _agent_tool_calls_before_timestamp_ms(
+    result: AgentResult, cutoff_timestamp_ms: int
+) -> int:
+    """Count transcript tool events at or before an epoch-millisecond cutoff."""
+    count = 0
+    for event in result.messages:
+        if not isinstance(event, dict):
+            continue
+        timestamp = event.get("timestamp")
+        if isinstance(timestamp, str) and timestamp.isdigit():
+            timestamp = int(timestamp)
+        if not isinstance(timestamp, (int, float)) or isinstance(timestamp, bool):
+            continue
+        if int(timestamp) > cutoff_timestamp_ms:
+            continue
+        part = event.get("part") if isinstance(event.get("part"), dict) else {}
+        if event.get("type") == "tool" or event.get("type") == "tool_use" or part.get("type") == "tool":
+            count += 1
+    return count
 
 
 @contextmanager
@@ -2571,6 +3531,153 @@ def _parse_exit_code(value: str | None) -> int:
         return -1
     value = value.strip()
     return int(value) if value.lstrip("-").isdigit() else -1
+
+
+def _collect_additional_crashes(
+    container: str, detector: str
+) -> tuple[list[AdditionalCrashSubmission], list[str]]:
+    """Read bounded, separately submitted crash findings without affecting the primary one."""
+    try:
+        exists_rc, _out, _err = docker_ops.exec_sh(
+            container, f"test -f {_ADDITIONAL_CRASHES_PATH}", timeout=15
+        )
+    except Exception as exc:
+        return [], [f"additional-crash manifest unavailable: {exc}"]
+    if exists_rc:
+        return [], []
+    try:
+        symlink_rc, _out, _err = docker_ops.exec_sh(
+            container, f"test ! -L {_ADDITIONAL_CRASHES_PATH}", timeout=15
+        )
+    except Exception as exc:
+        return [], [f"cannot validate additional-crash manifest: {exc}"]
+    if symlink_rc:
+        return [], ["additional-crash manifest must not be a symlink"]
+    try:
+        size_text = docker_ops.exec_sh(
+            container, f"stat -c %s {_ADDITIONAL_CRASHES_PATH}", timeout=15
+        )[1].strip()
+        manifest_size = int(size_text)
+    except Exception as exc:
+        return [], [f"cannot size additional-crash manifest: {exc}"]
+    if manifest_size < 0 or manifest_size > 1_000_000:
+        return [], ["additional-crash manifest exceeds 1000000 bytes"]
+    try:
+        raw = docker_ops.read_file(container, _ADDITIONAL_CRASHES_PATH)
+    except Exception as exc:
+        return [], [f"cannot read additional-crash manifest: {exc}"]
+    if len(raw) != manifest_size:
+        return [], ["additional-crash manifest changed while being read"]
+
+    findings: list[AdditionalCrashSubmission] = []
+    errors: list[str] = []
+    seen: set[str] = set()
+    total_poc_bytes = 0
+    for line_number, line in enumerate(raw.splitlines(), start=1):
+        if not line.strip():
+            continue
+        if len(findings) >= _MAX_ADDITIONAL_CRASHES:
+            errors.append(f"line {line_number}: maximum of {_MAX_ADDITIONAL_CRASHES} submissions exceeded")
+            break
+        try:
+            entry = json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            errors.append(f"line {line_number}: invalid JSON: {exc}")
+            continue
+        if not isinstance(entry, dict):
+            errors.append(f"line {line_number}: submission must be a JSON object")
+            continue
+        required = {
+            "finding_id", "summary", "poc_path", "reproduction_command",
+            "crash_type", "exit_code", "crash_output", "dup_check",
+        }
+        allowed = required | {"poc_kind"}
+        if required - entry.keys() or entry.keys() - allowed:
+            errors.append(f"line {line_number}: fields do not match the additional-crash schema")
+            continue
+        finding_id = entry.get("finding_id")
+        if not isinstance(finding_id, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", finding_id):
+            errors.append(f"line {line_number}: invalid finding_id")
+            continue
+        if finding_id in seen:
+            errors.append(f"line {line_number}: duplicate finding_id {finding_id!r}")
+            continue
+        expected_path = f"{_ADDITIONAL_CRASH_ROOT}/{finding_id}/poc.bin"
+        if entry.get("poc_path") != expected_path:
+            errors.append(f"line {line_number}: poc_path must be {expected_path!r}")
+            continue
+        command = entry.get("reproduction_command")
+        if not isinstance(command, str) or expected_path not in command or len(command) > 4096:
+            errors.append(f"line {line_number}: reproduction_command must include the exact PoC path")
+            continue
+        summary = entry.get("summary")
+        crash_type = entry.get("crash_type")
+        crash_output = entry.get("crash_output")
+        dup_check = entry.get("dup_check")
+        if not all(isinstance(value, str) and value.strip() for value in (
+            summary, crash_type, crash_output, dup_check
+        )):
+            errors.append(f"line {line_number}: summary, crash fields, and dup_check are required")
+            continue
+        if len(summary) > 2000 or len(crash_type) > 200 or len(crash_output) > 10_000 or len(dup_check) > 4000:
+            errors.append(f"line {line_number}: text field exceeds its size limit")
+            continue
+        exit_code = entry.get("exit_code")
+        if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+            errors.append(f"line {line_number}: exit_code must be an integer")
+            continue
+        poc_kind_value = entry.get("poc_kind", "file")
+        if not isinstance(poc_kind_value, str):
+            errors.append(f"line {line_number}: poc_kind must be a string")
+            continue
+        poc_kind = _normalize_poc_kind(poc_kind_value, detector)
+        if poc_kind not in POC_KINDS:
+            errors.append(f"line {line_number}: unsupported poc_kind {poc_kind!r}")
+            continue
+        try:
+            safe_file_rc, _out, _err = docker_ops.exec_sh(
+                container,
+                f"test -d {shlex.quote(_ADDITIONAL_CRASH_ROOT)} && "
+                f"test ! -L {shlex.quote(_ADDITIONAL_CRASH_ROOT)} && "
+                f"test -d {shlex.quote(f'{_ADDITIONAL_CRASH_ROOT}/{finding_id}')} && "
+                f"test ! -L {shlex.quote(f'{_ADDITIONAL_CRASH_ROOT}/{finding_id}')} && "
+                f"test -f {shlex.quote(expected_path)} && "
+                f"test ! -L {shlex.quote(expected_path)}",
+                timeout=15,
+            )
+            if safe_file_rc:
+                errors.append(f"line {line_number}: PoC must be a regular file, not a symlink")
+                continue
+            file_size = int(docker_ops.exec_sh(
+                container, f"stat -c %s {shlex.quote(expected_path)}", timeout=15
+            )[1].strip())
+            if file_size <= 0 or total_poc_bytes + file_size > _MAX_ADDITIONAL_CRASH_BYTES:
+                errors.append(f"line {line_number}: empty PoC or total PoC size exceeds 10 MiB")
+                continue
+            poc_bytes = docker_ops.read_file(container, expected_path)
+        except Exception as exc:
+            errors.append(f"line {line_number}: cannot read PoC: {exc}")
+            continue
+        if len(poc_bytes) != file_size:
+            errors.append(f"line {line_number}: PoC changed while being read")
+            continue
+        seen.add(finding_id)
+        total_poc_bytes += file_size
+        findings.append(AdditionalCrashSubmission(
+            finding_id=finding_id,
+            summary=summary.strip(),
+            crash=CrashArtifact(
+                poc_path=expected_path,
+                poc_bytes=poc_bytes,
+                reproduction_command=command,
+                crash_type=crash_type.strip(),
+                crash_output=crash_output,
+                exit_code=exit_code,
+                dup_check=dup_check.strip(),
+                poc_kind=poc_kind,
+            ),
+        ))
+    return findings, errors
 
 
 def _crash_result_xml_template(candidate_id: str) -> bytes:
@@ -2721,6 +3828,182 @@ def _status_for_missing_poc_submission(
     return status, reason
 
 
+def _status_for_symcc_missing_poc_submission(
+    *, status: str, reason: str, iterations: list[dict]
+) -> tuple[str, str]:
+    """Do not let model-only reachability claims outrank SymCC evidence."""
+    if status not in {"reached_no_crash", "reached_no_effect"}:
+        return status, reason
+    if _has_exact_target_reach_iteration(iterations):
+        return status, reason
+    detail = (
+        "SymCC machine evidence did not confirm an exact target-operation hit; "
+        "a model reachability claim, function entry, nearby block, or pending "
+        "trace is not enough to mark the candidate path reached."
+    )
+    return "iteration_exhausted", f"{reason}\n{detail}".strip()
+
+
+def _dynamic_status_breakdown(
+    *,
+    status: str,
+    detector: str,
+    iterations: list[dict],
+    symbolic_result: dict[str, Any] | None,
+    additional_crashes: list[AdditionalCrashSubmission],
+) -> dict[str, Any]:
+    """Split the dynamic result into audit-friendly dimensions.
+
+    The top-level ``status`` remains the legacy workflow state.  This breakdown
+    lets experiment analysis distinguish target-site approach, PoC materializing,
+    feedback quality, and extra findings without overloading one boolean.
+    """
+
+    observations = _machine_observations_for_status(iterations, symbolic_result)
+    saw_exact = any(
+        item.get("exact_target_reached") is True
+        or item.get("target_operation_reached") is True
+        for item in observations
+    )
+    saw_block = any(
+        item.get("target_block_entered") is True
+        or item.get("target_block_reached") is True
+        for item in observations
+    )
+    saw_function = any(
+        item.get("target_function_entered") is True for item in observations
+    )
+    saw_miss = any(
+        item.get("exact_target_reached") is False
+        or item.get("target_operation_reached") is False
+        or item.get("target_reachability") == "this_execution_missed"
+        for item in observations
+    )
+    saw_invalid_feedback = any(
+        str(item.get("status") or "") in {
+            "map_unavailable", "unavailable", "read_error", "missing",
+        }
+        for item in observations
+    )
+
+    if saw_exact:
+        target_site_status = "exact_reached"
+    elif saw_block:
+        target_site_status = "block_only"
+    elif saw_function:
+        target_site_status = "function_only"
+    elif saw_miss:
+        target_site_status = "missed"
+    elif saw_invalid_feedback:
+        target_site_status = "invalid_feedback"
+    else:
+        target_site_status = "unknown"
+
+    if status == "validated":
+        poc_status = "valid_poc"
+    elif status in {"agent_blocked", "agent_failed"}:
+        poc_status = status
+    elif status == "invalid_submission":
+        poc_status = "invalid_submission"
+    elif status == "wrong_path" or _has_crash_without_candidate_site(iterations):
+        poc_status = "crash_observed_not_submitted"
+    else:
+        poc_status = "no_poc"
+
+    additional_findings_status = "found_ungraded" if additional_crashes else "none"
+
+    feedback_quality_status = "unavailable"
+    if isinstance(symbolic_result, dict) and symbolic_result:
+        ready = _safe_int(symbolic_result.get("feedback_ready"))
+        ready_unconsumed = _safe_int(symbolic_result.get("feedback_ready_unconsumed"))
+        manually_read = _safe_int(symbolic_result.get("feedback_ready_manually_read"))
+        auto_delivered = _safe_int(symbolic_result.get("feedback_auto_delivered"))
+        metrics = symbolic_result.get("metrics")
+        if not isinstance(metrics, dict):
+            metrics = {}
+        exact_hits = _safe_int(metrics.get("exact_target_hit_records"))
+        generated_exact_hits = _safe_int(metrics.get("generated_replay_exact_hits"))
+        if ready_unconsumed > 0:
+            feedback_quality_status = "ready_unconsumed"
+        elif exact_hits > 0 or generated_exact_hits > 0:
+            feedback_quality_status = "useful"
+        elif ready > 0 and (manually_read > 0 or auto_delivered > 0):
+            feedback_quality_status = "consumed_no_improvement"
+        elif ready > 0:
+            feedback_quality_status = "ready_unconsumed"
+        else:
+            feedback_quality_status = "unavailable"
+
+    return {
+        "target_site_status": target_site_status,
+        "poc_status": poc_status,
+        "grade_status": "not_run",
+        "additional_findings_status": additional_findings_status,
+        "feedback_quality_status": feedback_quality_status,
+        "detector": detector,
+    }
+
+
+def _machine_observations_for_status(
+    iterations: list[dict], symbolic_result: dict[str, Any] | None
+) -> list[dict[str, Any]]:
+    observations: list[dict[str, Any]] = []
+    for record in iterations:
+        if not isinstance(record, dict):
+            continue
+        machine = record.get("machine_evidence")
+        if isinstance(machine, dict):
+            observations.append(machine)
+            continue
+        iteration_observation = record.get("symcc_observation")
+        if isinstance(iteration_observation, dict):
+            observations.append(iteration_observation)
+    if isinstance(symbolic_result, dict):
+        records = symbolic_result.get("records")
+        if isinstance(records, list):
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                observation = record.get("symcc_observation")
+                if isinstance(observation, dict):
+                    observations.append(observation)
+                generated = record.get("generated_replays")
+                if isinstance(generated, list):
+                    for item in generated:
+                        if not isinstance(item, dict):
+                            continue
+                        seed_observation = item.get("symcc_observation")
+                        if isinstance(seed_observation, dict):
+                            observations.append(seed_observation)
+    return observations
+
+
+def _safe_int(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    if not math.isfinite(float(value)):
+        return 0
+    return max(0, int(value))
+
+
+def _has_exact_target_reach_iteration(iterations: list[dict]) -> bool:
+    for record in iterations:
+        if not isinstance(record, dict):
+            continue
+        machine = record.get("machine_evidence")
+        if isinstance(machine, dict):
+            if (
+                machine.get("exact_target_reached") is True
+                or machine.get("target_operation_reached") is True
+            ):
+                return True
+            continue
+        observations = record.get("observations")
+        if isinstance(observations, dict) and observations.get("site_reached") is True:
+            return True
+    return False
+
+
 def _persist_instrumentation(
     report: InstrumentationReport | None,
     result_path: str | None,
@@ -2748,7 +4031,8 @@ def _prepare_iteration_workspace(
     try:
         rc, _out, _err = docker_ops.exec_sh(
             container,
-            "mkdir -p /work/validation/iterations",
+            "mkdir -p /work/validation/iterations "
+            "/work/validation/additional-crashes",
             timeout=15,
         )
         if rc:
@@ -2827,6 +4111,10 @@ def _prepare_iteration_workspace(
             "machine-readable template is in `iteration-contract.json`. "
             "The record does not replace the final PoC XML contract. Do not "
             "put secrets or unbounded command output in it.\n"
+            "Incidental independent target crashes, if found during this work, "
+            "have a separate submission file at "
+            "`/work/validation/additional-crashes.jsonl`; see the prompt section. "
+            "They do not replace this candidate's result.\n"
         )
         docker_ops.write_file(
             container,
@@ -2843,7 +4131,22 @@ def _prepare_iteration_workspace(
             "`/work/validation/crash-result.xml` and fill its existing element "
             "text. Keep the root, field names, order, and attributes unchanged. "
             "This file is not needed for no-crash or unreachable outcomes; "
-            "report those with the normal dynamic-status tags.\n"
+            "report those with the normal dynamic-status tags.\n\n"
+            "For a no-crash or no-PoC conclusion, your final assistant message "
+            "must contain these inline XML tags exactly once:\n\n"
+            "<dynamic_status>iteration_exhausted</dynamic_status>\n"
+            f"<candidate_id>{candidate.candidate_id}</candidate_id>\n"
+            "<reached_functions>comma-separated functions actually reached, "
+            "or empty</reached_functions>\n"
+            "<reachability_evidence>bounded commands, feedback request ids, "
+            "and machine evidence</reachability_evidence>\n"
+            "<reason>evidence-based conclusion</reason>\n\n"
+            "Allowed dynamic_status values are: not_reached, reached_no_crash, "
+            "reached_no_effect, wrong_behavior, wrong_path, "
+            "environment_blocked, invalid_submission, agent_failed, "
+            "agent_blocked, false_positive, and iteration_exhausted. When the "
+            "iteration budget is consumed without a validated PoC, prefer "
+            "`iteration_exhausted` over a narrative-only answer.\n"
         )
         docker_ops.write_file(
             container,
@@ -2995,7 +4298,10 @@ def _reconcile_symcc_iterations(
             observation.get("target_ids_configured") is True
             and observation.get("target_ids_valid") is True
         )
-        raw_reached = observation.get("target_reached")
+        raw_reached = observation.get(
+            "exact_target_reached",
+            observation.get("target_operation_reached", observation.get("target_reached")),
+        )
         if target_ids_valid and raw_reached is True:
             site_reached: bool | None = True
         elif (
@@ -3059,8 +4365,14 @@ def _reconcile_symcc_iterations(
             "trace_truncated": observation.get("trace_truncated"),
             "target_ids_configured": observation.get("target_ids_configured"),
             "target_ids_valid": observation.get("target_ids_valid"),
+            "exact_target_reached": observation.get("exact_target_reached"),
+            "target_operation_reached": observation.get("target_operation_reached"),
+            "target_function_entered": observation.get("target_function_entered"),
+            "target_block_entered": observation.get("target_block_entered"),
             "target_reached": observation.get("target_reached"),
             "target_block_reached": observation.get("target_block_reached"),
+            "target_anchor_granularity": observation.get("target_anchor_granularity"),
+            "allowed_conclusion": observation.get("allowed_conclusion"),
             "closest_observed_location": observation.get("closest_observed_location"),
             "distance": observation.get("distance"),
             "distance_kind": observation.get("distance_kind"),

@@ -1,0 +1,22 @@
+# Controlled prebuilt image for rerunning the ARVO 62290 SymCC experiment.
+image_tag: local/arvo-62290-site-feedback-nogit:20260924-nopie-retest
+github_url: https://github.com/ittiam-systems/libavc
+commit: b2a61a152a5e83b3419212e8d15a10d4488e51d9
+binary_path: /out/svc_dec_fuzzer_clean
+source_root: /src/libavc
+detector: asan
+memory_limit: 8g
+instrumentation:
+  default: "off"
+  providers: []
+symbolic_execution:
+  default: "off"
+  providers:
+    - symcc
+  symcc:
+    binary_path: /out/svc_dec_fuzzer_symcc
+    feedback_map_path: /out/symcc-feedback-map-nopie
+    commit: b2a61a152a5e83b3419212e8d15a10d4488e51d9
+    memory_limit: 4g
+    cpus: 2
+    max_concurrent_jobs: 2

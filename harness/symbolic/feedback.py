@@ -337,8 +337,15 @@ def summarize_trace(
     if trace.status in {"invalid", "missing_or_truncated", "incomplete"}:
         return {
             "trace_status": trace.status,
+            "exact_target_reached": None,
+            "target_operation_reached": None,
+            "target_function_entered": None,
+            "target_block_entered": None,
             "target_reached": None,
+            "target_block_reached": None,
             "target_reachability": "unknown",
+            "target_anchor_granularity": "unknown",
+            "allowed_conclusion": "target reach is unknown because the runtime trace is invalid or incomplete",
             "distance": None,
             "distance_kind": "static_icfg_edges",
             "distance_is_heuristic": True,
@@ -347,13 +354,24 @@ def summarize_trace(
 
     observed_ids = {event.site_id for event in trace.events}
     unknown_ids = sorted(observed_ids - set(graph["nodes"]) - set(graph["locations"]))
-    target_reached: bool | None
-    if not markers:
-        target_reached = None
+    reached_blocks = {
+        event.site_id for event in trace.events
+        if event.kind == 1 and event.site_id in graph["nodes"]
+    }
+
+    operation_markers = markers.intersection(set(graph["locations"]))
+    target_anchor_granularity = (
+        "source_location" if operation_markers
+        else "basic_block_or_function" if markers
+        else "unknown"
+    )
+    exact_target_reached: bool | None
+    if not operation_markers:
+        exact_target_reached = None
     else:
-        observed_target_marker = bool(observed_ids.intersection(markers))
+        observed_target_marker = bool(observed_ids.intersection(operation_markers))
         if observed_target_marker or trace.target_reached is True:
-            target_reached = True
+            exact_target_reached = True
         elif (
             trace.complete
             and not trace.truncated
@@ -362,29 +380,25 @@ def summarize_trace(
             # normally and the event stream contains every callback. For a
             # truncated stream, the runtime's target marker flag is the only
             # valid negative oracle.
-            target_reached = False
+            exact_target_reached = False
         elif (
             trace.complete
             and trace.target_ids_configured
             and trace.target_ids_valid
             and trace.target_reached is False
         ):
-            target_reached = False
+            exact_target_reached = False
         else:
-            target_reached = None
+            exact_target_reached = None
 
     distances = _reverse_distances(graph["successors"], targets)
-    reached_blocks = {
-        event.site_id for event in trace.events
-        if event.kind == 1 and event.site_id in graph["nodes"]
-    }
     observed_target_blocks = reached_blocks.intersection(targets)
     if observed_target_blocks:
-        target_block_reached: bool | None = True
+        target_block_entered: bool | None = True
     elif trace.complete and not trace.truncated and targets:
-        target_block_reached = False
+        target_block_entered = False
     else:
-        target_block_reached = None
+        target_block_entered = None
     best = min(
         ((distances[site_id], site_id) for site_id in reached_blocks if site_id in distances),
         default=None,
@@ -401,21 +415,74 @@ def summarize_trace(
             "line": node["line"],
         }
 
+    preferred_functions: set[str] = set()
+    preferred_source_files: set[str] = set()
+    for target_id in targets:
+        target_node = graph["nodes"].get(target_id)
+        if target_node is not None:
+            preferred_functions.add(target_node["function"])
+            if target_node["source_file"]:
+                preferred_source_files.add(target_node["source_file"])
+    for marker_id in markers:
+        target_location = graph["locations"].get(marker_id)
+        if target_location is not None:
+            preferred_functions.add(target_location["source_function"])
+            preferred_source_files.add(target_location["source_file"])
+        else:
+            target_node = graph["nodes"].get(marker_id)
+            if target_node is not None:
+                preferred_functions.add(target_node["function"])
+                if target_node["source_file"]:
+                    preferred_source_files.add(target_node["source_file"])
+    reached_functions = {
+        graph["nodes"][site_id]["function"] for site_id in reached_blocks
+        if site_id in graph["nodes"]
+    }
+    if preferred_functions and reached_functions.intersection(preferred_functions):
+        target_function_entered: bool | None = True
+    elif trace.complete and not trace.truncated and preferred_functions:
+        target_function_entered = False
+    else:
+        target_function_entered = None
+    observed_locations, observed_location_count = _observed_locations(
+        graph,
+        trace.events,
+        preferred_functions=preferred_functions,
+        preferred_source_files=preferred_source_files,
+    )
+    target_reachability = (
+        "this_execution_hit" if exact_target_reached is True
+        else "this_execution_missed" if exact_target_reached is False
+        else "unknown"
+    )
+
     return {
+        "feedback_schema_version": 2,
         "trace_status": trace.status,
         "trace_complete": trace.complete,
         "trace_truncated": trace.truncated,
         "target_ids_configured": trace.target_ids_configured,
         "target_ids_valid": trace.target_ids_valid,
         "observed_block_count": len(reached_blocks),
-        "observed_locations": _observed_locations(graph, trace.events),
+        "observed_locations": observed_locations,
+        "observed_location_count": observed_location_count,
+        "observed_locations_limited": observed_location_count > len(observed_locations),
+        "observed_locations_ordered": False,
+        "observed_locations_selection": "target_function_then_target_file_then_other_sites",
         "unknown_site_ids": unknown_ids[:64],
-        "target_reached": target_reached,
-        "target_block_reached": target_block_reached,
-        "target_reachability": (
-            "this_execution_hit" if target_reached is True
-            else "this_execution_missed" if target_reached is False
-            else "unknown"
+        "exact_target_reached": exact_target_reached,
+        "target_operation_reached": exact_target_reached,
+        "target_function_entered": target_function_entered,
+        "target_block_entered": target_block_entered,
+        "target_reached": exact_target_reached,
+        "target_block_reached": target_block_entered,
+        "target_reachability": target_reachability,
+        "target_anchor_granularity": target_anchor_granularity,
+        "allowed_conclusion": _allowed_conclusion(
+            exact_target_reached=exact_target_reached,
+            target_function_entered=target_function_entered,
+            target_block_entered=target_block_entered,
+            target_anchor_granularity=target_anchor_granularity,
         ),
         "closest_observed_location": closest,
         "distance": distance,
@@ -492,9 +559,22 @@ def _strict_bool(value: Any, label: str) -> bool:
 
 
 def _observed_locations(
-    graph: Mapping[str, Any], events: Iterable[TraceEvent]
-) -> list[dict[str, Any]]:
-    locations: list[dict[str, Any]] = []
+    graph: Mapping[str, Any],
+    events: Iterable[TraceEvent],
+    *,
+    preferred_functions: set[str] | None = None,
+    preferred_source_files: set[str] | None = None,
+    limit: int = 256,
+) -> tuple[list[dict[str, Any]], int]:
+    """Return observed locations with target-context sites first.
+
+    This is a selection over locations actually present in the trace, not a
+    path/distance inference. Priority ordering is deliberately not execution
+    order; repeated site IDs are already deduplicated by the runtime.
+    """
+    preferred_functions = preferred_functions or set()
+    preferred_source_files = preferred_source_files or set()
+    ranked: list[list[dict[str, Any]]] = [[], [], []]
     seen: set[int] = set()
     for event in events:
         if event.kind != 2 or event.site_id in seen:
@@ -503,13 +583,53 @@ def _observed_locations(
         if location is None:
             continue
         seen.add(event.site_id)
-        locations.append({
+        observed = {
             key: location[key]
             for key in ("source_file", "source_function", "line", "column")
-        })
-        if len(locations) >= 256:
-            break
-    return locations
+        }
+        if location["source_function"] in preferred_functions:
+            priority = 0
+        elif location["source_file"] in preferred_source_files:
+            priority = 1
+        else:
+            priority = 2
+        ranked[priority].append(observed)
+
+    total = sum(len(group) for group in ranked)
+    locations = [location for group in ranked for location in group]
+    return locations[:limit], total
+
+
+def _allowed_conclusion(
+    *,
+    exact_target_reached: bool | None,
+    target_function_entered: bool | None,
+    target_block_entered: bool | None,
+    target_anchor_granularity: str,
+) -> str:
+    if target_anchor_granularity != "source_location":
+        return (
+            "no precise source-location operation marker was configured; "
+            "function or block entry cannot prove the vulnerability operation ran"
+        )
+    if exact_target_reached is True:
+        return "the precise target operation marker was observed in this execution"
+    if exact_target_reached is False:
+        if target_block_entered is True:
+            return (
+                "entered the target block, but did not observe the precise target "
+                "operation marker"
+            )
+        if target_function_entered is True:
+            return (
+                "entered the target function, but did not observe the precise target "
+                "operation marker"
+            )
+        return "this complete execution did not observe the precise target operation marker"
+    return (
+        "target operation reach is unknown; do not treat this as a hit or a "
+        "definitive miss"
+    )
 
 
 def _id_list(value: Any, label: str) -> list[int]:

@@ -78,11 +78,16 @@ _TEXT = {"type": "text", "sessionID": "ses-1",
          "part": {"type": "text", "messageID": "msg-1", "text": "done"}}
 _STEP_FINISH = {"type": "step_finish", "sessionID": "ses-1",
                 "part": {"type": "step-finish", "messageID": "msg-1", "reason": "stop"}}
+_TOOL = {"type": "tool_use", "sessionID": "ses-1",
+         "part": {"type": "tool", "tool": "bash"}}
 
 
 def test_clean_completion_returns_without_resume(monkeypatch):
     spawned = _fake_cli(monkeypatch, [[_STEP_START, _TEXT, _STEP_FINISH]])
-    result = asyncio.run(run_agent("go", container="c", max_turns=50, model="m"))
+    result = asyncio.run(run_agent(
+        "go", container="c", max_turns=50, model="m",
+        phase_timeout_s=None, idle_timeout_s=None,
+    ))
     assert len(spawned) == 1
     assert result.error is None
     assert result.session_id == "ses-1"
@@ -107,6 +112,80 @@ def test_error_event_resumes(monkeypatch):
     assert "--session" in spawned[1] and "ses-1" in spawned[1]
     assert result.resume_count == 1
     assert result.error is None  # resumed cleanly
+
+
+def test_progress_nudge_resumes_with_corrective_prompt(monkeypatch):
+    spawned = _fake_cli(
+        monkeypatch,
+        [[_STEP_START, _TOOL], [_STEP_START, _TEXT, _STEP_FINISH]],
+    )
+    nudged = {"sent": False}
+
+    def nudge(result):
+        if result.tool_call_count >= 1 and not nudged["sent"]:
+            nudged["sent"] = True
+            return "submit a baseline request now"
+        return None
+
+    result = asyncio.run(
+        run_agent(
+            "go",
+            container="c",
+            max_turns=50,
+            model="m",
+            tools=None,
+            max_resume_attempts=1,
+            progress_nudge=nudge,
+        )
+    )
+
+    assert len(spawned) == 2
+    assert "--session" in spawned[1] and "ses-1" in spawned[1]
+    assert spawned[1][-1] == "submit a baseline request now"
+    assert result.resume_count == 1
+    assert result.error is None
+
+
+def test_completion_predicate_stops_agent_without_error(monkeypatch):
+    final_text = {
+        "type": "text",
+        "sessionID": "ses-1",
+        "part": {
+            "type": "text",
+            "messageID": "msg-2",
+            "text": "<dynamic_status>iteration_exhausted</dynamic_status>",
+        },
+    }
+    trailing_text = {
+        "type": "text",
+        "sessionID": "ses-1",
+        "part": {
+            "type": "text",
+            "messageID": "msg-3",
+            "text": "this should not be consumed",
+        },
+    }
+    spawned = _fake_cli(monkeypatch, [[_STEP_START, final_text, trailing_text]])
+
+    result = asyncio.run(run_agent(
+        "go",
+        container="c",
+        max_turns=50,
+        model="m",
+        phase_timeout_s=None,
+        idle_timeout_s=None,
+        completion_predicate=lambda r: "iteration_exhausted" in r.find_tagged_message(
+            "dynamic_status"
+        ),
+    ))
+
+    assert len(spawned) == 1
+    assert result.error is None
+    assert result.find_tagged_message("dynamic_status") == final_text["part"]["text"]
+    assert all(
+        "this should not be consumed" not in json.dumps(message)
+        for message in result.messages
+    )
 
 
 def test_resume_exhausted_preserves_error(monkeypatch):

@@ -16,6 +16,7 @@ REQUEST_ROOT = f"{PROTOCOL_ROOT}/requests"
 PENDING_ROOT = f"{PROTOCOL_ROOT}/pending"
 RESPONSE_ROOT = f"{PROTOCOL_ROOT}/responses"
 FEEDBACK_ROOT = f"{PROTOCOL_ROOT}/feedback"
+FEEDBACK_READ_LOG = f"{PROTOCOL_ROOT}/feedback-reads.jsonl"
 PROCESSED_ROOT = f"{PROTOCOL_ROOT}/processed"
 SNAPSHOT_ROOT = f"{PROTOCOL_ROOT}/snapshots"
 RUNNER_PATH = "/work/validation/run-input"
@@ -187,9 +188,13 @@ case "$id" in [A-Za-z0-9]*) ;; *) echo "unsafe request id" >&2; exit 2;; esac
 case "$id" in *[!A-Za-z0-9_.-]*) echo "unsafe request id" >&2; exit 2;; esac
 [ "${#id}" -le 80 ] || { echo "request id is too long" >&2; exit 2; }
 feedback="/work/validation/execution/feedback/$id.json"
+read_log="/work/validation/execution/feedback-reads.jsonl"
+now=$(date +%s 2>/dev/null || echo 0)
 if [ -f "$feedback" ]; then
+  printf '{"request_id":"%s","status":"ready","wall_time_s":%s}\\n' "$id" "$now" >> "$read_log" 2>/dev/null || true
   cat -- "$feedback"
 else
+  printf '{"request_id":"%s","status":"pending","wall_time_s":%s}\\n' "$id" "$now" >> "$read_log" 2>/dev/null || true
   printf '{"schema_version":1,"status":"pending","request_id":"%s"}\\n' "$id"
 fi
 '''
@@ -235,8 +240,13 @@ def protocol_readme(
         "If you parse or redirect runner output, preserve and print a concise summary of every "
         "ready-feedback record; do not filter it down to only the clean-target result. "
         f"For an individual request, `{FEEDBACK_READER_PATH} round-001` remains available and returns "
-        "`pending` immediately if the background job is still running. Do not poll in a tight loop "
-        "or wait on it; continue source analysis and input work. "
+        "`pending` immediately if the background job is still running. Do not run `sleep`, "
+        "`watch`, a polling loop, or any blocking wait for SymCC; continue source analysis "
+        "and input work. Before ending the dynamic phase "
+        "without a validated PoC, read each still-pending request once with `read-feedback` and "
+        "include the latest ready/pending status in your iteration evidence. If feedback is "
+        "still pending at the request limit, emit the final status immediately instead of "
+        "waiting for it to become ready. "
         if symbolic_enabled else ""
     )
     return f'''# Dynamic execution protocol

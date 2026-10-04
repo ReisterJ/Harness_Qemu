@@ -99,17 +99,32 @@ def test_prebuilt_symcc_protocol_is_the_final_dynamic_prompt_override():
     assert "its response may include `ready_feedback`" in prompt
     assert "mandatory" in prompt and "inspect it before choosing the next" in prompt
     assert "at most 8 input requests" in prompt
+    assert "first 5 minutes or first 25 meaningful tool calls" in prompt
+    assert "MUST be submitted through this protocol" in prompt
+    assert "hard requirement, not a suggestion or priority" in prompt
+    assert "Mandatory first-input deadline" in prompt
+    assert "aim to submit" not in prompt
+    assert "Do not wait until you believe an input is close" in prompt
+    assert "Never run `sleep` or a polling loop" in prompt
     assert "iteration_limit_reached" in prompt
-    assert "preserve and print a concise" in prompt
-    assert "summary of every `ready_feedback` record" in prompt
-    assert "Do not filter" in prompt
-    assert "output or silently discard" in prompt
+    assert "preserve a concise summary of every record" in prompt
+    assert "bounded, target-context-prioritized locations actually" in prompt
+    assert "Do not replace actual observations" in prompt
+    assert "silently discard `ready_feedback`" in prompt
     assert "read-feedback" in prompt
     assert "excess jobs wait, not skip" in prompt
     assert "concrete trace" in prompt and "symbolic-exploration" in prompt
     assert "snapshots its bytes before execution" in prompt
     assert "If the reader returns `pending`, do" in prompt
     assert "Do not compile a source slice" in prompt
+    assert "target-function/file prioritized" in prompt
+    assert "not a chronological execution path" in prompt
+    assert "Each generated replay has its own input hash" in prompt
+    assert "Do not use CFG distance" in prompt
+    assert "do not end with" in prompt and "a question asking whether to continue" in prompt
+    assert "a complete trace miss proves only" in prompt
+    assert "submitted input missed the marker" in prompt
+    assert "Your final" in prompt and "response must include the normal inline status tags" in prompt
     assert prompt.rfind("Harness execution override") > prompt.rfind(
         "Dynamic-validation scope"
     )
@@ -135,7 +150,8 @@ def test_ready_symbolic_context_teaches_the_tool_contract_not_the_answer():
     assert "your next tool action must submit" in prompt
     assert "Do not inspect VCS history" in prompt
     assert "at most 300 seconds per invocation" in prompt
-    assert "reserve at least 300 seconds" in prompt
+    assert "Do not assume a default 1800-second phase limit" in prompt
+    assert "If an overall deadline was supplied, reserve time" in prompt
     assert "Write each record immediately" in prompt
     assert prompt.index("Required first-step symbolic-execution probe") < prompt.index(
         "You are conducting authorized security research"

@@ -17,6 +17,9 @@
   vuln-pipeline static <target> --model <model>                # source-only static report
   vuln-pipeline dynamic <target> --static-report <path> --model <model>
                                                                # validate one static candidate
+  vuln-pipeline dynamic-pairs <target> --static-report <path> --model <model>
+                                                               # paired off/feedback dynamic runs
+  vuln-pipeline plan-dynamic-pairs                              # print paired experiment commands
   vuln-pipeline run <target> --model <model>                   # one find + grade cycle
   vuln-pipeline run <target> --model <m> --runs 8 --parallel   # 8 concurrent, round-robin focus areas
   vuln-pipeline run <target> --model <m> --auto-focus          # recon discovers focus areas first
@@ -38,6 +41,8 @@ import argparse
 import asyncio
 import json
 import os
+import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -48,7 +53,15 @@ from pathlib import Path
 
 from . import docker_ops, sandbox
 from .agent import color
-from .artifacts import CrashArtifact, LogicArtifact, RunResult, StaticFinding
+from .artifacts import (
+    AdditionalCrashSubmission,
+    AdditionalFindingResult,
+    CrashArtifact,
+    GraderVerdict,
+    LogicArtifact,
+    RunResult,
+    StaticFinding,
+)
 from .asan import asan_excerpt, crash_reason, top_frame
 from .config import TargetConfig
 from .dedup import dedup
@@ -59,6 +72,7 @@ from .find import (
     run_find,
 )
 from .dynamic_validation import run_dynamic_validation
+from .experiment_summary import render_markdown_summary, summarize_experiment_tree
 from .static_analysis import run_static_analysis
 from .grade import run_grade
 from .judge import run_judge, run_compare
@@ -132,6 +146,16 @@ def resolve_target_dir(target: str) -> Path:
     raise FileNotFoundError(
         f"Target '{target}' not found. Looked at: {p}, {local}"
     )
+
+
+def _positive_seconds(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number of seconds") from exc
+    if not (seconds > 0 and seconds < float("inf")):
+        raise argparse.ArgumentTypeError("must be a positive finite number of seconds")
+    return seconds
 
 
 def terminate_subprocesses() -> None:
@@ -248,6 +272,12 @@ def _write_result(out_dir: Path, result: RunResult) -> None:
     slim = result.to_dict()
     slim["find_transcript"] = f"see find_transcript.jsonl ({len(result.find_transcript)} messages)"
     slim["grade_transcript"] = f"see grade_transcript.jsonl ({len(result.grade_transcript)} messages)"
+    for item in slim.get("additional_findings", []):
+        finding_id = item.get("finding_id", "unknown")
+        item["grade_transcript"] = (
+            f"see additional_findings/{finding_id}/grade_transcript.jsonl "
+            f"({len(item.get('grade_transcript') or [])} messages)"
+        )
     # Pipeline-parsed classification: deterministic crash_type / severity /
     # operation. Sits alongside the agent-emitted crash_type so downstream
     # consumers can cross-check (the agent tag is free-text and fragments).
@@ -273,6 +303,7 @@ async def _run_once(
     instrumentation: str | None = None,
     max_iterations: int = DEFAULT_DYNAMIC_MAX_ITERATIONS,
     symbolic_execution: str | None = None,
+    phase_timeout_s: float | None = None,
 ) -> RunResult:
     """One find(+grade) attempt. Assumes image is already built.
 
@@ -284,15 +315,28 @@ async def _run_once(
     timings: dict[str, float] = {}
     instrumentation_result: dict | None = None
     symbolic_execution_result: dict | None = None
+    additional_crashes: list[AdditionalCrashSubmission] = []
     out_dir.mkdir(parents=True, exist_ok=True)
     find_container = f"find_{target.name}_{run_idx}"
     grade_container = f"grader_{target.name}_{run_idx}"
 
-    def _done(result: RunResult) -> RunResult:
+    async def _done(result: RunResult) -> RunResult:
         if result.instrumentation is None:
             result.instrumentation = instrumentation_result
         if result.symbolic_execution is None:
             result.symbolic_execution = symbolic_execution_result
+        if additional_crashes:
+            result.additional_findings = await _grade_additional_crashes(
+                additional_crashes,
+                target=target,
+                model=model,
+                agent_env=agent_env,
+                out_dir=out_dir,
+                run_idx=run_idx,
+                system_prompt=system_prompt,
+                grade=find_only is False,
+                found_bugs_path=found_bugs_path,
+            )
         _write_result(out_dir, result)
         return result
 
@@ -324,6 +368,7 @@ async def _run_once(
             symbolic_execution=symbolic_execution,
             symbolic_execution_result_path=str(out_dir / "symbolic_execution"),
             max_iterations=max_iterations,
+            phase_timeout_s=phase_timeout_s,
         )
         # FindPhaseResult preserves the historical three-value iteration API;
         # tuple-returning test doubles and older integrations remain valid.
@@ -333,9 +378,13 @@ async def _run_once(
         static_finding = static_findings[0] if static_findings else None
         instrumentation_result = getattr(find_outcome, "instrumentation", None)
         symbolic_execution_result = getattr(find_outcome, "symbolic_execution", None)
+        dynamic_result = getattr(find_outcome, "dynamic_result", None)
+        additional_crashes = list(
+            getattr(dynamic_result, "additional_crashes", []) or []
+        )
     except Exception as e:
         traceback.print_exc()
-        return _done(RunResult(
+        return await _done(RunResult(
             target=target.name, status="agent_failed",
             crash=None, verdict=None, logic=None, timings=timings,
             error=f"find agent: {type(e).__name__}: {e}",
@@ -356,7 +405,7 @@ async def _run_once(
     if find_result.error:
         if crash is None and logic is None:
             print(f"[find:{run_idx}] Agent failed: {find_result.error}")
-            return _done(RunResult(
+            return await _done(RunResult(
                 target=target.name, status="agent_failed",
                 crash=None, verdict=None, logic=None,
                 find_transcript=find_transcript, timings=timings,
@@ -375,7 +424,7 @@ async def _run_once(
     artifact = crash or logic
     if artifact is None:
         print(f"[find:{run_idx}] No PoC artifact emitted.")
-        return _done(RunResult(
+        return await _done(RunResult(
             target=target.name, status="no_crash_found",
             crash=None, verdict=None, logic=None,
             find_transcript=find_transcript, timings=timings,
@@ -391,7 +440,7 @@ async def _run_once(
     # crash doesn't pollute siblings' dedup context.
     if artifact.dup_check is None:
         print(f"[find:{run_idx}] Rejected: missing <dup_check> tag.")
-        return _done(RunResult(
+        return await _done(RunResult(
             target=target.name, status="agent_failed",
             crash=crash, logic=logic, verdict=None,
             find_transcript=find_transcript, timings=timings,
@@ -405,7 +454,7 @@ async def _run_once(
         _append_found(found_bugs_path, artifact, run_idx)
 
     if find_only:
-        return _done(RunResult(
+        return await _done(RunResult(
             target=target.name, status="no_crash_found",  # ungraded → not confirmed
             crash=crash, logic=logic, verdict=None,
             find_transcript=find_transcript, timings=timings,
@@ -425,7 +474,7 @@ async def _run_once(
         )
     except Exception as e:
         traceback.print_exc()
-        return _done(RunResult(
+        return await _done(RunResult(
             target=target.name, status="agent_failed",
             crash=crash, logic=logic, verdict=None,
             find_transcript=find_transcript, timings=timings,
@@ -436,7 +485,7 @@ async def _run_once(
 
     if grade_result.error:
         print(f"[grade:{run_idx}] Agent failed: {grade_result.error}")
-        return _done(RunResult(
+        return await _done(RunResult(
             target=target.name, status="agent_failed",
             crash=crash, logic=logic, verdict=None,
             find_transcript=find_transcript, grade_transcript=grade_transcript,
@@ -457,7 +506,7 @@ async def _run_once(
         find_transcript=find_transcript, grade_transcript=grade_transcript,
         timings=timings, error=find_error, instrumentation=instrumentation_result,
     )
-    _write_result(out_dir, result)
+    await _done(result)
 
     # ── Streaming: judge → report dispatch ───────────────────────────────────────
     # result.json is already on disk — errors here shouldn't clobber it. The
@@ -696,6 +745,88 @@ def _append_found(
         f.write(json.dumps(entry) + "\n")
 
 
+async def _grade_additional_crashes(
+    submissions: list[AdditionalCrashSubmission],
+    *,
+    target: TargetConfig,
+    model: str,
+    agent_env: dict[str, str],
+    out_dir: Path,
+    run_idx: int,
+    system_prompt: str | None,
+    grade: bool,
+    found_bugs_path: Path | None,
+) -> list[AdditionalFindingResult]:
+    """Persist and independently grade incidental crashes without changing the primary verdict."""
+    results: list[AdditionalFindingResult] = []
+    root = out_dir / "additional_findings"
+    for submission in submissions:
+        finding_dir = root / submission.finding_id
+        finding_dir.mkdir(parents=True, exist_ok=True)
+        poc_path = finding_dir / "poc.bin"
+        poc_path.write_bytes(submission.crash.poc_bytes)
+        if found_bugs_path:
+            _append_found(found_bugs_path, submission.crash, run_idx)
+
+        if not grade:
+            result = AdditionalFindingResult(
+                finding_id=submission.finding_id,
+                summary=submission.summary,
+                crash=submission.crash,
+                status="submitted_ungraded",
+            )
+        else:
+            safe_name = f"grader_{target.name}_{run_idx}_extra_{submission.finding_id}"
+            safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", safe_name)[:63]
+            transcript_path = finding_dir / "grade_transcript.jsonl"
+            started = time.monotonic()
+            try:
+                verdict, grade_agent, elapsed = await run_grade(
+                    submission.crash,
+                    target,
+                    model=model,
+                    workspace_dir=str(finding_dir / "grade_workspace"),
+                    agent_env=agent_env,
+                    container_name=safe_name,
+                    transcript_path=str(transcript_path),
+                    progress_prefix=f"[grade-extra:{submission.finding_id}]",
+                    system_prompt=system_prompt,
+                    # Do not pass the primary static candidate: this is an
+                    # independent crash and must be graded on its own evidence.
+                    static_finding=None,
+                )
+                transcript = grade_agent.transcript()
+                agent_error = grade_agent.error
+                result = AdditionalFindingResult(
+                    finding_id=submission.finding_id,
+                    summary=submission.summary,
+                    crash=submission.crash,
+                    status=(
+                        "agent_failed" if agent_error else
+                        "crash_found" if verdict.passed else "crash_rejected"
+                    ),
+                    verdict=None if agent_error else verdict,
+                    grade_transcript=transcript,
+                    elapsed_s=elapsed or (time.monotonic() - started),
+                    error=agent_error,
+                )
+            except Exception as exc:
+                result = AdditionalFindingResult(
+                    finding_id=submission.finding_id,
+                    summary=submission.summary,
+                    crash=submission.crash,
+                    status="agent_failed",
+                    elapsed_s=time.monotonic() - started,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+
+        (finding_dir / "result.json").write_text(
+            json.dumps(result.to_dict(), indent=2, ensure_ascii=False) + "\n"
+        )
+        results.append(result)
+    return results
+
+
 def _read_found_summaries(path: Path) -> list[str]:
     if not path.exists():
         return []
@@ -880,7 +1011,8 @@ async def _run_all(
                          symbolic_execution=getattr(args, "symbolic_execution", None),
                          max_iterations=getattr(
                              args, "max_iterations", DEFAULT_DYNAMIC_MAX_ITERATIONS
-                         ))
+                         ),
+                         phase_timeout_s=getattr(args, "phase_timeout", None))
 
     if args.parallel:
         n_live = args.runs - len(checkpoints)
@@ -1038,6 +1170,10 @@ def main() -> int:
     p_dynamic.add_argument("--max-turns", type=int, default=DEFAULT_DYNAMIC_MAX_TURNS,
                            help=f"Dynamic-agent turn budget (default {DEFAULT_DYNAMIC_MAX_TURNS})")
     p_dynamic.add_argument(
+        "--phase-timeout", type=_positive_seconds, default=None, metavar="SECONDS",
+        help="Optional overall dynamic-phase deadline in seconds; omitted means no overall deadline",
+    )
+    p_dynamic.add_argument(
         "--max-iterations", type=int, default=DEFAULT_DYNAMIC_MAX_ITERATIONS,
         help=("Maximum adaptive dynamic-validation rounds "
               f"(default {DEFAULT_DYNAMIC_MAX_ITERATIONS})"),
@@ -1058,6 +1194,93 @@ def main() -> int:
     p_dynamic.add_argument("--engagement-context", type=Path, default=None,
                            help="Path to an authorization/engagement-scope file")
 
+    p_dynamic_pairs = sub.add_parser(
+        "dynamic-pairs",
+        help="Run paired off/feedback dynamic-validation experiments",
+    )
+    p_dynamic_pairs.add_argument("target", help="Target name (under ./targets/) or path to target dir")
+    p_dynamic_pairs.add_argument("--static-report", type=Path, required=True, metavar="PATH",
+                                 help="static_analysis.json produced by `static` or `run`")
+    p_dynamic_pairs.add_argument("--candidate-id", default=None,
+                                 help="Candidate to validate; default is the highest-confidence entry")
+    p_dynamic_pairs.add_argument("--model", default=os.environ.get("VULN_PIPELINE_MODEL"),
+                                 help="Model string (required; or set VULN_PIPELINE_MODEL)")
+    p_dynamic_pairs.add_argument("--runs", type=int, default=3,
+                                 help="Number of paired repetitions (default 3)")
+    p_dynamic_pairs.add_argument(
+        "--arms", choices=("off", "feedback"), nargs="+",
+        default=("off", "feedback"),
+        help="Arms to run for each pair; feedback maps to --symbolic-execution symcc",
+    )
+    p_dynamic_pairs.add_argument("--max-turns", type=int, default=DEFAULT_DYNAMIC_MAX_TURNS,
+                                 help=f"Dynamic-agent turn budget (default {DEFAULT_DYNAMIC_MAX_TURNS})")
+    p_dynamic_pairs.add_argument(
+        "--phase-timeout", type=_positive_seconds, default=None, metavar="SECONDS",
+        help="Optional overall dynamic-phase deadline in seconds; omitted means no overall deadline",
+    )
+    p_dynamic_pairs.add_argument(
+        "--max-iterations", type=int, default=DEFAULT_DYNAMIC_MAX_ITERATIONS,
+        help=("Maximum adaptive dynamic-validation rounds "
+              f"(default {DEFAULT_DYNAMIC_MAX_ITERATIONS})"),
+    )
+    p_dynamic_pairs.add_argument("--results-dir", default="./results/experiments",
+                                 help="Output root for the paired experiment")
+    p_dynamic_pairs.add_argument(
+        "--experiment-name", default=None,
+        help="Subdirectory name under --results-dir; default is target-paired-<UTC timestamp>",
+    )
+    p_dynamic_pairs.add_argument(
+        "--resume", action="store_true",
+        help="Skip pair/arm directories that already contain dynamic_validation.json",
+    )
+    p_dynamic_pairs.add_argument(
+        "--instrumentation", choices=("off", "auto", "llvm"), default=None,
+        help="Dynamic observation provider: off, auto, llvm, or target-manifest default",
+    )
+    p_dynamic_pairs.add_argument("--docker-params", type=Path, default=None, metavar="PATH",
+                                 help="Override the target's docker-params.yaml")
+    p_dynamic_pairs.add_argument("--dangerously-no-sandbox", dest="dangerously_no_sandbox",
+                                 action="store_true", help="See `run --help`.")
+    p_dynamic_pairs.add_argument("--engagement-context", type=Path, default=None,
+                                 help="Path to an authorization/engagement-scope file")
+
+    p_plan_pairs = sub.add_parser(
+        "plan-dynamic-pairs",
+        help="Print dynamic-pairs commands from an experiment target matrix",
+    )
+    p_plan_pairs.add_argument(
+        "--matrix", type=Path,
+        default=Path("docs/research/symcc-feedback-experiment-targets.json"),
+        help="Target matrix JSON (default docs/research/symcc-feedback-experiment-targets.json)",
+    )
+    p_plan_pairs.add_argument(
+        "--target-id", action="append", default=None,
+        help="Only emit this target id; may be repeated. Default: all ready targets",
+    )
+    p_plan_pairs.add_argument("--include-deferred", action="store_true",
+                             help="Also emit deferred targets from the matrix")
+    p_plan_pairs.add_argument("--model", default="deepseek-flash",
+                             help="Model to place in generated commands (default deepseek-flash)")
+    p_plan_pairs.add_argument("--runs", type=int, default=3,
+                             help="Paired repetitions in generated commands (default 3)")
+    p_plan_pairs.add_argument(
+        "--phase-timeout", type=_positive_seconds, default=3600.0, metavar="SECONDS",
+        help="Dynamic-phase deadline in generated commands (default 3600)",
+    )
+    p_plan_pairs.add_argument(
+        "--max-iterations", type=int, default=DEFAULT_DYNAMIC_MAX_ITERATIONS,
+        help=("Maximum dynamic-validation rounds in generated commands "
+              f"(default {DEFAULT_DYNAMIC_MAX_ITERATIONS})"),
+    )
+    p_plan_pairs.add_argument("--results-dir", default="results/experiments",
+                             help="Output root in generated commands")
+    p_plan_pairs.add_argument("--resume", action="store_true",
+                             help="Add --resume to generated dynamic-pairs commands")
+    p_plan_pairs.add_argument("--no-sandbox-flag", action="store_true",
+                             help="Omit --dangerously-no-sandbox from generated commands")
+    p_plan_pairs.add_argument("--out", type=Path, default=None,
+                             help="Optional path to write a shell script")
+
     p_run = sub.add_parser("run", help="Run find+grade against a target")
     p_run.add_argument("target", help="Target name (under ./targets/) or path to target dir")
     p_run.add_argument("--find-only", action="store_true", help="Skip grade stage")
@@ -1076,6 +1299,10 @@ def main() -> int:
                        help="Run recon agent to auto-discover focus areas (overrides config.yaml)")
     p_run.add_argument("--max-turns", type=int, default=DEFAULT_FIND_MAX_TURNS,
                        help=f"Find-agent turn budget (default {DEFAULT_FIND_MAX_TURNS})")
+    p_run.add_argument(
+        "--phase-timeout", type=_positive_seconds, default=None, metavar="SECONDS",
+        help="Optional overall dynamic-validation deadline in seconds; omitted means no overall deadline",
+    )
     p_run.add_argument(
         "--max-iterations", type=int, default=DEFAULT_DYNAMIC_MAX_ITERATIONS,
         help=("Maximum adaptive dynamic-validation rounds "
@@ -1133,6 +1360,23 @@ def main() -> int:
     p_dedup.add_argument("results_dir", type=Path,
                          help="Directory to walk for result.json files (e.g. results/<target>/)")
 
+    p_summarize = sub.add_parser(
+        "summarize-experiments",
+        help="Summarize dynamic_validation.json experiment results under a directory",
+    )
+    p_summarize.add_argument(
+        "results_dir", type=Path, nargs="+",
+        help="One or more directories/files to scan for dynamic_validation.json",
+    )
+    p_summarize.add_argument(
+        "--json-out", type=Path, default=None,
+        help="Optional path to write the machine-readable summary JSON",
+    )
+    p_summarize.add_argument(
+        "--markdown-out", type=Path, default=None,
+        help="Optional path to write the Markdown summary",
+    )
+
     p_report = sub.add_parser("report",
                               help="Generate exploitability reports for unique crashes under a results dir")
     p_report.add_argument("results_dir", type=Path,
@@ -1185,7 +1429,7 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    if args.command in ("build", "inspect", "static", "dynamic", "run", "recon", "report", "patch"):
+    if args.command in ("build", "inspect", "static", "dynamic", "dynamic-pairs", "run", "recon", "report", "patch"):
         if err := sandbox.require(args.dangerously_no_sandbox):
             print(err, file=sys.stderr)
             return 1
@@ -1198,12 +1442,18 @@ def main() -> int:
         return _cmd_static(args)
     if args.command == "dynamic":
         return _cmd_dynamic(args)
+    if args.command == "dynamic-pairs":
+        return _cmd_dynamic_pairs(args)
+    if args.command == "plan-dynamic-pairs":
+        return _cmd_plan_dynamic_pairs(args)
     if args.command == "run":
         return _cmd_run(args)
     if args.command == "recon":
         return _cmd_recon(args)
     if args.command == "dedup":
         return _cmd_dedup(args)
+    if args.command == "summarize-experiments":
+        return _cmd_summarize_experiments(args)
     if args.command == "report":
         return _cmd_report(args)
     if args.command == "patch":
@@ -1508,6 +1758,7 @@ def _cmd_dynamic(args) -> int:
             symbolic_execution_result_path=str(out_dir / "symbolic_execution"),
             crash_result_path=str(out_dir / "crash-result.xml"),
             max_iterations=args.max_iterations,
+            phase_timeout_s=args.phase_timeout,
         ))
     except Exception as exc:
         print(f"error: dynamic phase failed: {type(exc).__name__}: {exc}", file=sys.stderr)
@@ -1525,6 +1776,241 @@ def _cmd_dynamic(args) -> int:
         print(f"[dynamic] PoC artifact is ready for the original grade phase: {out_dir}")
         return 0
     return 2
+
+
+def _cmd_dynamic_pairs(args) -> int:
+    """Run repeated off/feedback dynamic-validation arms with fixed variables."""
+    if args.runs <= 0:
+        print("error: --runs must be positive", file=sys.stderr)
+        return 1
+    if not args.model:
+        print("error: --model required (or set VULN_PIPELINE_MODEL)", file=sys.stderr)
+        return 1
+
+    started = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    target_label = re.sub(r"[^A-Za-z0-9_.-]+", "-", Path(str(args.target)).name)
+    target_label = target_label.strip("-") or "target"
+    experiment_name = args.experiment_name or f"{target_label}-paired-{started}"
+    experiment_root = Path(args.results_dir) / experiment_name
+    experiment_root.mkdir(parents=True, exist_ok=True)
+
+    manifest: dict[str, object] = {
+        "schema_version": 1,
+        "command": "dynamic-pairs",
+        "target": str(args.target),
+        "static_report": str(args.static_report),
+        "candidate_id": args.candidate_id,
+        "model": args.model,
+        "runs": args.runs,
+        "arms": list(args.arms),
+        "max_turns": args.max_turns,
+        "phase_timeout": args.phase_timeout,
+        "max_iterations": args.max_iterations,
+        "instrumentation": args.instrumentation,
+        "docker_params": str(args.docker_params) if args.docker_params else None,
+        "started_at": started,
+        "resume": bool(args.resume),
+        "pairs": [],
+    }
+
+    had_infra_failure = False
+    for run_idx in range(1, args.runs + 1):
+        for arm in args.arms:
+            symbolic_execution = "off" if arm == "off" else "symcc"
+            arm_results_dir = experiment_root / f"pair-{run_idx}" / arm
+            existing_results = _dynamic_pair_existing_results(arm_results_dir)
+            print(
+                f"[dynamic-pairs] pair={run_idx}/{args.runs} arm={arm} "
+                f"symbolic_execution={symbolic_execution}"
+            )
+            if args.resume and existing_results:
+                print(
+                    f"[dynamic-pairs] pair={run_idx} arm={arm} skipped "
+                    f"({len(existing_results)} existing dynamic result(s))"
+                )
+                manifest["pairs"].append({  # type: ignore[index]
+                    "pair": run_idx,
+                    "arm": arm,
+                    "symbolic_execution": symbolic_execution,
+                    "results_dir": str(arm_results_dir),
+                    "return_code": None,
+                    "skipped": True,
+                    "existing_dynamic_results": [str(path) for path in existing_results],
+                })
+                (experiment_root / "manifest.json").write_text(
+                    json.dumps(manifest, indent=2, ensure_ascii=False) + "\n"
+                )
+                continue
+            run_args = argparse.Namespace(
+                target=args.target,
+                static_report=args.static_report,
+                candidate_id=args.candidate_id,
+                model=args.model,
+                max_turns=args.max_turns,
+                phase_timeout=args.phase_timeout,
+                max_iterations=args.max_iterations,
+                results_dir=str(arm_results_dir),
+                instrumentation=args.instrumentation,
+                symbolic_execution=symbolic_execution,
+                docker_params=args.docker_params,
+                dangerously_no_sandbox=args.dangerously_no_sandbox,
+                engagement_context=args.engagement_context,
+            )
+            rc = _cmd_dynamic(run_args)
+            if rc not in {0, 2}:
+                had_infra_failure = True
+            manifest["pairs"].append({  # type: ignore[index]
+                "pair": run_idx,
+                "arm": arm,
+                "symbolic_execution": symbolic_execution,
+                "results_dir": str(arm_results_dir),
+                "return_code": rc,
+                "skipped": False,
+            })
+            (experiment_root / "manifest.json").write_text(
+                json.dumps(manifest, indent=2, ensure_ascii=False) + "\n"
+            )
+
+    summary = summarize_experiment_tree(experiment_root)
+    markdown = render_markdown_summary(summary)
+    (experiment_root / "summary.json").write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False) + "\n"
+    )
+    (experiment_root / "summary.md").write_text(markdown)
+    print(markdown)
+    print(f"[dynamic-pairs] manifest → {experiment_root / 'manifest.json'}")
+    print(f"[dynamic-pairs] summary  → {experiment_root / 'summary.md'}")
+    return 1 if had_infra_failure else 0
+
+
+def _dynamic_pair_existing_results(root: Path) -> list[Path]:
+    """Return completed dynamic result files below one pair/arm root."""
+    if not root.exists():
+        return []
+    return sorted(
+        path
+        for path in root.rglob("dynamic_validation.json")
+        if path.is_file()
+    )
+
+
+def _cmd_plan_dynamic_pairs(args) -> int:
+    """Print reproducible dynamic-pairs commands from a target matrix."""
+    try:
+        payload = json.loads(args.matrix.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"error: could not read target matrix {args.matrix}: {exc}", file=sys.stderr)
+        return 1
+    targets = payload.get("targets")
+    if not isinstance(targets, list):
+        print(f"error: target matrix has no targets list: {args.matrix}", file=sys.stderr)
+        return 1
+    selected_ids = set(args.target_id or [])
+    selected: list[dict[str, object]] = []
+    for item in targets:
+        if not isinstance(item, dict):
+            continue
+        target_id = str(item.get("id") or "")
+        status = str(item.get("status") or "")
+        if selected_ids and target_id not in selected_ids:
+            continue
+        if not args.include_deferred and status != "ready":
+            continue
+        selected.append(item)
+    if selected_ids:
+        found_ids = {str(item.get("id") or "") for item in selected}
+        missing = sorted(selected_ids - found_ids)
+        if missing:
+            print(
+                "error: target id(s) not found or not selected: " + ", ".join(missing),
+                file=sys.stderr,
+            )
+            return 1
+    errors: list[str] = []
+    commands: list[str] = []
+    for item in selected:
+        command, item_errors = _dynamic_pairs_command_from_matrix_item(
+            item,
+            model=args.model,
+            runs=args.runs,
+            phase_timeout=args.phase_timeout,
+            max_iterations=args.max_iterations,
+            results_dir=args.results_dir,
+            resume=args.resume,
+            include_no_sandbox=not args.no_sandbox_flag,
+        )
+        errors.extend(item_errors)
+        if command:
+            commands.append(command)
+    if errors:
+        for error in errors:
+            print(f"error: {error}", file=sys.stderr)
+        return 1
+    script_lines = [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        "",
+        *commands,
+        "",
+    ]
+    script_text = "\n".join(script_lines)
+    if args.out:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(script_text)
+        print(f"[plan-dynamic-pairs] wrote {len(commands)} command(s) → {args.out}")
+    else:
+        print(script_text)
+    return 0
+
+
+def _dynamic_pairs_command_from_matrix_item(
+    item: dict[str, object],
+    *,
+    model: str,
+    runs: int,
+    phase_timeout: float,
+    max_iterations: int,
+    results_dir: str,
+    resume: bool,
+    include_no_sandbox: bool,
+) -> tuple[str | None, list[str]]:
+    target_id = str(item.get("id") or "")
+    target_path = str(item.get("target_path") or "")
+    static_report = str(item.get("static_report") or "")
+    experiment_name = str(item.get("experiment_name") or target_id or "dynamic-pairs")
+    errors: list[str] = []
+    if not target_id:
+        errors.append("matrix item missing id")
+    if not target_path:
+        errors.append(f"{target_id}: missing target_path")
+    elif not Path(target_path).is_dir():
+        errors.append(f"{target_id}: target_path does not exist: {target_path}")
+    if not static_report:
+        errors.append(f"{target_id}: missing static_report")
+    elif not Path(static_report).is_file():
+        errors.append(f"{target_id}: static_report does not exist: {static_report}")
+    if runs <= 0:
+        errors.append("--runs must be positive")
+    if max_iterations <= 0:
+        errors.append("--max-iterations must be positive")
+    if errors:
+        return None, errors
+    parts = [
+        ".venv/bin/python", "-m", "harness.cli", "dynamic-pairs",
+        target_path,
+        "--static-report", static_report,
+        "--model", model,
+        "--runs", str(runs),
+        "--phase-timeout", str(int(phase_timeout) if phase_timeout.is_integer() else phase_timeout),
+        "--max-iterations", str(max_iterations),
+        "--results-dir", results_dir,
+        "--experiment-name", experiment_name,
+    ]
+    if resume:
+        parts.append("--resume")
+    if include_no_sandbox:
+        parts.append("--dangerously-no-sandbox")
+    return " ".join(shlex.quote(part) for part in parts), []
 
 
 def _cmd_run(args) -> int:
@@ -1659,6 +2145,26 @@ def _cmd_dedup(args) -> int:
     groups = dedup(root)
     print(format_report(groups, root), end="")
     return 0 if groups else 2
+
+
+def _cmd_summarize_experiments(args) -> int:
+    roots: list[Path] = args.results_dir
+    missing = [str(root) for root in roots if not root.exists()]
+    if missing:
+        print(f"error: path does not exist: {missing[0]}", file=sys.stderr)
+        return 1
+    summary = summarize_experiment_tree(roots)
+    markdown = render_markdown_summary(summary)
+    if args.json_out:
+        args.json_out.parent.mkdir(parents=True, exist_ok=True)
+        args.json_out.write_text(
+            json.dumps(summary, indent=2, ensure_ascii=False) + "\n"
+        )
+    if args.markdown_out:
+        args.markdown_out.parent.mkdir(parents=True, exist_ok=True)
+        args.markdown_out.write_text(markdown)
+    print(markdown, end="")
+    return 0 if summary.get("run_count") else 2
 
 
 # ── report ───────────────────────────────────────────────────────────────────

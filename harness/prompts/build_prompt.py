@@ -180,6 +180,20 @@ The host copies the checked-out source snapshot into the build context as
 `source/` after this task. Therefore a normal Dockerfile should contain a line
 like `COPY source/ /work/src/` and then build from `/work/src`.
 
+## ASan executable build policy
+
+For a native Linux userspace C/C++ target built with AddressSanitizer, build
+the executable as non-PIE to avoid sanitizer shadow-memory startup collisions
+in the experiment environment: compile the target objects with `-fno-pie` and
+link each runnable target/fuzzer executable with `-no-pie`. Apply the flags to
+the actual instrumented executable and its linked target objects, not only to
+an unrelated helper. Verify the final ELF header reports `Type: EXEC` (for
+example with `readelf -h`) and record the flags and check in `build-plan.json`.
+Do not apply this policy to kernel/QEMU guest images, non-Linux targets, or
+languages/toolchains where these flags are not valid. If the upstream build
+system cannot honor the flags safely, explain the limitation rather than
+silently claiming a non-PIE ASan build.
+
 ## Manifest contract (mandatory)
 
 The host validates `target-manifest.yaml` before it runs Docker. Use the exact
