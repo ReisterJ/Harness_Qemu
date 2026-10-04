@@ -304,6 +304,7 @@ async def _run_once(
     max_iterations: int = DEFAULT_DYNAMIC_MAX_ITERATIONS,
     symbolic_execution: str | None = None,
     phase_timeout_s: float | None = None,
+    supervisor: str = "rules",
 ) -> RunResult:
     """One find(+grade) attempt. Assumes image is already built.
 
@@ -367,6 +368,8 @@ async def _run_once(
             instrumentation_result_path=str(out_dir / "instrumentation"),
             symbolic_execution=symbolic_execution,
             symbolic_execution_result_path=str(out_dir / "symbolic_execution"),
+            supervisor_mode=supervisor,
+            supervisor_result_path=str(out_dir / "supervisor_events.jsonl"),
             max_iterations=max_iterations,
             phase_timeout_s=phase_timeout_s,
         )
@@ -1009,6 +1012,7 @@ async def _run_all(
                          stream_ctx, accept_dos=args.accept_dos, system_prompt=system_prompt,
                          instrumentation=getattr(args, "instrumentation", None),
                          symbolic_execution=getattr(args, "symbolic_execution", None),
+                         supervisor=getattr(args, "supervisor", "rules"),
                          max_iterations=getattr(
                              args, "max_iterations", DEFAULT_DYNAMIC_MAX_ITERATIONS
                          ),
@@ -1187,6 +1191,10 @@ def main() -> int:
         "--symbolic-execution", choices=("off", "auto", "klee", "symcc"), default=None,
         help="Dynamic symbolic-execution helper: off, auto, klee, symcc, or target default",
     )
+    p_dynamic.add_argument(
+        "--supervisor", choices=("off", "rules"), default="rules",
+        help="Dynamic validation search-policy supervisor (default rules)",
+    )
     p_dynamic.add_argument("--docker-params", type=Path, default=None, metavar="PATH",
                            help="Override the target's docker-params.yaml")
     p_dynamic.add_argument("--dangerously-no-sandbox", dest="dangerously_no_sandbox",
@@ -1237,6 +1245,10 @@ def main() -> int:
         "--instrumentation", choices=("off", "auto", "llvm"), default=None,
         help="Dynamic observation provider: off, auto, llvm, or target-manifest default",
     )
+    p_dynamic_pairs.add_argument(
+        "--supervisor", choices=("off", "rules"), default="rules",
+        help="Dynamic validation search-policy supervisor for each arm (default rules)",
+    )
     p_dynamic_pairs.add_argument("--docker-params", type=Path, default=None, metavar="PATH",
                                  help="Override the target's docker-params.yaml")
     p_dynamic_pairs.add_argument("--dangerously-no-sandbox", dest="dangerously_no_sandbox",
@@ -1272,6 +1284,10 @@ def main() -> int:
         help=("Maximum dynamic-validation rounds in generated commands "
               f"(default {DEFAULT_DYNAMIC_MAX_ITERATIONS})"),
     )
+    p_plan_pairs.add_argument(
+        "--supervisor", choices=("off", "rules"), default="rules",
+        help="Supervisor mode in generated dynamic-pairs commands (default rules)",
+    )
     p_plan_pairs.add_argument("--results-dir", default="results/experiments",
                              help="Output root in generated commands")
     p_plan_pairs.add_argument("--resume", action="store_true",
@@ -1291,6 +1307,10 @@ def main() -> int:
     p_run.add_argument(
         "--symbolic-execution", choices=("off", "auto", "klee", "symcc"), default=None,
         help="Dynamic symbolic-execution helper: off, auto, klee, symcc, or target default",
+    )
+    p_run.add_argument(
+        "--supervisor", choices=("off", "rules"), default="rules",
+        help="Dynamic validation search-policy supervisor (default rules)",
     )
     p_run.add_argument("--runs", type=int, default=1, help="Number of independent runs")
     p_run.add_argument("--parallel", action="store_true",
@@ -1759,6 +1779,8 @@ def _cmd_dynamic(args) -> int:
             crash_result_path=str(out_dir / "crash-result.xml"),
             max_iterations=args.max_iterations,
             phase_timeout_s=args.phase_timeout,
+            supervisor_mode=args.supervisor,
+            supervisor_result_path=str(out_dir / "supervisor_events.jsonl"),
         ))
     except Exception as exc:
         print(f"error: dynamic phase failed: {type(exc).__name__}: {exc}", file=sys.stderr)
@@ -1807,6 +1829,7 @@ def _cmd_dynamic_pairs(args) -> int:
         "phase_timeout": args.phase_timeout,
         "max_iterations": args.max_iterations,
         "instrumentation": args.instrumentation,
+        "supervisor": args.supervisor,
         "docker_params": str(args.docker_params) if args.docker_params else None,
         "started_at": started,
         "resume": bool(args.resume),
@@ -1851,6 +1874,7 @@ def _cmd_dynamic_pairs(args) -> int:
                 max_iterations=args.max_iterations,
                 results_dir=str(arm_results_dir),
                 instrumentation=args.instrumentation,
+                supervisor=args.supervisor,
                 symbolic_execution=symbolic_execution,
                 docker_params=args.docker_params,
                 dangerously_no_sandbox=args.dangerously_no_sandbox,
@@ -1935,6 +1959,7 @@ def _cmd_plan_dynamic_pairs(args) -> int:
             runs=args.runs,
             phase_timeout=args.phase_timeout,
             max_iterations=args.max_iterations,
+            supervisor=args.supervisor,
             results_dir=args.results_dir,
             resume=args.resume,
             include_no_sandbox=not args.no_sandbox_flag,
@@ -1970,6 +1995,7 @@ def _dynamic_pairs_command_from_matrix_item(
     runs: int,
     phase_timeout: float,
     max_iterations: int,
+    supervisor: str,
     results_dir: str,
     resume: bool,
     include_no_sandbox: bool,
@@ -2003,6 +2029,7 @@ def _dynamic_pairs_command_from_matrix_item(
         "--runs", str(runs),
         "--phase-timeout", str(int(phase_timeout) if phase_timeout.is_integer() else phase_timeout),
         "--max-iterations", str(max_iterations),
+        "--supervisor", supervisor,
         "--results-dir", results_dir,
         "--experiment-name", experiment_name,
     ]

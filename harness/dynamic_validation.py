@@ -71,6 +71,11 @@ from .symbolic.feedback import (
     summarize_trace,
 )
 from .symbolic.seed_plan import SeedPlanError, parse_seed_plan
+from .supervisor import (
+    SearchPolicySupervisor,
+    combine_progress_nudges,
+    make_supervisor_progress_nudge,
+)
 
 _DYNAMIC_STATUSES = {
     "not_reached",
@@ -127,6 +132,8 @@ async def run_dynamic_validation(
     crash_result_path: str | None = None,
     max_iterations: int = _DEFAULT_MAX_ITERATIONS,
     phase_timeout_s: float | None = None,
+    supervisor_mode: str = "rules",
+    supervisor_result_path: str | None = None,
 ) -> tuple[DynamicValidationResult, AgentResult, dict[str, float]]:
     """Try to produce a crash or semantic-logic PoC for one static candidate."""
     if phase_timeout_s is not None and (
@@ -150,6 +157,15 @@ async def run_dynamic_validation(
     instrumentation_prepared: InstrumentationReport | None = None
     instrumentation_result: InstrumentationReport | None = None
     symbolic_result: dict | None = None
+    supervisor = _make_validation_supervisor(
+        supervisor_mode,
+        supervisor_result_path=supervisor_result_path,
+        transcript_path=transcript_path,
+    )
+    supervisor_nudge = make_supervisor_progress_nudge(
+        supervisor,
+        on_decision=_supervisor_decision_handler(container_name, target),
+    )
     with _open_dynamic_session(
         target,
         container_name=container_name,
@@ -232,6 +248,7 @@ async def run_dynamic_validation(
                 feedback_runtime=symbolic_feedback_runtime,
                 max_iterations=iteration_limit,
                 phase_timeout_s=phase_timeout_s,
+                supervisor_nudge=supervisor_nudge,
             )
             timings.update(protocol_timings)
         else:
@@ -266,11 +283,14 @@ async def run_dynamic_validation(
                 tools=["Read", "Write", "Bash"],
                 phase_timeout_s=phase_timeout_s,
                 idle_timeout_s=phase_timeout_s,
+                progress_nudge=supervisor_nudge,
                 completion_predicate=_dynamic_completion_predicate,
             )
             timings["dynamic_validation"] = time.time() - started
         timings["dynamic_agent_tool_calls"] = float(result.tool_call_count)
         timings["dynamic_agent_messages"] = float(result.assistant_message_count)
+        if supervisor is not None:
+            timings["supervisor_events"] = float(supervisor.event_count)
         if symbolic_session is not None:
             symbolic_result = symbolic_session.collect()
             timings["symbolic_execution_session"] = float(
@@ -3115,6 +3135,64 @@ def _dynamic_completion_predicate(result: AgentResult) -> bool:
     return parse_xml_tag(text, "reason") is not None
 
 
+def _make_validation_supervisor(
+    mode: str | None,
+    *,
+    supervisor_result_path: str | None,
+    transcript_path: str | None,
+) -> SearchPolicySupervisor | None:
+    mode = (mode or "rules").strip().lower()
+    if mode == "off":
+        return None
+    if mode != "rules":
+        raise ValueError(f"unsupported supervisor mode: {mode}")
+    event_path = supervisor_result_path
+    if event_path is None and transcript_path:
+        event_path = str(Path(transcript_path).with_name("supervisor_events.jsonl"))
+    return SearchPolicySupervisor(mode=mode, event_path=event_path)
+
+
+def _supervisor_decision_handler(container: str, target: TargetConfig):
+    """Return a side-effect hook for supervisor interventions."""
+
+    def _handle(decision) -> None:
+        if decision.violation_type == "background_worker_sprawl":
+            _terminate_target_search_processes(container, target)
+
+    return _handle
+
+
+def _terminate_target_search_processes(container: str, target: TargetConfig) -> None:
+    """Best-effort cleanup for target/fuzzer workers spawned by the agent.
+
+    This is not a safety sandbox. It prevents low-value background searches
+    from consuming the experiment budget after the supervisor has corrected the
+    worker's strategy.
+    """
+    target_name = Path(target.binary_path).name if target.binary_path else ""
+    target_q = shlex.quote(target_name)
+    try:
+        docker_ops.exec_sh(
+            container,
+            "target=" + target_q + "; "
+            "pids=$(ps -eo pid=,comm= | awk -v target=\"$target\" "
+            "'$2 != \"opencode\" && ("
+            "(target != \"\" && $2 == target) || "
+            "$2 ~ /fuzzer$/ || $2 ~ /_fuzzer$/"
+            ") {print $1}'); "
+            "[ -z \"$pids\" ] || kill -TERM $pids; sleep 1; "
+            "pids=$(ps -eo pid=,comm= | awk -v target=\"$target\" "
+            "'$2 != \"opencode\" && ("
+            "(target != \"\" && $2 == target) || "
+            "$2 ~ /fuzzer$/ || $2 ~ /_fuzzer$/"
+            ") {print $1}'); "
+            "[ -z \"$pids\" ] || kill -KILL $pids",
+            timeout=5,
+        )
+    except Exception:
+        return
+
+
 async def _run_prebuilt_symcc_agent(
     *, prompt: str, target: TargetConfig, container: str, model: str,
     max_turns: int, system_prompt: str | None, max_resume_attempts: int,
@@ -3123,6 +3201,7 @@ async def _run_prebuilt_symcc_agent(
     feedback_runtime: dict[str, Any] | None = None,
     max_iterations: int = _DEFAULT_MAX_ITERATIONS,
     phase_timeout_s: float | None = None,
+    supervisor_nudge=None,
 ) -> tuple[AgentResult, dict[str, float], dict[str, Any]]:
     started = time.time()
     stop = asyncio.Event()
@@ -3139,7 +3218,10 @@ async def _run_prebuilt_symcc_agent(
             tools=["Read", "Write", "Bash"],
             phase_timeout_s=phase_timeout_s,
             idle_timeout_s=phase_timeout_s,
-            progress_nudge=_prebuilt_progress_nudge(container),
+            progress_nudge=combine_progress_nudges(
+                supervisor_nudge,
+                _prebuilt_progress_nudge(container),
+            ),
             completion_predicate=_dynamic_completion_predicate,
         )
     finally:

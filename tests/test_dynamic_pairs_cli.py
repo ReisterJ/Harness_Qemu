@@ -57,11 +57,11 @@ def _write_fake_dynamic_result(root: Path, *, arm: str) -> None:
 
 
 def test_dynamic_pairs_runs_off_and_feedback_and_writes_summary(tmp_path, monkeypatch):
-    calls: list[tuple[str, str]] = []
+    calls: list[tuple[str, str, str]] = []
 
     def fake_dynamic(run_args):
         arm = Path(run_args.results_dir).name
-        calls.append((arm, run_args.symbolic_execution))
+        calls.append((arm, run_args.symbolic_execution, run_args.supervisor))
         _write_fake_dynamic_result(Path(run_args.results_dir), arm=arm)
         return 2
 
@@ -76,6 +76,7 @@ def test_dynamic_pairs_runs_off_and_feedback_and_writes_summary(tmp_path, monkey
         max_turns=20000,
         phase_timeout=3600.0,
         max_iterations=8,
+        supervisor="rules",
         results_dir=str(tmp_path),
         experiment_name="paired",
         resume=False,
@@ -88,9 +89,10 @@ def test_dynamic_pairs_runs_off_and_feedback_and_writes_summary(tmp_path, monkey
     rc = cli._cmd_dynamic_pairs(args)
 
     assert rc == 0
-    assert calls == [("off", "off"), ("feedback", "symcc")]
+    assert calls == [("off", "off", "rules"), ("feedback", "symcc", "rules")]
     manifest = json.loads((tmp_path / "paired" / "manifest.json").read_text())
     assert manifest["runs"] == 1
+    assert manifest["supervisor"] == "rules"
     assert manifest["pairs"][0]["arm"] == "off"
     assert manifest["pairs"][1]["arm"] == "feedback"
     summary = json.loads((tmp_path / "paired" / "summary.json").read_text())
@@ -102,13 +104,13 @@ def test_dynamic_pairs_runs_off_and_feedback_and_writes_summary(tmp_path, monkey
 
 
 def test_dynamic_pairs_resume_skips_existing_arm_and_runs_missing_arm(tmp_path, monkeypatch):
-    calls: list[tuple[str, str]] = []
+    calls: list[tuple[str, str, str]] = []
     existing_off_root = tmp_path / "paired" / "pair-1" / "off"
     _write_fake_dynamic_result(existing_off_root, arm="off")
 
     def fake_dynamic(run_args):
         arm = Path(run_args.results_dir).name
-        calls.append((arm, run_args.symbolic_execution))
+        calls.append((arm, run_args.symbolic_execution, run_args.supervisor))
         _write_fake_dynamic_result(Path(run_args.results_dir), arm=arm)
         return 2
 
@@ -123,6 +125,7 @@ def test_dynamic_pairs_resume_skips_existing_arm_and_runs_missing_arm(tmp_path, 
         max_turns=20000,
         phase_timeout=3600.0,
         max_iterations=8,
+        supervisor="rules",
         results_dir=str(tmp_path),
         experiment_name="paired",
         resume=True,
@@ -135,7 +138,7 @@ def test_dynamic_pairs_resume_skips_existing_arm_and_runs_missing_arm(tmp_path, 
     rc = cli._cmd_dynamic_pairs(args)
 
     assert rc == 0
-    assert calls == [("feedback", "symcc")]
+    assert calls == [("feedback", "symcc", "rules")]
     manifest = json.loads((tmp_path / "paired" / "manifest.json").read_text())
     assert manifest["resume"] is True
     assert manifest["pairs"][0]["arm"] == "off"
@@ -147,3 +150,32 @@ def test_dynamic_pairs_resume_skips_existing_arm_and_runs_missing_arm(tmp_path, 
     assert summary["run_count"] == 2
     assert summary["by_arm"]["off"]["runs"] == 1
     assert summary["by_arm"]["feedback"]["runs"] == 1
+
+
+def test_plan_dynamic_pairs_command_includes_supervisor(tmp_path):
+    target_dir = tmp_path / "target"
+    target_dir.mkdir()
+    static_report = tmp_path / "static.json"
+    static_report.write_text('{"findings": []}\n')
+    command, errors = cli._dynamic_pairs_command_from_matrix_item(
+        {
+            "id": "sample",
+            "target_path": str(target_dir),
+            "static_report": str(static_report),
+            "experiment_name": "sample-exp",
+        },
+        model="deepseek-flash",
+        runs=3,
+        phase_timeout=3600.0,
+        max_iterations=8,
+        supervisor="rules",
+        results_dir="results/experiments",
+        resume=True,
+        include_no_sandbox=True,
+    )
+
+    assert errors == []
+    assert command is not None
+    assert "--supervisor rules" in command
+    assert "--resume" in command
+    assert "--dangerously-no-sandbox" in command

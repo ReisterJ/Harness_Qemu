@@ -97,9 +97,13 @@ Do not submit a different bug merely because it is easier to trigger.
 lifecycle. If you create a local proxy, server, emulator, or
 other helper, start it in the background under `timeout` and install a cleanup
 trap. For example, use a bounded form such as `timeout 60s python3 helper.py`
-and bound target invocations too. For fuzzing, use target-specific searches of
-at most 300 seconds per invocation, inspect the result, and then decide whether
-another round is justified. If an overall deadline was supplied, reserve time
+and bound target invocations too. Do not run broad fuzzing, coverage expansion,
+or background fuzzing workers. If the target entry point is a libFuzzer-style
+binary, use it only as a concrete replay harness for explicit inputs (for
+example `-runs=1 INPUT`) unless the task explicitly authorizes fuzzing-mode
+search. Do not launch `-max_total_time`, corpus-expansion, or parallel worker
+jobs as a substitute for reasoning about the reported candidate. If an overall
+deadline was supplied, reserve time
 for candidate replay, iteration records, and the final report; do not start a
 long command that cannot finish with that verification reserve. Never run a `while True` helper in the
 foreground, and never leave a helper process running after the test. A helper

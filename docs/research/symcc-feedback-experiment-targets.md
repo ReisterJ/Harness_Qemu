@@ -55,6 +55,7 @@ docs/research/symcc-feedback-experiment-targets.json
   --runs 3 \
   --phase-timeout 3600 \
   --max-iterations 8 \
+  --supervisor rules \
   --results-dir results/experiments \
   --experiment-name mruby-57672-feedback-paired \
   --dangerously-no-sandbox
@@ -69,6 +70,7 @@ docs/research/symcc-feedback-experiment-targets.json
   --runs 3 \
   --phase-timeout 3600 \
   --max-iterations 8 \
+  --supervisor rules \
   --results-dir results/experiments \
   --experiment-name arvo-62290-feedback-paired \
   --dangerously-no-sandbox
@@ -84,6 +86,7 @@ docs/research/symcc-feedback-experiment-targets.json
   --runs 3 \
   --phase-timeout 3600 \
   --max-iterations 8 \
+  --supervisor rules \
   --results-dir results/experiments \
   --experiment-name arvo-38283-feedback-paired \
   --dangerously-no-sandbox
@@ -99,6 +102,7 @@ docs/research/symcc-feedback-experiment-targets.json
   --runs 3 \
   --phase-timeout 3600 \
   --max-iterations 8 \
+  --supervisor rules \
   --results-dir results/experiments \
   --experiment-name arvo-55020-feedback-paired \
   --dangerously-no-sandbox
@@ -131,4 +135,3 @@ docs/research/symcc-feedback-experiment-targets.json
   --json-out results/experiments/symcc-feedback-batch-summary.json \
   --markdown-out results/experiments/symcc-feedback-batch-summary.md
 ```
-

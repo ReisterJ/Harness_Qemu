@@ -73,6 +73,8 @@ async def run_find(
     symbolic_execution_result_path: str | None = None,
     max_iterations: int = DEFAULT_DYNAMIC_MAX_ITERATIONS,
     phase_timeout_s: float | None = None,
+    supervisor_mode: str = "rules",
+    supervisor_result_path: str | None = None,
 ) -> FindPhaseResult:
     """Run static analysis followed by dynamic validation.
 
@@ -168,12 +170,14 @@ async def run_find(
         instrumentation_result_path=instrumentation_result_path,
         symbolic_execution=symbolic_execution,
         symbolic_execution_result_path=symbolic_execution_result_path,
+        supervisor_result_path=supervisor_result_path,
         crash_result_path=(
             str(Path(dynamic_result_path).with_name("crash-result.xml"))
             if dynamic_result_path else None
         ),
         max_iterations=max_iterations,
         phase_timeout_s=phase_timeout_s,
+        supervisor_mode=supervisor_mode,
     )
     timings.update(dynamic_timings)
     timings["find"] = timings.get("static_analysis", 0.0) + timings.get(

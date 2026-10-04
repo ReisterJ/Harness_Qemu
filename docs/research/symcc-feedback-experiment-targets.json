@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "description": "Targets selected for SymCC feedback stabilization paired experiments. Ready targets have a target config, prebuilt SymCC configuration, and a static report suitable for dynamic-pairs.",
-  "default_command_template": ".venv/bin/python -m harness.cli dynamic-pairs {target_path} --static-report {static_report} --model deepseek-flash --runs 3 --phase-timeout 3600 --max-iterations 8 --results-dir results/experiments --experiment-name {experiment_name} --dangerously-no-sandbox",
+  "default_command_template": ".venv/bin/python -m harness.cli dynamic-pairs {target_path} --static-report {static_report} --model deepseek-flash --runs 3 --phase-timeout 3600 --max-iterations 8 --supervisor rules --results-dir results/experiments --experiment-name {experiment_name} --dangerously-no-sandbox",
   "targets": [
     {
       "id": "mruby-57672",
