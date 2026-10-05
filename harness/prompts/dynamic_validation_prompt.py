@@ -513,8 +513,12 @@ one JSON object per line to
 {"finding_id":"extra-001","summary":"short independent root-cause description","poc_path":"/work/validation/additional-crashes/extra-001/poc.bin","reproduction_command":"BINARY_PATH /work/validation/additional-crashes/extra-001/poc.bin","poc_kind":"file","crash_type":"heap-buffer-overflow","exit_code":134,"crash_output":"bounded sanitizer report","dup_check":"why this is distinct from known findings"}
 ```
 
-Use a unique ID containing only letters, digits, `_`, `-`, or `.`. Do not
-include base64 input bytes in the JSONL; the host reads the file at `poc_path`.
+The workspace also contains `/work/validation/additional-crash-template.json`;
+copy that template and replace every field. Use a unique ID containing only
+letters, digits, `_`, `-`, or `.`. The `poc_path` must be exactly
+`/work/validation/additional-crashes/<finding_id>/poc.bin`; do not point it at
+`/tmp`, `/work/poc`, or a request wrapper path. Do not include base64 input
+bytes in the JSONL; the host reads the file at `poc_path`.
 The host stores each submission separately and runs it through an independent
 Grade check. A side finding never makes the primary candidate pass or fail.
 Do not broaden exploration solely to find side findings, and do not submit

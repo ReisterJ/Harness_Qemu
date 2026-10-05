@@ -102,12 +102,33 @@ _CRASH_RESULT_XML_PATH = "/work/validation/crash-result.xml"
 _CRASH_RESULT_TEMPLATE_PATH = "/work/validation/crash-result-template.xml"
 _ADDITIONAL_CRASHES_PATH = "/work/validation/additional-crashes.jsonl"
 _ADDITIONAL_CRASH_ROOT = "/work/validation/additional-crashes"
+_ADDITIONAL_CRASH_TEMPLATE_PATH = "/work/validation/additional-crash-template.json"
 _MAX_ADDITIONAL_CRASHES = 10
 _MAX_ADDITIONAL_CRASH_BYTES = 10 * 1024 * 1024
 _CRASH_RESULT_FIELDS = (
     "candidate_id", "poc_path", "reproduction_command", "poc_kind",
     "crash_type", "exit_code", "crash_output", "dup_check",
 )
+
+
+def _additional_crash_template_json(candidate_id: str) -> bytes:
+    """Return a concrete JSONL object template for incidental crashes."""
+    template = {
+        "finding_id": "extra-001",
+        "summary": "short independent root-cause description",
+        "poc_path": "/work/validation/additional-crashes/extra-001/poc.bin",
+        "reproduction_command": (
+            "<target-binary> /work/validation/additional-crashes/extra-001/poc.bin"
+        ),
+        "poc_kind": "file",
+        "crash_type": "heap-buffer-overflow",
+        "exit_code": 134,
+        "crash_output": "bounded sanitizer report",
+        "dup_check": (
+            f"why this is distinct from primary candidate {candidate_id}"
+        ),
+    }
+    return json.dumps(template, indent=2, ensure_ascii=False).encode() + b"\n"
 
 
 async def run_dynamic_validation(
@@ -249,6 +270,7 @@ async def run_dynamic_validation(
                 max_iterations=iteration_limit,
                 phase_timeout_s=phase_timeout_s,
                 supervisor_nudge=supervisor_nudge,
+                completion_predicate=_make_dynamic_completion_predicate(supervisor),
             )
             timings.update(protocol_timings)
         else:
@@ -284,7 +306,7 @@ async def run_dynamic_validation(
                 phase_timeout_s=phase_timeout_s,
                 idle_timeout_s=phase_timeout_s,
                 progress_nudge=supervisor_nudge,
-                completion_predicate=_dynamic_completion_predicate,
+                completion_predicate=_make_dynamic_completion_predicate(supervisor),
             )
             timings["dynamic_validation"] = time.time() - started
         timings["dynamic_agent_tool_calls"] = float(result.tool_call_count)
@@ -838,7 +860,7 @@ async def _run_harness_managed_symcc(
                         tools=["Read", "Write", "Bash"],
                         phase_timeout_s=handoff_budget,
                         idle_timeout_s=handoff_budget,
-                        completion_predicate=_dynamic_completion_predicate,
+                        completion_predicate=_make_dynamic_completion_predicate(None),
                     ),
                     timeout=(
                         min(handoff_budget + 30.0, max(15.0, remaining - 5.0))
@@ -3135,6 +3157,28 @@ def _dynamic_completion_predicate(result: AgentResult) -> bool:
     return parse_xml_tag(text, "reason") is not None
 
 
+def _make_dynamic_completion_predicate(
+    supervisor: SearchPolicySupervisor | None,
+):
+    """Build the dynamic completion predicate, optionally guarded by supervisor.
+
+    After a supervisor correction, a final status is not accepted until the
+    worker performs at least one more tool action.  This keeps corrections from
+    becoming an immediate no-PoC exit path.
+    """
+
+    def _predicate(result: AgentResult) -> bool:
+        if not _dynamic_completion_predicate(result):
+            return False
+        if supervisor is not None and not supervisor.final_status_allowed(
+            result.messages
+        ):
+            return False
+        return True
+
+    return _predicate
+
+
 def _make_validation_supervisor(
     mode: str | None,
     *,
@@ -3202,6 +3246,7 @@ async def _run_prebuilt_symcc_agent(
     max_iterations: int = _DEFAULT_MAX_ITERATIONS,
     phase_timeout_s: float | None = None,
     supervisor_nudge=None,
+    completion_predicate=None,
 ) -> tuple[AgentResult, dict[str, float], dict[str, Any]]:
     started = time.time()
     stop = asyncio.Event()
@@ -3222,7 +3267,8 @@ async def _run_prebuilt_symcc_agent(
                 supervisor_nudge,
                 _prebuilt_progress_nudge(container),
             ),
-            completion_predicate=_dynamic_completion_predicate,
+            completion_predicate=completion_predicate
+            or _make_dynamic_completion_predicate(None),
         )
     finally:
         stop.set()
@@ -3674,8 +3720,19 @@ def _collect_additional_crashes(
             "crash_type", "exit_code", "crash_output", "dup_check",
         }
         allowed = required | {"poc_kind"}
-        if required - entry.keys() or entry.keys() - allowed:
-            errors.append(f"line {line_number}: fields do not match the additional-crash schema")
+        missing = sorted(required - entry.keys())
+        unexpected = sorted(entry.keys() - allowed)
+        if missing or unexpected:
+            detail = []
+            if missing:
+                detail.append("missing " + ", ".join(missing))
+            if unexpected:
+                detail.append("unexpected " + ", ".join(unexpected))
+            errors.append(
+                f"line {line_number}: fields do not match the "
+                f"additional-crash schema ({'; '.join(detail)}); expected "
+                f"{', '.join(sorted(allowed))}"
+            )
             continue
         finding_id = entry.get("finding_id")
         if not isinstance(finding_id, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", finding_id):
@@ -4196,7 +4253,11 @@ def _prepare_iteration_workspace(
             "Incidental independent target crashes, if found during this work, "
             "have a separate submission file at "
             "`/work/validation/additional-crashes.jsonl`; see the prompt section. "
-            "They do not replace this candidate's result.\n"
+            "They do not replace this candidate's result. Use "
+            "`/work/validation/additional-crash-template.json` as the exact "
+            "JSONL object template, copy the crashing input to "
+            "`/work/validation/additional-crashes/<finding_id>/poc.bin`, and "
+            "keep `finding_id` consistent between the directory and JSON.\n"
         )
         docker_ops.write_file(
             container,
@@ -4234,6 +4295,11 @@ def _prepare_iteration_workspace(
             container,
             _CRASH_RESULT_TEMPLATE_PATH,
             _crash_result_xml_template(candidate.candidate_id),
+        )
+        docker_ops.write_file(
+            container,
+            _ADDITIONAL_CRASH_TEMPLATE_PATH,
+            _additional_crash_template_json(candidate.candidate_id),
         )
         docker_ops.write_file(
             container, "/work/validation/README.md",

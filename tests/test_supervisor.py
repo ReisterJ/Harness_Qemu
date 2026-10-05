@@ -1,6 +1,7 @@
 import json
 
 from harness.agent import AgentResult
+from harness.dynamic_validation import _make_dynamic_completion_predicate
 from harness.supervisor import (
     SearchPolicySupervisor,
     combine_progress_nudges,
@@ -21,6 +22,22 @@ def _tool(command: str, *, output: str = "", call_id: str = "call-1") -> dict:
                 "input": {"command": command},
                 "output": output,
             },
+        },
+    }
+
+
+def _final_status() -> dict:
+    return {
+        "type": "text",
+        "sessionID": "ses-1",
+        "part": {
+            "type": "text",
+            "messageID": "msg-final",
+            "text": (
+                "<dynamic_status>iteration_exhausted</dynamic_status>\n"
+                "<candidate_id>candidate_001</candidate_id>\n"
+                "<reason>no PoC</reason>"
+            ),
         },
     }
 
@@ -97,6 +114,18 @@ def test_supervisor_does_not_treat_arbitrary_counts_as_process_sprawl():
     assert decision is None
 
 
+def test_supervisor_does_not_treat_file_grep_count_as_process_sprawl():
+    supervisor = SearchPolicySupervisor(max_background_target_processes=8)
+    decision = supervisor.review([
+        _tool(
+            "cd /tmp/opencode && ls -la trap3.c 2>&1; grep -c . trap3.c",
+            output="77\n",
+        )
+    ])
+
+    assert decision is None
+
+
 def test_supervisor_flags_blocking_wait():
     supervisor = SearchPolicySupervisor(max_blocking_wait_s=20)
     decision = supervisor.review([
@@ -131,6 +160,34 @@ def test_supervisor_progress_nudge_returns_corrective_prompt_once():
     assert "Supervisor intervention" in prompt
     assert "broad_fuzzing" in prompt
     assert nudge(result) is None
+
+
+def test_supervisor_final_status_requires_tool_after_correction():
+    supervisor = SearchPolicySupervisor()
+    first = _tool("/out/mruby_fuzzer -max_total_time=300 /tmp/corpus")
+    assert supervisor.review([first]) is not None
+    assert not supervisor.final_status_allowed([first])
+
+    second = _tool(
+        "timeout 30 /out/mruby_fuzzer -runs=1 /work/validation/inputs/poc.rb",
+        call_id="call-2",
+    )
+    assert supervisor.final_status_allowed([first, second])
+
+
+def test_dynamic_completion_guard_rejects_immediate_final_after_correction():
+    supervisor = SearchPolicySupervisor()
+    first = _tool("/out/mruby_fuzzer -max_total_time=300 /tmp/corpus")
+    assert supervisor.review([first]) is not None
+
+    predicate = _make_dynamic_completion_predicate(supervisor)
+    assert not predicate(AgentResult(messages=[first, _final_status()]))
+
+    second = _tool(
+        "timeout 30 /out/mruby_fuzzer -runs=1 /work/validation/inputs/poc.rb",
+        call_id="call-2",
+    )
+    assert predicate(AgentResult(messages=[first, second, _final_status()]))
 
 
 def test_supervisor_progress_nudge_invokes_decision_hook():

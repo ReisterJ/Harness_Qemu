@@ -58,7 +58,11 @@ class SupervisorDecision:
             "Continue the same dynamic-validation task. Do not treat this as a "
             "security restriction; it is a search-strategy correction. Focus on "
             "constructing explicit, replayable candidate inputs and validating "
-            "them against the execution evidence."
+            "them against the execution evidence. Do not immediately emit a "
+            "final no-PoC, false-positive, or iteration-exhausted status after "
+            "this intervention. First perform at least one new concrete, "
+            "bounded replay or source-guided input check that follows the "
+            "required next action, then record that evidence."
         )
 
 
@@ -83,6 +87,9 @@ class SearchPolicySupervisor:
     max_background_target_processes: int = 8
     _processed_calls: set[str] = field(default_factory=set, init=False)
     _sequence: int = field(default=0, init=False)
+    _last_actionable_decision: SupervisorDecision | None = field(
+        default=None, init=False
+    )
 
     @property
     def event_count(self) -> int:
@@ -103,8 +110,25 @@ class SearchPolicySupervisor:
             if decision.decision in {
                 "correct", "interrupt", "block_final_submission",
             }:
+                self._last_actionable_decision = decision
                 return decision
         return None
+
+    def final_status_allowed(self, messages: list[dict]) -> bool:
+        """Return whether final dynamic-status tags may be accepted.
+
+        A supervisor intervention is a search-strategy correction.  If the
+        worker immediately ends after a correction, the corrected strategy was
+        never tested.  Require at least one subsequent tool action before the
+        dynamic completion predicate accepts final status tags.
+        """
+        decision = self._last_actionable_decision
+        if decision is None or decision.event_index is None:
+            return True
+        return any(
+            event.index > decision.event_index
+            for event in _iter_tool_events(messages)
+        )
 
     def _review_tool_event(
         self, event: SupervisorToolEvent
@@ -351,7 +375,8 @@ def _reported_target_process_count(command: str, output: str) -> int | None:
     process_query = (
         ("ps " in lower_command or lower_command.startswith("ps "))
         or "pgrep" in lower_command
-        or "grep -c" in lower_command
+        or "pidof" in lower_command
+        or "/proc/" in lower_command
     ) and any(
         marker in lower_command
         for marker in ("fuzzer", "_fuzzer", "mruby_fuzzer", "opencode")

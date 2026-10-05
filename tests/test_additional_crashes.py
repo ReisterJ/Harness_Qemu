@@ -15,7 +15,10 @@ from harness.artifacts import (
 )
 from harness.cli import _grade_additional_crashes
 from harness.config import TargetConfig
-from harness.dynamic_validation import _collect_additional_crashes
+from harness.dynamic_validation import (
+    _additional_crash_template_json,
+    _collect_additional_crashes,
+)
 from harness.prompts.dynamic_validation_prompt import build_dynamic_validation_prompt
 from harness.artifacts import StaticFinding
 
@@ -92,6 +95,59 @@ def test_additional_crash_parser_rejects_path_escape(monkeypatch):
     assert any("invalid finding_id" in error for error in errors)
 
 
+def test_additional_crash_template_matches_expected_schema():
+    template = json.loads(_additional_crash_template_json("candidate_001"))
+
+    assert template["finding_id"] == "extra-001"
+    assert template["poc_path"] == (
+        "/work/validation/additional-crashes/extra-001/poc.bin"
+    )
+    assert set(template) == {
+        "finding_id",
+        "summary",
+        "poc_path",
+        "reproduction_command",
+        "poc_kind",
+        "crash_type",
+        "exit_code",
+        "crash_output",
+        "dup_check",
+    }
+    assert "candidate_001" in template["dup_check"]
+
+
+def test_additional_crash_parser_reports_missing_and_unexpected_fields(monkeypatch):
+    manifest = (json.dumps({
+        "kind": "allocation-size-too-big",
+        "candidate_id": "candidate_001",
+        "related": False,
+        "poc_path": "/tmp/crash",
+        "exit_code": 1,
+    }) + "\n").encode()
+
+    def fake_exec(_container, command, **_kwargs):
+        if command == "test -f /work/validation/additional-crashes.jsonl":
+            return 0, "", ""
+        if command == "test ! -L /work/validation/additional-crashes.jsonl":
+            return 0, "", ""
+        if command.startswith("stat -c %s"):
+            return 0, str(len(manifest)), ""
+        raise AssertionError(command)
+
+    monkeypatch.setattr("harness.dynamic_validation.docker_ops.exec_sh", fake_exec)
+    monkeypatch.setattr(
+        "harness.dynamic_validation.docker_ops.read_file", lambda *_: manifest
+    )
+
+    findings, errors = _collect_additional_crashes("find-test", "asan")
+
+    assert findings == []
+    assert len(errors) == 1
+    assert "missing" in errors[0] and "finding_id" in errors[0]
+    assert "unexpected candidate_id" in errors[0]
+    assert "expected" in errors[0]
+
+
 def test_dynamic_prompt_separates_incidental_crash_from_primary_candidate():
     finding = StaticFinding(
         candidate_id="candidate-1",
@@ -115,8 +171,10 @@ def test_dynamic_prompt_separates_incidental_crash_from_primary_candidate():
         detector="asan",
     )
     assert "additional-crashes.jsonl" in prompt
+    assert "additional-crash-template.json" in prompt
     assert "A side finding never makes the primary candidate pass or fail" in prompt
     assert '"reproduction_command":"/out/target ' in prompt
+    assert "do not point it at" in prompt
 
 
 def test_additional_crash_is_graded_independently_and_persisted(tmp_path, monkeypatch):
