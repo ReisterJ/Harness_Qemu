@@ -496,3 +496,17 @@ def test_dynamic_validation_normalizes_crash_label_to_file_poc(monkeypatch):
 
 def _fake_agent_result(message: str) -> AgentResult:
     return AgentResult(messages=[_assistant(message)], result_message=message)
+
+
+def test_dynamic_prompt_without_round_budget_states_no_fixed_budget():
+    prompt = build_dynamic_validation_prompt(
+        candidate=_finding(),
+        github_url="https://example.test/project",
+        commit="abc",
+        source_root="/src",
+        binary_path="/bin/target",
+        max_iterations=None,
+    )
+    assert "no fixed round budget" in prompt
+    assert "at most" not in prompt.split("## Iterative dynamic-validation loop")[1].split("1. ")[0]
+    assert "/work/validation/iterations/round-NNN.json" in prompt

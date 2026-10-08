@@ -404,22 +404,27 @@ def _permission_for_tools(tools: list[str] | None) -> dict[str, str]:
 def _build_agent_file(
     agent_name: str,
     system_prompt: str | None,
-    max_turns: int,
+    max_turns: int | None,
     tools: list[str] | None,
 ) -> str:
     """Render a `.opencode/agents/<name>.md` file: frontmatter (description,
     mode, steps, permission) + body = the system prompt. opencode reads this
-    as the agent definition; `--agent <name>` selects it."""
+    as the agent definition; `--agent <name>` selects it.
+
+    ``max_turns`` maps to opencode's ``steps`` cap; ``None`` omits the field so
+    the session has no step cap (the caller's wall-clock deadline is the only
+    bound)."""
     perm_lines = "\n".join(f"  {k}: {v}" for k, v in _permission_for_tools(tools).items())
     body = (system_prompt or "").strip() or (
         "You are a security-research agent for the vuln-pipeline. "
         "Follow the user's instructions precisely and use the available tools."
     )
+    steps_line = f"steps: {max_turns}\n" if max_turns else ""
     return (
         f"---\n"
         f"description: vuln-pipeline {agent_name} agent\n"
         f"mode: primary\n"
-        f"steps: {max_turns}\n"
+        f"{steps_line}"
         f"permission:\n{perm_lines}\n"
         f"---\n{body}\n"
     )
@@ -463,7 +468,7 @@ async def run_agent(
     prompt: str,
     *,
     container: str,
-    max_turns: int,
+    max_turns: int | None,
     model: str,
     max_resume_attempts: int = 20,
     transcript_path: str | None = None,
@@ -489,10 +494,11 @@ async def run_agent(
     API keys / runtime env are already on the container (set at docker_ops.run
     time via harness.auth.resolve_auth_env).
 
-    ``max_turns`` maps to the agent's ``steps`` cap. When opencode hits the
-    cap it forces a text response and exits cleanly (rc 0) — the pipeline then
-    sees a finished run without a submitted artifact, which downstream treats
-    as no-find. There is no separate "turn budget exhausted" error.
+    ``max_turns`` maps to the agent's ``steps`` cap; ``None`` omits the cap so
+    the session runs until the model stops or the watchdog deadline fires.  A
+    configured cap is enforced by opencode, which forces a text response and
+    exits cleanly (rc 0) — the pipeline then sees a finished run without a
+    submitted artifact, which downstream treats as no-find.
 
     Resilience: transient API failures surface as opencode ``error`` events or
     a non-zero exit; we resume the session (``--session <id>``) up to

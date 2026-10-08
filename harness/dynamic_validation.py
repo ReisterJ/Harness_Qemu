@@ -82,7 +82,7 @@ async def run_dynamic_validation(
     target: TargetConfig,
     candidate: StaticFinding,
     model: str,
-    max_turns: int,
+    max_turns: int | None,
     agent_env: dict[str, str] | None = None,
     container_name: str = "find_target",
     focus_area: str | None = None,
@@ -98,7 +98,7 @@ async def run_dynamic_validation(
     symbolic_execution: str | None = None,
     symbolic_execution_result_path: str | None = None,
     crash_result_path: str | None = None,
-    max_iterations: int = _DEFAULT_MAX_ITERATIONS,
+    max_iterations: int | None = None,
     phase_timeout_s: float | None = None,
 ) -> tuple[DynamicValidationResult, AgentResult, dict[str, float]]:
     """Try to produce a crash or semantic-logic PoC for one static candidate."""
@@ -115,7 +115,12 @@ async def run_dynamic_validation(
             "SymCC was selected, but target config has no prebuilt "
             "symbolic_execution.symcc.binary_path"
         )
-    iteration_limit = max(1, min(int(max_iterations), _MAX_ITERATION_RECORDS))
+    # ``None`` (or 0) means no fixed round budget: the phase deadline is the
+    # only bound.  An explicit positive value caps the documented rounds.
+    iteration_limit = (
+        None if not max_iterations
+        else max(1, min(int(max_iterations), _MAX_ITERATION_RECORDS))
+    )
     instrumentation_prepared: InstrumentationReport | None = None
     instrumentation_result: InstrumentationReport | None = None
     symbolic_result: dict | None = None
@@ -1629,7 +1634,7 @@ async def _prebuilt_protocol_worker(
 
 async def _run_prebuilt_symcc_agent(
     *, prompt: str, target: TargetConfig, container: str, model: str,
-    max_turns: int, system_prompt: str | None, max_resume_attempts: int,
+    max_turns: int | None, system_prompt: str | None, max_resume_attempts: int,
     transcript_path: str | None, progress_prefix: str | None,
     result_path: str | None,
     phase_timeout_s: float | None = None,
@@ -1900,7 +1905,7 @@ def _persist_instrumentation(
 
 
 def _prepare_iteration_workspace(
-    container: str, candidate: StaticFinding, max_iterations: int, detector: str
+    container: str, candidate: StaticFinding, max_iterations: int | None, detector: str
 ) -> None:
     """Create the provider-neutral iteration contract inside the agent image."""
     try:
@@ -1915,6 +1920,7 @@ def _prepare_iteration_workspace(
             "schema_version": 1,
             "candidate_id": candidate.candidate_id,
             "max_iterations": max_iterations,
+            "round_budget": "unlimited" if max_iterations is None else "bounded",
             "record_dir": "/work/validation/iterations",
             "observation_fields": [
                 "site_reached",
@@ -2005,7 +2011,7 @@ def _prepare_iteration_workspace(
 
 
 def _collect_iteration_records(
-    container: str, candidate_id: str, max_iterations: int
+    container: str, candidate_id: str, max_iterations: int | None
 ) -> tuple[list[dict], list[str]]:
     """Read bounded round records before the runtime container is removed."""
     try:
@@ -2023,7 +2029,8 @@ def _collect_iteration_records(
     errors: list[str] = []
     records: list[dict] = []
     paths = [line.strip() for line in listing.splitlines() if line.strip()]
-    for path in paths[:max_iterations]:
+    selected = paths if max_iterations is None else paths[:max_iterations]
+    for path in selected:
         if not re.match(r"^/work/validation/iterations/round-[0-9]{3}\.json$", path):
             errors.append(f"ignored unsafe iteration path: {path[:200]}")
             continue
@@ -2051,7 +2058,7 @@ def _collect_iteration_records(
             continue
         value["schema_version"] = 1
         records.append(_bound_iteration(value))
-    if len(paths) > max_iterations:
+    if max_iterations is not None and len(paths) > max_iterations:
         errors.append(f"iteration records truncated at {max_iterations}")
     records.sort(key=lambda item: (int(item.get("round_id", 0)), str(item)))
     return records, errors

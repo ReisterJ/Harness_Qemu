@@ -129,7 +129,8 @@ bin/vp-sandboxed run    <target> --model <m>            # one find agent + grade
     [--stream]                                          # judge + report on each crash as its grade lands (recommended)
     [--novelty]                                         # (--stream only) upstream fix-status check; clones github_url on the host
     [--report-max-turns N]                              # (--stream only) report-agent turn budget
-    [--max-turns N]                                     # find-agent turn budget
+    [--max-turns N]                                     # optional find-agent step cap (default: none — the phase deadline bounds the run)
+    [--max-iterations N]                                # optional cap on adaptive validation rounds (default: none)
     [--find-only]                                       # skip grading (useful for prompt iteration)
     [--accept-dos]                                      # benchmark mode: DoS-class crashes count as valid finds
     [--instrumentation off|auto|llvm]                   # default: auto; off explicitly disables feedback
@@ -138,11 +139,15 @@ bin/vp-sandboxed run    <target> --model <m>            # one find agent + grade
     [--engagement-context <file>]                       # threaded into every agent prompt
 
 bin/vp-sandboxed static <target> --model <m>             # only produce static_analysis.json
+    [--max-turns N]                                      # optional static-agent step cap (default: none)
     [--results-dir <dir>]                                # default ./results
 
 bin/vp-sandboxed dynamic <target> --static-report <file> --model <m>
     [--candidate-id <id>]                                # default: highest-confidence finding
     [--instrumentation off|auto|llvm]                    # default: auto; dynamic observation provider
+    [--symbolic-execution off|auto|klee|symcc]           # dynamic symbolic-execution helper
+    [--phase-timeout SECONDS]                            # overall phase deadline (default: none)
+    [--max-turns N] [--max-iterations N]                 # optional caps; both default to none
     [--results-dir <dir>]                                # no grade is run by this command
 
 bin/vp-sandboxed dedup  results/<target>/<ts>/          # group crashes by signature (no flags; spawns no agents)

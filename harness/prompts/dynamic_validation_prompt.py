@@ -31,7 +31,7 @@ def build_dynamic_validation_prompt(
     symbolic_round: int | None = None,
     symbolic_feedback: dict | None = None,
     symbolic_finalize: bool = False,
-    max_iterations: int = 8,
+    max_iterations: int | None = None,
 ) -> str:
     """Reuse detector-specific runtime instructions and narrow them to a finding."""
     base = build_find_prompt(
@@ -340,7 +340,7 @@ def build_poc_generation_prompt(
     runtime_context: dict | None = None,
     instrumentation_context: dict | None = None,
     symbolic_feedback: dict | None = None,
-    max_iterations: int = 8,
+    max_iterations: int | None = None,
 ) -> str:
     """Prompt a fresh agent that owns only post-SymCC PoC construction."""
     base = build_dynamic_validation_prompt(
@@ -829,16 +829,26 @@ copied into the grade container.
 """
 
 
-def _iteration_section(max_iterations: int, candidate_id: str) -> str:
+def _iteration_section(max_iterations: int | None, candidate_id: str) -> str:
     """Shared adaptive loop for both memory and semantic candidates."""
-    limit = max(1, min(int(max_iterations), 100))
+    if max_iterations is None:
+        budget = (
+            "There is no fixed round budget: keep working in numbered validation "
+            "rounds in this same container session and continue until the phase "
+            "deadline or a validated PoC. Every round must:"
+        )
+    else:
+        limit = max(1, min(int(max_iterations), 100))
+        budget = (
+            f"Work through at most {limit} numbered validation rounds in\n"
+            "this same container session. Every round must:"
+        )
     return f"""
 
 ## Iterative dynamic-validation loop
 
 Do not treat the static finding's call chain or trigger conditions as facts.
-It is a hypothesis. Work through at most {limit} numbered validation rounds in
-this same container session. Every round must:
+It is a hypothesis. {budget}
 
 1. Re-read the candidate source location and state the current entry/path
    hypothesis.

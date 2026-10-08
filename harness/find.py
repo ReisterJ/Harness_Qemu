@@ -20,11 +20,10 @@ from .dynamic_validation import run_dynamic_validation
 from .static_analysis import run_static_analysis
 
 
+# Legacy bounded budgets. The CLI leaves both caps unset so the wall-clock
+# phase deadline is the effective bound; pass one of these explicitly (or any
+# positive value) to cap steps/rounds again.
 DEFAULT_FIND_MAX_TURNS = 2000
-# Dynamic validation needs a high step ceiling so its wall-clock watchdog,
-# rather than the agent step counter, is the effective bound for long PoC
-# searches. The standalone `dynamic` CLI uses this value; the static phase and
-# combined `run` command retain DEFAULT_FIND_MAX_TURNS.
 DEFAULT_DYNAMIC_MAX_TURNS = 20000
 DEFAULT_DYNAMIC_MAX_ITERATIONS = 8
 
@@ -53,7 +52,7 @@ class FindPhaseResult:
 async def run_find(
     target: TargetConfig,
     model: str,
-    max_turns: int = DEFAULT_FIND_MAX_TURNS,
+    max_turns: int | None = None,
     agent_env: dict[str, str] | None = None,
     container_name: str = "find_target",
     focus_area: str | None = None,
@@ -71,7 +70,7 @@ async def run_find(
     instrumentation_result_path: str | None = None,
     symbolic_execution: str | None = None,
     symbolic_execution_result_path: str | None = None,
-    max_iterations: int = DEFAULT_DYNAMIC_MAX_ITERATIONS,
+    max_iterations: int | None = None,
 ) -> FindPhaseResult:
     """Run static analysis followed by dynamic validation.
 

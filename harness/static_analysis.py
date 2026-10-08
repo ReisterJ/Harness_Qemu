@@ -57,7 +57,7 @@ def parse_static_findings(text: str) -> tuple[list[StaticFinding], str | None]:
 async def run_static_analysis(
     target: TargetConfig,
     model: str,
-    max_turns: int,
+    max_turns: int | None,
     agent_env: dict[str, str] | None = None,
     container_name: str = "static_target",
     focus_area: str | None = None,

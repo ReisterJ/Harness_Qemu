@@ -12,6 +12,7 @@ import json
 
 from harness import docker_ops
 from harness.agent import (
+    _build_agent_file,
     _is_unbounded_helper_process,
     _model_config,
     _opencode_model,
@@ -260,3 +261,10 @@ def test_watchdog_does_not_misclassify_timeout_wrapped_helper_children():
     assert _unbounded_helper_processes(processes) == [
         "103 1 S python3 unbounded_server.py"
     ]
+
+
+def test_agent_file_omits_step_cap_when_max_turns_is_none():
+    text = _build_agent_file("find", "body", None, ["Read", "Bash"])
+    assert "steps:" not in text
+    capped = _build_agent_file("find", "body", 25, ["Read", "Bash"])
+    assert "steps: 25" in capped

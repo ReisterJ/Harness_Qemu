@@ -53,9 +53,6 @@ from .asan import asan_excerpt, crash_reason, top_frame
 from .config import TargetConfig
 from .dedup import dedup
 from .find import (
-    DEFAULT_DYNAMIC_MAX_ITERATIONS,
-    DEFAULT_DYNAMIC_MAX_TURNS,
-    DEFAULT_FIND_MAX_TURNS,
     run_find,
 )
 from .dynamic_validation import run_dynamic_validation
@@ -275,7 +272,7 @@ async def _run_once(
     target: TargetConfig,
     model: str,
     find_only: bool,
-    max_turns: int,
+    max_turns: int | None,
     agent_env: dict[str, str],
     out_dir: Path,
     focus_area: str | None,
@@ -284,7 +281,7 @@ async def _run_once(
     accept_dos: bool = False,
     system_prompt: str | None = None,
     instrumentation: str | None = None,
-    max_iterations: int = DEFAULT_DYNAMIC_MAX_ITERATIONS,
+    max_iterations: int | None = None,
     symbolic_execution: str | None = None,
 ) -> RunResult:
     """One find(+grade) attempt. Assumes image is already built.
@@ -891,9 +888,7 @@ async def _run_all(
                          stream_ctx, accept_dos=args.accept_dos, system_prompt=system_prompt,
                          instrumentation=getattr(args, "instrumentation", None),
                          symbolic_execution=getattr(args, "symbolic_execution", None),
-                         max_iterations=getattr(
-                             args, "max_iterations", DEFAULT_DYNAMIC_MAX_ITERATIONS
-                         ))
+                         max_iterations=getattr(args, "max_iterations", None))
 
     if args.parallel:
         n_live = args.runs - len(checkpoints)
@@ -1028,8 +1023,9 @@ def main() -> int:
     p_static.add_argument("target", help="Target name (under ./targets/) or path to target dir")
     p_static.add_argument("--model", default=os.environ.get("VULN_PIPELINE_MODEL"),
                           help="Model string (required; or set VULN_PIPELINE_MODEL)")
-    p_static.add_argument("--max-turns", type=int, default=DEFAULT_FIND_MAX_TURNS,
-                          help=f"Static-agent turn budget (default {DEFAULT_FIND_MAX_TURNS})")
+    p_static.add_argument("--max-turns", type=int, default=None,
+                          help=("Optional opencode step cap for the static agent. "
+                                "Omitted means no step cap."))
     p_static.add_argument("--results-dir", default="./results", help="Output root")
     p_static.add_argument("--docker-params", type=Path, default=None, metavar="PATH",
                           help="Override the target's docker-params.yaml")
@@ -1048,12 +1044,14 @@ def main() -> int:
                            help="Candidate to validate; default is the highest-confidence entry")
     p_dynamic.add_argument("--model", default=os.environ.get("VULN_PIPELINE_MODEL"),
                            help="Model string (required; or set VULN_PIPELINE_MODEL)")
-    p_dynamic.add_argument("--max-turns", type=int, default=DEFAULT_DYNAMIC_MAX_TURNS,
-                           help=f"Dynamic-agent turn budget (default {DEFAULT_DYNAMIC_MAX_TURNS})")
+    p_dynamic.add_argument("--max-turns", type=int, default=None,
+                           help=("Optional opencode step cap for the dynamic agent. "
+                                 "Omitted means no step cap: the phase deadline is the "
+                                 "only bound."))
     p_dynamic.add_argument(
-        "--max-iterations", type=int, default=DEFAULT_DYNAMIC_MAX_ITERATIONS,
-        help=("Maximum adaptive dynamic-validation rounds "
-              f"(default {DEFAULT_DYNAMIC_MAX_ITERATIONS})"),
+        "--max-iterations", type=int, default=None,
+        help=("Optional cap on adaptive dynamic-validation rounds. Omitted means "
+              "no round budget; records are kept for every round."),
     )
     p_dynamic.add_argument(
         "--phase-timeout", type=_positive_seconds, default=None, metavar="SECONDS",
@@ -1093,12 +1091,13 @@ def main() -> int:
                        help="Run all --runs concurrently (~1GB RAM per run)")
     p_run.add_argument("--auto-focus", dest="auto_focus", action="store_true",
                        help="Run recon agent to auto-discover focus areas (overrides config.yaml)")
-    p_run.add_argument("--max-turns", type=int, default=DEFAULT_FIND_MAX_TURNS,
-                       help=f"Find-agent turn budget (default {DEFAULT_FIND_MAX_TURNS})")
+    p_run.add_argument("--max-turns", type=int, default=None,
+                       help=("Optional opencode step cap for the find agent. Omitted "
+                             "means no step cap."))
     p_run.add_argument(
-        "--max-iterations", type=int, default=DEFAULT_DYNAMIC_MAX_ITERATIONS,
-        help=("Maximum adaptive dynamic-validation rounds "
-              f"(default {DEFAULT_DYNAMIC_MAX_ITERATIONS})"),
+        "--max-iterations", type=int, default=None,
+        help=("Optional cap on adaptive dynamic-validation rounds. Omitted means "
+              "no round budget."),
     )
     p_run.add_argument("--recon-max-turns", type=int, default=RECON_MAX_TURNS,
                        help=f"Recon-agent turn budget for --auto-focus (default {RECON_MAX_TURNS})")
@@ -1400,6 +1399,7 @@ def _cmd_static(args) -> int:
     static_path = out_dir / "static_analysis.json"
     transcript_path = out_dir / "static_transcript.jsonl"
     print(f"[static] Target: {target.name} (model={args.model})")
+    print(f"[static] Step cap: {'none' if not args.max_turns else args.max_turns}")
     try:
         prepare_target_image(target, rebuild=False)
         findings, result, timings, parse_error = asyncio.run(run_static_analysis(
@@ -1512,6 +1512,11 @@ def _cmd_dynamic(args) -> int:
     print(
         "[dynamic] Phase timeout: "
         + (f"{args.phase_timeout:.0f}s" if args.phase_timeout else "none (no overall deadline)")
+    )
+    print(
+        "[dynamic] Other caps: "
+        + f"steps={'none' if not args.max_turns else args.max_turns}, "
+        + f"rounds={'none' if not args.max_iterations else args.max_iterations}"
     )
     try:
         prepare_target_image(target, rebuild=False)
