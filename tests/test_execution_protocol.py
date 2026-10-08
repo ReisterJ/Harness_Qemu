@@ -1,4 +1,5 @@
 """Tests for harness-owned dynamic input requests and prebuilt SymCC runs."""
+import asyncio
 import json
 
 import pytest
@@ -221,3 +222,48 @@ def test_symcc_protocol_preflights_binaries_and_installs_runner(monkeypatch):
         "mv -- /out/target-symcc /out/.harness-symcc-target-symcc" in command
         for command in calls
     )
+
+
+def test_prebuilt_symcc_agent_forwards_phase_timeout_and_no_deadline(monkeypatch):
+    """The symcc agent must use the caller's watchdog budget, not a constant."""
+    from harness.agent import AgentResult
+    from harness.dynamic_validation import _run_prebuilt_symcc_agent
+
+    message = "<dynamic_status>iteration_exhausted</dynamic_status>"
+
+    captured = {}
+
+    async def fake_worker(**_kwargs):
+        return {
+            "schema_version": 1, "provider": "symcc-prebuilt", "status": "completed",
+            "requests": 0, "invalid_requests": 0, "errors": 0,
+            "symcc_execution_s": 0.0, "records": [],
+        }
+
+    async def fake_agent(**kwargs):
+        captured.update(kwargs)
+        return AgentResult(
+            messages=[{"type": "text", "part": {"type": "text", "text": message}}],
+            result_message=message,
+        )
+
+    monkeypatch.setattr("harness.dynamic_validation._prebuilt_protocol_worker", fake_worker)
+    monkeypatch.setattr("harness.dynamic_validation.run_agent", fake_agent)
+
+    target = _target()
+    asyncio.run(_run_prebuilt_symcc_agent(
+        prompt="p", target=target, container="c", model="m", max_turns=1,
+        system_prompt=None, max_resume_attempts=1, transcript_path=None,
+        progress_prefix=None, result_path=None, phase_timeout_s=7200.0,
+    ))
+    assert captured["phase_timeout_s"] == 7200.0
+    assert captured["idle_timeout_s"] == 7200.0
+
+    captured.clear()
+    asyncio.run(_run_prebuilt_symcc_agent(
+        prompt="p", target=target, container="c", model="m", max_turns=1,
+        system_prompt=None, max_resume_attempts=1, transcript_path=None,
+        progress_prefix=None, result_path=None,
+    ))
+    assert captured["phase_timeout_s"] is None
+    assert captured["idle_timeout_s"] is None

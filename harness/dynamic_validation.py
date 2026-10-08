@@ -99,6 +99,7 @@ async def run_dynamic_validation(
     symbolic_execution_result_path: str | None = None,
     crash_result_path: str | None = None,
     max_iterations: int = _DEFAULT_MAX_ITERATIONS,
+    phase_timeout_s: float | None = None,
 ) -> tuple[DynamicValidationResult, AgentResult, dict[str, float]]:
     """Try to produce a crash or semantic-logic PoC for one static candidate."""
     timings: dict[str, float] = {}
@@ -190,6 +191,7 @@ async def run_dynamic_validation(
                 transcript_path=transcript_path,
                 progress_prefix=progress_prefix,
                 result_path=symbolic_execution_result_path,
+                phase_timeout_s=phase_timeout_s,
             )
             timings.update(protocol_timings)
         else:
@@ -221,6 +223,8 @@ async def run_dynamic_validation(
                 system_prompt=system_prompt,
                 max_resume_attempts=max_resume_attempts,
                 tools=["Read", "Write", "Bash"],
+                phase_timeout_s=phase_timeout_s,
+                idle_timeout_s=phase_timeout_s,
             )
             timings["dynamic_validation"] = time.time() - started
         timings["dynamic_agent_tool_calls"] = float(result.tool_call_count)
@@ -1628,6 +1632,7 @@ async def _run_prebuilt_symcc_agent(
     max_turns: int, system_prompt: str | None, max_resume_attempts: int,
     transcript_path: str | None, progress_prefix: str | None,
     result_path: str | None,
+    phase_timeout_s: float | None = None,
 ) -> tuple[AgentResult, dict[str, float], dict[str, Any]]:
     started = time.time()
     stop = asyncio.Event()
@@ -1639,8 +1644,9 @@ async def _run_prebuilt_symcc_agent(
             prompt=prompt, max_turns=max_turns, model=model, container=container,
             transcript_path=transcript_path, progress_prefix=progress_prefix,
             system_prompt=system_prompt, max_resume_attempts=max_resume_attempts,
-            tools=["Read", "Write", "Bash"], phase_timeout_s=1800.0,
-            idle_timeout_s=1800.0,
+            tools=["Read", "Write", "Bash"],
+            phase_timeout_s=phase_timeout_s,
+            idle_timeout_s=phase_timeout_s,
         )
     finally:
         stop.set()

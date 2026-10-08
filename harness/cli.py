@@ -118,6 +118,19 @@ def _load_dotenv() -> None:
         return
 
 
+def _positive_seconds(value: str) -> float:
+    """argparse type for a positive number of seconds."""
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"expected a number of seconds, got {value!r}"
+        ) from exc
+    if seconds <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return seconds
+
+
 def resolve_target_dir(target: str) -> Path:
     """Accept either a name (looked up under ./targets/) or a direct path.
 
@@ -1042,6 +1055,12 @@ def main() -> int:
         help=("Maximum adaptive dynamic-validation rounds "
               f"(default {DEFAULT_DYNAMIC_MAX_ITERATIONS})"),
     )
+    p_dynamic.add_argument(
+        "--phase-timeout", type=_positive_seconds, default=None, metavar="SECONDS",
+        help=("Optional overall dynamic-phase deadline in seconds.  Omitted means "
+              "no overall deadline: the agent watchdog still bounds unbounded "
+              "helper processes and per-command timeouts still apply."),
+    )
     p_dynamic.add_argument("--results-dir", default="./results", help="Output root")
     p_dynamic.add_argument(
         "--instrumentation", choices=("off", "auto", "llvm"), default=None,
@@ -1490,6 +1509,10 @@ def _cmd_dynamic(args) -> int:
     print(f"[dynamic] Candidate: {candidate.candidate_id} ({candidate.location})")
     print(f"[dynamic] Instrumentation: {args.instrumentation or (target.instrumentation or {}).get('default', 'auto')}")
     print(f"[dynamic] Symbolic execution: {args.symbolic_execution or (target.symbolic_execution or {}).get('default', 'off')}")
+    print(
+        "[dynamic] Phase timeout: "
+        + (f"{args.phase_timeout:.0f}s" if args.phase_timeout else "none (no overall deadline)")
+    )
     try:
         prepare_target_image(target, rebuild=False)
         result, agent_result, timings = asyncio.run(run_dynamic_validation(
@@ -1508,6 +1531,7 @@ def _cmd_dynamic(args) -> int:
             symbolic_execution_result_path=str(out_dir / "symbolic_execution"),
             crash_result_path=str(out_dir / "crash-result.xml"),
             max_iterations=args.max_iterations,
+            phase_timeout_s=args.phase_timeout,
         ))
     except Exception as exc:
         print(f"error: dynamic phase failed: {type(exc).__name__}: {exc}", file=sys.stderr)

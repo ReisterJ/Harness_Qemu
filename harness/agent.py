@@ -273,8 +273,8 @@ async def _agent_watchdog(
     activity: dict[str, float],
     state: dict[str, str | None],
     *,
-    phase_timeout_s: float,
-    idle_timeout_s: float,
+    phase_timeout_s: float | None,
+    idle_timeout_s: float | None,
     helper_timeout_s: float,
     interval_s: float,
 ) -> None:
@@ -284,13 +284,13 @@ async def _agent_watchdog(
     therefore distinguishes a quiet model request (no child tool process) from
     a quiet Bash command by probing the container process table.  Unbounded
     ad-hoc helper servers get a shorter dedicated deadline, while a bounded
-    command can use the full 1800-second phase budget.
+    command can use the full phase budget (when one is configured).
     """
     helper_since: float | None = None
     while proc.returncode is None:
         await asyncio.sleep(max(0.05, interval_s))
         now = time.monotonic()
-        if now - activity["started"] > phase_timeout_s:
+        if phase_timeout_s is not None and now - activity["started"] > phase_timeout_s:
             state["error"] = (
                 f"agent/model_blocked: phase exceeded {phase_timeout_s:.0f}s"
             )
@@ -315,7 +315,10 @@ async def _agent_watchdog(
                 helper_since = None
             else:
                 helper_since = None
-                if now - activity["last_event"] > idle_timeout_s:
+                if (
+                    idle_timeout_s is not None
+                    and now - activity["last_event"] > idle_timeout_s
+                ):
                     state["error"] = (
                         "agent/model_blocked: no streamed agent event and no active "
                         f"tool process for {idle_timeout_s:.0f}s"
@@ -468,11 +471,13 @@ async def run_agent(
     progress_prefix: str | None = None,
     tools: list[str] | None = None,
     system_prompt: str | None = None,
-    phase_timeout_s: float = 1800.0,
+    # ``None`` disables the overall phase deadline; the helper deadline and the
+    # tool-command bounds still apply.
+    phase_timeout_s: float | None = 1800.0,
     # A quiet model request may legitimately take as long as the phase.  The
     # separate helper deadline still prevents an unbounded local server from
-    # consuming that entire budget.
-    idle_timeout_s: float = 1800.0,
+    # consuming that entire budget.  ``None`` disables the idle deadline.
+    idle_timeout_s: float | None = 1800.0,
     helper_timeout_s: float = 120.0,
     watchdog_interval_s: float = 5.0,
 ) -> AgentResult:
