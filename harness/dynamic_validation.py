@@ -13,7 +13,7 @@ import xml.etree.ElementTree as ET
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 from xml.sax.saxutils import escape as xml_escape
 
 from . import docker_ops
@@ -123,6 +123,7 @@ async def run_dynamic_validation(
         None if not max_iterations
         else max(1, min(int(max_iterations), _MAX_ITERATION_RECORDS))
     )
+    focus_functions = _candidate_focus_functions(candidate)
     instrumentation_prepared: InstrumentationReport | None = None
     instrumentation_result: InstrumentationReport | None = None
     symbolic_result: dict | None = None
@@ -199,6 +200,7 @@ async def run_dynamic_validation(
                 progress_prefix=progress_prefix,
                 result_path=symbolic_execution_result_path,
                 phase_timeout_s=phase_timeout_s,
+                focus_functions=focus_functions,
             )
             timings.update(protocol_timings)
         else:
@@ -1235,6 +1237,13 @@ def _symcc_hidden_path(binary_path: str, role: str) -> str:
 
 # Coverage is an observation channel, never a gate: a request is still valid
 # when the coverage build is missing, times out, or fails to produce a report.
+_FUNCTION_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{2,79}$")
+_LOCATION_FUNCTION_PATTERNS = (
+    re.compile(r"\bfunction\s+([A-Za-z_][A-Za-z0-9_]*)"),
+    re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s+in\s+[\w./+-]+\.[A-Za-z]{1,4}\b"),
+    re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*\("),
+)
+_COVERAGE_MAX_FOCUS = 4
 _COVERAGE_TIMEOUT_CAP_S = 30
 _COVERAGE_TOP_FILES = 5
 _COVERAGE_SAMPLE_LINES = 12
@@ -1252,15 +1261,67 @@ class ProtocolCoverageSession:
     files_touched: int = 0
     covered_lines: dict[str, set[int]] = field(default_factory=dict)
     functions_seen: set[str] = field(default_factory=set)
+    focus_hits: dict[str, int] = field(default_factory=dict)
+    focus_reached: set[str] = field(default_factory=set)
 
-    def record(self, files: dict[str, set[int]], functions: set[str]) -> None:
+    def record(
+        self,
+        files: dict[str, set[int]],
+        functions: set[str],
+        focus: Iterable[tuple[str, int]] = (),
+    ) -> None:
         for path, lines in files.items():
             self.covered_lines.setdefault(path, set()).update(lines)
         self.functions_seen.update(functions)
+        for name, hits in focus:
+            self.focus_hits[name] = self.focus_hits.get(name, 0) + int(hits)
+            if hits:
+                self.focus_reached.add(name)
         self.requests += 1
         self.lines_hit = sum(len(lines) for lines in self.covered_lines.values())
         self.functions_hit = len(self.functions_seen)
         self.files_touched = len(self.covered_lines)
+
+
+def _candidate_focus_functions(
+    candidate: StaticFinding,
+) -> tuple[dict[str, Any], ...]:
+    """Checkpoints the static candidate names: the target point to reach.
+
+    Structured ``observability_targets`` win; otherwise the function name is
+    read out of the free-text ``location`` (e.g. "mrb_env_unshare in gc.c").
+    """
+    focus: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(name: Any, file: Any = "", line: Any = None, why: Any = "") -> None:
+        text = str(name or "").strip()
+        if not _FUNCTION_NAME_RE.match(text) or text in seen:
+            return
+        seen.add(text)
+        item: dict[str, Any] = {"name": text}
+        if isinstance(file, str) and file.strip():
+            item["file"] = file.strip()
+        if isinstance(line, int) and line > 0:
+            item["line"] = line
+        if isinstance(why, str) and why.strip():
+            item["why"] = why.strip()[:200]
+        focus.append(item)
+
+    for target in candidate.observability_targets or ():
+        if isinstance(target, dict):
+            add(
+                target.get("function"),
+                target.get("file"),
+                target.get("line"),
+                target.get("why"),
+            )
+    if not focus:
+        location = str(candidate.location or "")
+        for pattern in _LOCATION_FUNCTION_PATTERNS:
+            for match in pattern.finditer(location):
+                add(match.group(1))
+    return tuple(focus[:_COVERAGE_MAX_FOCUS])
 
 
 def _find_container_tool(container: str, name: str) -> str | None:
@@ -1280,8 +1341,81 @@ def _find_container_tool(container: str, name: str) -> str | None:
     return resolved[-1].strip() if resolved else None
 
 
+def _focus_coverage(
+    focus: Iterable[dict[str, Any]],
+    *,
+    functions: dict[str, int],
+    function_lines: dict[str, int],
+    function_file: dict[str, str],
+    file_lines: dict[str, dict[int, int]],
+    session: ProtocolCoverageSession,
+) -> list[dict[str, Any]]:
+    """Per-input hit counts for the candidate's target function(s).
+
+    The static candidate names the point the input has to reach, so it is
+    reported on every request whether or not it is new to the session.
+    """
+    per_file_lines: dict[str, list[int]] = {}
+    for symbol, line in function_lines.items():
+        per_file_lines.setdefault(function_file.get(symbol, ""), []).append(line)
+    for lines in per_file_lines.values():
+        lines.sort()
+
+    entries: list[dict[str, Any]] = []
+    for item in focus:
+        name = str(item.get("name") or "")
+        if not name:
+            continue
+        matches = [
+            symbol
+            for symbol in function_lines
+            if symbol == name or symbol.endswith(":" + name)
+        ]
+        session_hits = session.focus_hits.get(name, 0)
+        if not matches:
+            entries.append({
+                "name": name,
+                "status": "unmatched",
+                "hits": 0,
+                "session_hits": session_hits,
+                "note": "not present in the coverage mapping (inlined, renamed, or wrong name)",
+            })
+            continue
+        symbol = max(
+            matches, key=lambda candidate: (functions.get(candidate, 0), candidate)
+        )
+        line = function_lines[symbol]
+        path = function_file.get(symbol, "")
+        same_file = per_file_lines.get(path, [])
+        next_line = next(
+            (number for number in same_file if number > line), None
+        )
+        span = {
+            number: count
+            for number, count in file_lines.get(path, {}).items()
+            if number >= line and (next_line is None or number < next_line)
+        }
+        hits = int(functions.get(symbol, 0))
+        entry: dict[str, Any] = {
+            "name": name,
+            "file": path,
+            "line": line,
+            "hits": hits,
+            "session_hits": session_hits + hits,
+            "status": "hit" if hits else "not_hit",
+        }
+        if span:
+            entry["lines_in_function"] = len(span)
+            entry["lines_hit"] = sum(1 for count in span.values() if count > 0)
+        if symbol != name:
+            entry["symbol"] = symbol
+        entries.append(entry)
+    return entries
+
+
 def _summarize_lcov_coverage(
-    lcov: str, *, session: ProtocolCoverageSession
+    lcov: str, *, session: ProtocolCoverageSession,
+    focus: Iterable[dict[str, Any]] = (),
 ) -> dict[str, Any]:
     """Turn an llvm-cov lcov export into the compact per-input feedback block.
 
@@ -1292,6 +1426,9 @@ def _summarize_lcov_coverage(
     files: dict[str, set[int]] = {}
     functions: dict[str, int] = {}
     file_functions: dict[str, dict[str, int]] = {}
+    file_lines: dict[str, dict[int, int]] = {}
+    function_lines: dict[str, int] = {}
+    function_file: dict[str, str] = {}
     path = ""
     for line in lcov.splitlines():
         if line.startswith("SF:"):
@@ -1299,22 +1436,34 @@ def _summarize_lcov_coverage(
         elif line.startswith("DA:") and path:
             try:
                 number, count = line[3:].split(",", 1)
-                if int(count) > 0:
-                    files.setdefault(path, set()).add(int(number))
+                hits = int(count)
             except ValueError:
                 continue
+            file_lines.setdefault(path, {})[int(number)] = hits
+            if hits > 0:
+                files.setdefault(path, set()).add(int(number))
+        elif line.startswith("FN:") and path:
+            try:
+                number, name = line[3:].split(",", 1)
+            except ValueError:
+                continue
+            name = name.strip()
+            if name:
+                function_lines[name] = int(number)
+                function_file[name] = path
         elif line.startswith("FNDA:") and path:
             try:
                 count, name = line[5:].split(",", 1)
             except ValueError:
                 continue
             name = name.strip()
-            if int(count) > 0 and name:
+            if name:
                 functions[name] = int(count)
-                file_functions.setdefault(path, {})[name] = int(count)
+                if int(count) > 0:
+                    file_functions.setdefault(path, {})[name] = int(count)
 
     files_touched = len(files)
-    functions_hit = len(functions)
+    functions_hit = sum(1 for hits in functions.values() if hits > 0)
     new_lines_total = 0
     top_files: list[dict[str, Any]] = []
     for file, lines in sorted(
@@ -1347,12 +1496,25 @@ def _summarize_lcov_coverage(
         (
             (name, hits)
             for name, hits in functions.items()
-            if name not in session.functions_seen
+            if hits > 0 and name not in session.functions_seen
         ),
         key=lambda item: (-item[1], item[0]),
     )[:_COVERAGE_MAX_FUNCTIONS]
 
-    session.record(files, set(functions))
+    focus_entries = _focus_coverage(
+        focus,
+        functions=functions,
+        function_lines=function_lines,
+        function_file=function_file,
+        file_lines=file_lines,
+        session=session,
+    )
+
+    session.record(
+        files,
+        {name for name, hits in functions.items() if hits > 0},
+        ((entry["name"], entry["hits"]) for entry in focus_entries),
+    )
     return {
         "schema_version": 1,
         "files_touched": files_touched,
@@ -1362,6 +1524,7 @@ def _summarize_lcov_coverage(
         "new_functions": [
             {"name": name, "hits": hits} for name, hits in hottest_functions
         ],
+        "focus": focus_entries,
         "top_new_files": top_files,
         "cumulative": {
             "requests": session.requests,
@@ -1379,6 +1542,7 @@ def _collect_protocol_coverage(
     request: ExecutionRequest,
     input_path: str,
     session: ProtocolCoverageSession,
+    focus: Iterable[dict[str, Any]] = (),
 ) -> dict[str, Any]:
     """Run the agent's own input through the coverage build and report it.
 
@@ -1450,7 +1614,7 @@ def _collect_protocol_coverage(
         text = raw.decode("utf-8", errors="replace")
     except Exception as exc:  # pragma: no cover - bytes.decode with replace cannot raise
         return {**report, "status": "failed", "errors": [str(exc)]}
-    summary = _summarize_lcov_coverage(text, session=session)
+    summary = _summarize_lcov_coverage(text, session=session, focus=focus)
     summary["report"] = {"lcov": lcov, "profdata": profdata}
     return {**report, **summary}
 
@@ -1634,6 +1798,7 @@ def _run_protocol_binary(
 def _execute_prebuilt_protocol_request(
     *, container: str, target: TargetConfig, raw: bytes, filename: str,
     round_id: int, coverage_session: ProtocolCoverageSession | None = None,
+    focus_functions: Iterable[dict[str, Any]] = (),
 ) -> dict[str, Any]:
     try:
         request = parse_request(raw, filename=filename)
@@ -1693,6 +1858,7 @@ def _execute_prebuilt_protocol_request(
                 request=request,
                 input_path=request.input_path,
                 session=coverage_session or ProtocolCoverageSession(),
+                focus=focus_functions,
             )
         except Exception as exc:
             coverage = {
@@ -1796,6 +1962,7 @@ def _execute_prebuilt_protocol_request(
 async def _prebuilt_protocol_worker(
     *, container: str, target: TargetConfig, stop: asyncio.Event,
     result_path: str | None,
+    focus_functions: Iterable[dict[str, Any]] = (),
 ) -> dict[str, Any]:
     seen: set[str] = set()
     records: list[dict[str, Any]] = []
@@ -1803,6 +1970,7 @@ async def _prebuilt_protocol_worker(
     stats = {
         "processed": 0, "invalid": 0, "errors": 0, "symcc_duration_s": 0.0,
         "coverage_requests": 0, "coverage_errors": 0, "coverage_new_lines": 0,
+        "focus_reached": 0,
     }
     command = (
         f"find {shlex.quote(PENDING_ROOT)} -maxdepth 1 -type f "
@@ -1829,6 +1997,7 @@ async def _prebuilt_protocol_worker(
                         container=container, target=target, raw=raw,
                         filename=name, round_id=stats["processed"] + 1,
                         coverage_session=coverage_session,
+                        focus_functions=focus_functions,
                     )
                     if response.get("status") == "invalid_request":
                         stats["invalid"] += 1
@@ -1843,6 +2012,9 @@ async def _prebuilt_protocol_worker(
                             stats["coverage_new_lines"] += int(
                                 coverage.get("new_lines") or 0
                             )
+                            for entry in coverage.get("focus") or ():
+                                if entry.get("status") == "hit":
+                                    stats["focus_reached"] += 1
                         else:
                             stats["coverage_errors"] += 1
                     await asyncio.to_thread(
@@ -1890,6 +2062,7 @@ async def _prebuilt_protocol_worker(
         "coverage_requests": stats["coverage_requests"],
         "coverage_errors": stats["coverage_errors"],
         "coverage_new_lines": stats["coverage_new_lines"],
+        "coverage_focus_hits": stats["focus_reached"],
         "records": records,
     }
     if result_path:
@@ -1908,11 +2081,13 @@ async def _run_prebuilt_symcc_agent(
     transcript_path: str | None, progress_prefix: str | None,
     result_path: str | None,
     phase_timeout_s: float | None = None,
+    focus_functions: Iterable[dict[str, Any]] = (),
 ) -> tuple[AgentResult, dict[str, float], dict[str, Any]]:
     started = time.time()
     stop = asyncio.Event()
     worker = asyncio.create_task(_prebuilt_protocol_worker(
-        container=container, target=target, stop=stop, result_path=result_path
+        container=container, target=target, stop=stop, result_path=result_path,
+        focus_functions=focus_functions,
     ))
     try:
         result = await run_agent(

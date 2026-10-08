@@ -283,10 +283,14 @@ def _coverage_target():
 
 
 def _lcov(*records):
+    """Build an lcov export.  Function entries are (name, hits[, line])."""
     blocks = []
     for path, lines, functions in records:
         block = [f"SF:{path}"]
-        for name, hits in functions:
+        for entry in functions:
+            name, hits = entry[0], entry[1]
+            line = entry[2] if len(entry) > 2 else 1
+            block.append(f"FN:{line},{name}")
             block.append(f"FNDA:{hits},{name}")
         for number, count in lines:
             block.append(f"DA:{number},{count}")
@@ -511,3 +515,163 @@ def test_target_config_rejects_relative_coverage_binary(tmp_path):
     )
     with pytest.raises(ValueError, match="coverage_binary_path"):
         TargetConfig.load(tmp_path)
+
+
+def test_focus_block_tracks_the_target_function_on_every_input():
+    from harness.dynamic_validation import (
+        ProtocolCoverageSession,
+        _summarize_lcov_coverage,
+    )
+
+    focus = ({"name": "mrb_env_unshare", "file": "src/vm.c", "line": 375},)
+    session = ProtocolCoverageSession()
+
+    hit = _summarize_lcov_coverage(
+        _lcov(
+            ("/src/mruby/src/vm.c",
+             [(370, 5), (376, 42), (380, 3)],
+             [("mrb_env_unshare", 42, 375), ("mrb_vm_exec", 9, 500)]),
+        ),
+        session=session,
+        focus=focus,
+    )["focus"]
+    assert hit == [{
+        "name": "mrb_env_unshare",
+        "file": "/src/mruby/src/vm.c",
+        "line": 375,
+        "hits": 42,
+        "session_hits": 42,
+        "status": "hit",
+        "lines_in_function": 2,
+        "lines_hit": 2,
+    }]
+
+    # second input misses the target: still reported, cumulative hits retained
+    miss = _summarize_lcov_coverage(
+        _lcov(("/src/mruby/src/vm.c", [(370, 1)], [("mrb_env_unshare", 0, 375)])),
+        session=session,
+        focus=focus,
+    )["focus"]
+    assert miss[0]["status"] == "not_hit"
+    assert miss[0]["hits"] == 0
+    assert miss[0]["session_hits"] == 42
+
+
+def test_focus_block_matches_static_function_symbols_and_flags_unknown_names():
+    from harness.dynamic_validation import (
+        ProtocolCoverageSession,
+        _summarize_lcov_coverage,
+    )
+
+    session = ProtocolCoverageSession()
+    entries = _summarize_lcov_coverage(
+        _lcov(
+            ("/src/mruby/src/gc.c",
+             [(1153, 5), (1158, 1)],
+             [("gc.c:incremental_sweep_phase", 1, 1114)]),
+        ),
+        session=session,
+        focus=({"name": "incremental_sweep_phase"}, {"name": "mrb_env_unshare"}),
+    )["focus"]
+
+    assert entries[0]["name"] == "incremental_sweep_phase"
+    assert entries[0]["symbol"] == "gc.c:incremental_sweep_phase"
+    assert entries[0]["status"] == "hit"
+    assert entries[0]["hits"] == 1
+    assert entries[0]["lines_in_function"] == 2
+    assert entries[0]["lines_hit"] == 2
+    assert entries[1] == {
+        "name": "mrb_env_unshare",
+        "status": "unmatched",
+        "hits": 0,
+        "session_hits": 0,
+        "note": "not present in the coverage mapping (inlined, renamed, or wrong name)",
+    }
+
+
+def test_focus_functions_come_from_observability_targets_or_location():
+    from harness.dynamic_validation import _candidate_focus_functions
+
+    structured = StaticFinding(
+        candidate_id="candidate_001",
+        bug_class="heap-use-after-free",
+        location="src/vm.c:375",
+        static_call_chain="",
+        entry_points="",
+        attacker_controlled_data="",
+        reachability_evidence="",
+        required_conditions="",
+        root_cause="",
+        verification_plan="",
+        confidence=0.5,
+        observability_targets=[
+            {"file": "src/vm.c", "function": "mrb_env_unshare", "line": 375,
+             "why": "candidate sink"},
+            {"function": "mrb_vm_exec"},
+            {"function": "not a name"},
+        ],
+    )
+    assert _candidate_focus_functions(structured) == (
+        {"name": "mrb_env_unshare", "file": "src/vm.c", "line": 375,
+         "why": "candidate sink"},
+        {"name": "mrb_vm_exec"},
+    )
+
+    fallback = StaticFinding(
+        candidate_id="candidate_001",
+        bug_class="unknown",
+        location="mrb_env_unshare in gc.c",
+        static_call_chain="",
+        entry_points="",
+        attacker_controlled_data="",
+        reachability_evidence="",
+        required_conditions="",
+        root_cause="A write-barrier bug exists in mrb_env_unshare.",
+        verification_plan="",
+        confidence=0.5,
+    )
+    assert [item["name"] for item in _candidate_focus_functions(fallback)] == [
+        "mrb_env_unshare",
+    ]
+
+
+def test_focus_is_reported_in_the_protocol_response(monkeypatch):
+    target = _coverage_target()
+    lcov = _lcov(
+        ("/src/mruby/src/vm.c", [(376, 42)], [("mrb_env_unshare", 42, 376)]),
+    )
+
+    def fake_exec(container, command, timeout=0):
+        if command.startswith("command -v llvm-profdata"):
+            return 0, "/usr/bin/llvm-profdata-15\n", ""
+        if command.startswith("command -v llvm-cov"):
+            return 0, "/usr/bin/llvm-cov-15\n", ""
+        if command.startswith("readlink -f"):
+            return 0, f"{INPUT_ROOT}/candidate.bin\n", ""
+        if command.startswith("test -f"):
+            return 0, "", ""
+        if command.startswith("stat -c"):
+            return 0, "4\n", ""
+        return 0, "", ""
+
+    monkeypatch.setattr(docker_ops, "exec_sh", fake_exec)
+    monkeypatch.setattr(
+        docker_ops, "read_file",
+        lambda _c, path: lcov.encode() if path.endswith(".lcov")
+        else (b"seed" if path.endswith("candidate.bin") else b""),
+    )
+    monkeypatch.setattr(docker_ops, "write_file", lambda *a, **k: None)
+
+    response = _execute_prebuilt_protocol_request(
+        container="target",
+        target=target,
+        raw=json.dumps(_request()).encode(),
+        filename="round-001.json",
+        round_id=1,
+        focus_functions=({"name": "mrb_env_unshare", "file": "src/vm.c"},),
+    )
+    focus = response["coverage"]["focus"]
+    assert focus[0]["name"] == "mrb_env_unshare"
+    assert focus[0]["status"] == "hit"
+    assert focus[0]["hits"] == 42
+    assert focus[0]["file"] == "/src/mruby/src/vm.c"
