@@ -63,9 +63,10 @@ def test_symbolic_provider_selection_is_opt_in_and_target_configurable():
 def test_prebuilt_mruby_experiment_target_resolves_without_revealing_bug():
     root = Path(__file__).resolve().parents[1]
     target = TargetConfig.load(root / "targets" / "mruby-arvo")
-    assert target.runtime_image_tag == "local/mruby-arvo-prebuilt-symcc:2de602b"
+    assert target.runtime_image_tag == "local/mruby-arvo-prebuilt-symcc:2de602b-cov1"
     assert target.source_root == "/src/mruby"
     assert target.binary_path == "/out/mruby_fuzzer"
+    assert target.coverage_binary_path == "/out/mruby_fuzzer_cov"
     assert target.known_bugs == []
     assert target.symbolic_execution == {
         "default": "off",

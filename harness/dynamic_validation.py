@@ -11,6 +11,7 @@ import re
 import shlex
 import xml.etree.ElementTree as ET
 from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 from xml.sax.saxutils import escape as xml_escape
@@ -26,6 +27,7 @@ from .artifacts import (
 )
 from .config import TargetConfig
 from .execution_protocol import (
+    COVERAGE_ROOT,
     INPUT_ROOT,
     PENDING_ROOT,
     PROCESSED_ROOT,
@@ -1231,6 +1233,228 @@ def _symcc_hidden_path(binary_path: str, role: str) -> str:
     return str(path.with_name(f".harness-{role}-{path.name}"))
 
 
+# Coverage is an observation channel, never a gate: a request is still valid
+# when the coverage build is missing, times out, or fails to produce a report.
+_COVERAGE_TIMEOUT_CAP_S = 30
+_COVERAGE_TOP_FILES = 5
+_COVERAGE_SAMPLE_LINES = 12
+_COVERAGE_FILE_FUNCTIONS = 8
+_COVERAGE_MAX_FUNCTIONS = 10
+
+
+@dataclass
+class ProtocolCoverageSession:
+    """Accumulated coverage of the inputs this dynamic session already ran."""
+
+    requests: int = 0
+    lines_hit: int = 0
+    functions_hit: int = 0
+    files_touched: int = 0
+    covered_lines: dict[str, set[int]] = field(default_factory=dict)
+    functions_seen: set[str] = field(default_factory=set)
+
+    def record(self, files: dict[str, set[int]], functions: set[str]) -> None:
+        for path, lines in files.items():
+            self.covered_lines.setdefault(path, set()).update(lines)
+        self.functions_seen.update(functions)
+        self.requests += 1
+        self.lines_hit = sum(len(lines) for lines in self.covered_lines.values())
+        self.functions_hit = len(self.functions_seen)
+        self.files_touched = len(self.covered_lines)
+
+
+def _find_container_tool(container: str, name: str) -> str | None:
+    """Resolve a tool inside the container, accepting versioned binaries."""
+    command = (
+        f"command -v {name} 2>/dev/null || "
+        f"find /usr/bin /usr/local/bin -maxdepth 1 -name '{name}-[0-9]*' "
+        "-print 2>/dev/null | sort -V | tail -n 1"
+    )
+    try:
+        rc, out, _err = docker_ops.exec_sh(container, command, timeout=15)
+    except Exception:
+        return None
+    if rc:
+        return None
+    resolved = out.strip().splitlines()
+    return resolved[-1].strip() if resolved else None
+
+
+def _summarize_lcov_coverage(
+    lcov: str, *, session: ProtocolCoverageSession
+) -> dict[str, Any]:
+    """Turn an llvm-cov lcov export into the compact per-input feedback block.
+
+    Updates ``session`` in place so ``new_lines``/``new_functions`` describe
+    what this input reached beyond the inputs of the same session.  Only the
+    submitted input is described: SymCC-generated testcases are not included.
+    """
+    files: dict[str, set[int]] = {}
+    functions: dict[str, int] = {}
+    file_functions: dict[str, dict[str, int]] = {}
+    path = ""
+    for line in lcov.splitlines():
+        if line.startswith("SF:"):
+            path = line[3:].strip()
+        elif line.startswith("DA:") and path:
+            try:
+                number, count = line[3:].split(",", 1)
+                if int(count) > 0:
+                    files.setdefault(path, set()).add(int(number))
+            except ValueError:
+                continue
+        elif line.startswith("FNDA:") and path:
+            try:
+                count, name = line[5:].split(",", 1)
+            except ValueError:
+                continue
+            name = name.strip()
+            if int(count) > 0 and name:
+                functions[name] = int(count)
+                file_functions.setdefault(path, {})[name] = int(count)
+
+    files_touched = len(files)
+    functions_hit = len(functions)
+    new_lines_total = 0
+    top_files: list[dict[str, Any]] = []
+    for file, lines in sorted(
+        files.items(),
+        key=lambda item: (-len(item[1] - session.covered_lines.get(item[0], set())), item[0]),
+    ):
+        fresh = lines - session.covered_lines.get(file, set())
+        new_lines_total += len(fresh)
+        if not fresh or len(top_files) >= _COVERAGE_TOP_FILES:
+            continue
+        fresh_functions = sorted(
+            (
+                (name, hits)
+                for name, hits in file_functions.get(file, {}).items()
+                if name not in session.functions_seen
+            ),
+            key=lambda item: (-item[1], item[0]),
+        )[:_COVERAGE_FILE_FUNCTIONS]
+        top_files.append({
+            "file": file,
+            "new_lines": len(fresh),
+            "lines_hit": len(lines),
+            "sample_new_lines": sorted(fresh)[:_COVERAGE_SAMPLE_LINES],
+            "new_functions": [
+                {"name": name, "hits": hits} for name, hits in fresh_functions
+            ],
+        })
+
+    hottest_functions = sorted(
+        (
+            (name, hits)
+            for name, hits in functions.items()
+            if name not in session.functions_seen
+        ),
+        key=lambda item: (-item[1], item[0]),
+    )[:_COVERAGE_MAX_FUNCTIONS]
+
+    session.record(files, set(functions))
+    return {
+        "schema_version": 1,
+        "files_touched": files_touched,
+        "lines_hit": sum(len(lines) for lines in files.values()),
+        "functions_hit": functions_hit,
+        "new_lines": new_lines_total,
+        "new_functions": [
+            {"name": name, "hits": hits} for name, hits in hottest_functions
+        ],
+        "top_new_files": top_files,
+        "cumulative": {
+            "requests": session.requests,
+            "files_touched": session.files_touched,
+            "lines_hit": session.lines_hit,
+            "functions_hit": session.functions_hit,
+        },
+    }
+
+
+def _collect_protocol_coverage(
+    *,
+    container: str,
+    target: TargetConfig,
+    request: ExecutionRequest,
+    input_path: str,
+    session: ProtocolCoverageSession,
+) -> dict[str, Any]:
+    """Run the agent's own input through the coverage build and report it.
+
+    Only the submitted input is executed here: SymCC-generated testcases are
+    not part of this feedback.  Any failure downgrades the block, never the
+    request.
+    """
+    binary = _symcc_hidden_path(target.coverage_binary_path or "", "coverage")
+    profdata_tool = _find_container_tool(container, "llvm-profdata")
+    cov_tool = _find_container_tool(container, "llvm-cov")
+    if not profdata_tool or not cov_tool:
+        return {
+            "schema_version": 1,
+            "status": "unavailable",
+            "errors": ["llvm-profdata or llvm-cov is missing in the target image"],
+        }
+
+    profraw = f"{COVERAGE_ROOT}/{request.request_id}.profraw"
+    profdata = f"{COVERAGE_ROOT}/{request.request_id}.profdata"
+    lcov = f"{COVERAGE_ROOT}/{request.request_id}.lcov"
+    rc, _out, err = docker_ops.exec_sh(
+        container, f"rm -f -- {shlex.quote(profraw)} {shlex.quote(profdata)}", timeout=15
+    )
+    if rc:
+        return {
+            "schema_version": 1,
+            "status": "failed",
+            "errors": [f"cannot reset coverage workspace: {err[-300:]}"],
+        }
+    coerced = ExecutionRequest(
+        request.request_id,
+        input_path,
+        request.program_args,
+        min(request.timeout_s, _COVERAGE_TIMEOUT_CAP_S),
+        {**request.env, "LLVM_PROFILE_FILE": profraw},
+    )
+    run = _run_protocol_binary(
+        container=container, binary=binary, request=coerced, input_path=input_path
+    )
+    report = {
+        "schema_version": 1,
+        "status": "completed",
+        "binary": binary,
+        "exit_code": run.get("exit_code"),
+        "duration_s": run.get("duration_s"),
+        "sanitizer_event": run.get("sanitizer_event"),
+        "run_status": run.get("status"),
+    }
+    merge = (
+        f"{shlex.quote(profdata_tool)} merge -sparse {shlex.quote(profraw)} "
+        f"-o {shlex.quote(profdata)} && "
+        f"{shlex.quote(cov_tool)} export -instr-profile={shlex.quote(profdata)} "
+        f"{shlex.quote(binary)} -format=lcov > {shlex.quote(lcov)}"
+    )
+    try:
+        rc, _out, err = docker_ops.exec_sh(container, merge, timeout=120)
+    except Exception as exc:
+        return {**report, "status": "failed", "errors": [f"{type(exc).__name__}: {exc}"]}
+    if rc:
+        return {
+            **report,
+            "status": "failed",
+            "errors": [f"coverage report failed: {(err or '')[-300:]}"],
+        }
+    raw = docker_ops.read_file(container, lcov)
+    if not raw:
+        return {**report, "status": "failed", "errors": ["coverage report is empty"]}
+    try:
+        text = raw.decode("utf-8", errors="replace")
+    except Exception as exc:  # pragma: no cover - bytes.decode with replace cannot raise
+        return {**report, "status": "failed", "errors": [str(exc)]}
+    summary = _summarize_lcov_coverage(text, session=session)
+    summary["report"] = {"lcov": lcov, "profdata": profdata}
+    return {**report, **summary}
+
+
 def _prepare_prebuilt_symcc_protocol(
     container: str, target: TargetConfig
 ) -> dict[str, Any]:
@@ -1264,6 +1488,10 @@ def _prepare_prebuilt_symcc_protocol(
         )
     binary_clean_hidden = _symcc_hidden_path(clean_parts[0], "clean")
     binary_symcc_hidden = _symcc_hidden_path(symcc_parts[0], "symcc")
+    coverage_binary = target.coverage_binary_path
+    coverage_hidden = (
+        _symcc_hidden_path(coverage_binary, "coverage") if coverage_binary else None
+    )
     paths = [
         INPUT_ROOT,
         REQUEST_ROOT,
@@ -1274,15 +1502,20 @@ def _prepare_prebuilt_symcc_protocol(
         str(Path(binary_clean_hidden).parent),
         str(Path(binary_symcc_hidden).parent),
     ]
+    if coverage_hidden:
+        paths.append(COVERAGE_ROOT)
     command = "mkdir -p -- " + " ".join(shlex.quote(path) for path in paths)
     rc, _out, err = docker_ops.exec_sh(container, command, timeout=15)
     if rc:
         raise RuntimeError(f"cannot prepare execution protocol directories: {err[-500:]}")
 
-    for original, hidden, label in (
+    binaries = [
         (clean_parts[0], binary_clean_hidden, "clean"),
         (symcc_parts[0], binary_symcc_hidden, "SymCC"),
-    ):
+    ]
+    if coverage_binary and coverage_hidden:
+        binaries.append((coverage_binary, coverage_hidden, "coverage"))
+    for original, hidden, label in binaries:
         check = f"test -f {shlex.quote(original)} && test -x {shlex.quote(original)}"
         rc, _out, err = docker_ops.exec_sh(container, check, timeout=15)
         if rc:
@@ -1326,7 +1559,9 @@ def _prepare_prebuilt_symcc_protocol(
         raise RuntimeError(f"cannot enable execution protocol client: {err[-300:]}")
     docker_ops.write_file(container, REQUEST_TEMPLATE_PATH, protocol_template())
     docker_ops.write_file(
-        container, EXECUTION_README_PATH, protocol_readme(symbolic_enabled=True)
+        container,
+        EXECUTION_README_PATH,
+        protocol_readme(symbolic_enabled=True, coverage_enabled=bool(coverage_hidden)),
     )
     return {
         "schema_version": 1,
@@ -1340,6 +1575,7 @@ def _prepare_prebuilt_symcc_protocol(
         "prebuilt_binary": True,
         "artifact_commit": artifact_commit,
         "symcc_program_args": symcc_args,
+        "coverage_binary": coverage_hidden,
     }
 
 
@@ -1397,7 +1633,7 @@ def _run_protocol_binary(
 
 def _execute_prebuilt_protocol_request(
     *, container: str, target: TargetConfig, raw: bytes, filename: str,
-    round_id: int,
+    round_id: int, coverage_session: ProtocolCoverageSession | None = None,
 ) -> dict[str, Any]:
     try:
         request = parse_request(raw, filename=filename)
@@ -1448,6 +1684,22 @@ def _execute_prebuilt_protocol_request(
         container=container, binary=clean_binary, request=request,
         input_path=request.input_path,
     )
+    coverage: dict[str, Any] | None = None
+    if target.coverage_binary_path:
+        try:
+            coverage = _collect_protocol_coverage(
+                container=container,
+                target=target,
+                request=request,
+                input_path=request.input_path,
+                session=coverage_session or ProtocolCoverageSession(),
+            )
+        except Exception as exc:
+            coverage = {
+                "schema_version": 1,
+                "status": "failed",
+                "errors": [f"{type(exc).__name__}: {exc}"],
+            }
     out_dir = f"/work/validation/symcc-results/{request.request_id}"
     rc, _out, err = docker_ops.exec_sh(
         container, f"rm -rf -- {shlex.quote(out_dir)} && mkdir -p -- {shlex.quote(out_dir)}",
@@ -1532,6 +1784,7 @@ def _execute_prebuilt_protocol_request(
         "clean": clean,
         "symcc": symcc,
         "generated_replays": replays,
+        **({"coverage": coverage} if coverage is not None else {}),
         "site_reached": None,
         "site_reachability_note": (
             "SymCC execution and clean-target replay are reported; no source-site "
@@ -1546,7 +1799,11 @@ async def _prebuilt_protocol_worker(
 ) -> dict[str, Any]:
     seen: set[str] = set()
     records: list[dict[str, Any]] = []
-    stats = {"processed": 0, "invalid": 0, "errors": 0, "symcc_duration_s": 0.0}
+    coverage_session = ProtocolCoverageSession()
+    stats = {
+        "processed": 0, "invalid": 0, "errors": 0, "symcc_duration_s": 0.0,
+        "coverage_requests": 0, "coverage_errors": 0, "coverage_new_lines": 0,
+    }
     command = (
         f"find {shlex.quote(PENDING_ROOT)} -maxdepth 1 -type f "
         "-name '*.json' -print | sort"
@@ -1571,6 +1828,7 @@ async def _prebuilt_protocol_worker(
                         _execute_prebuilt_protocol_request,
                         container=container, target=target, raw=raw,
                         filename=name, round_id=stats["processed"] + 1,
+                        coverage_session=coverage_session,
                     )
                     if response.get("status") == "invalid_request":
                         stats["invalid"] += 1
@@ -1578,6 +1836,15 @@ async def _prebuilt_protocol_worker(
                         stats["errors"] += 1
                     symcc = response.get("symcc") or {}
                     stats["symcc_duration_s"] += float(symcc.get("duration_s") or 0)
+                    coverage = response.get("coverage") or {}
+                    if coverage:
+                        if coverage.get("status") == "completed":
+                            stats["coverage_requests"] += 1
+                            stats["coverage_new_lines"] += int(
+                                coverage.get("new_lines") or 0
+                            )
+                        else:
+                            stats["coverage_errors"] += 1
                     await asyncio.to_thread(
                         docker_ops.write_file, container,
                         f"{RESPONSE_ROOT}/{name}",
@@ -1620,6 +1887,9 @@ async def _prebuilt_protocol_worker(
         "schema_version": 1, "provider": "symcc-prebuilt", "status": "completed",
         "requests": stats["processed"], "invalid_requests": stats["invalid"],
         "errors": stats["errors"], "symcc_execution_s": round(stats["symcc_duration_s"], 3),
+        "coverage_requests": stats["coverage_requests"],
+        "coverage_errors": stats["coverage_errors"],
+        "coverage_new_lines": stats["coverage_new_lines"],
         "records": records,
     }
     if result_path:
@@ -1673,6 +1943,8 @@ async def _run_prebuilt_symcc_agent(
         "execution_protocol_invalid": float(summary.get("invalid_requests", 0)),
         "execution_protocol_errors": float(summary.get("errors", 0)),
         "symbolic_execution_session": float(summary.get("symcc_execution_s", 0)),
+        "coverage_requests": float(summary.get("coverage_requests", 0)),
+        "coverage_errors": float(summary.get("coverage_errors", 0)),
     }, summary
 
 

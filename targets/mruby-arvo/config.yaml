@@ -1,11 +1,14 @@
 # Prebuilt OSS-Fuzz image used to measure dynamic symbolic execution.
-image_tag: local/mruby-arvo-prebuilt-symcc:2de602b
+image_tag: local/mruby-arvo-prebuilt-symcc:2de602b-cov1
 github_url: https://github.com/mruby/mruby
 commit: 2de602b8696bc21e4cbc2c6e08e2fae27b1ad79b
 binary_path: /out/mruby_fuzzer
 source_root: /src/mruby
 detector: asan
 memory_limit: 4g
+# Coverage build of the same source/commit: every agent input is also run
+# through it so the protocol response can report executed lines/functions.
+coverage_binary_path: /out/mruby_fuzzer_cov
 symbolic_execution:
   default: off
   providers:

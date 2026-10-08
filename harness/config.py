@@ -70,6 +70,7 @@ class TargetConfig:
     shm_size: str | None = None       # docker --shm-size
     memory_limit: str = "4g"          # docker --memory
     reattack_harness: str | None = None  # in-image script that runs every /poc/* and exits 1 on crash
+    coverage_binary_path: str | None = None  # prebuilt coverage build used for per-input execution feedback
     instrumentation: dict[str, Any] | None = field(default=None, repr=False)
     symbolic_execution: dict[str, Any] | None = field(default=None, repr=False)
     manifest: dict[str, Any] | None = field(default=None, repr=False)
@@ -185,6 +186,16 @@ class TargetConfig:
                 f"targets/{target_dir.name}/README.md for how to run it"
             )
 
+        coverage_binary_path = cfg.get("coverage_binary_path")
+        if coverage_binary_path is not None and (
+            not isinstance(coverage_binary_path, str)
+            or not coverage_binary_path.startswith("/")
+            or "\x00" in coverage_binary_path
+        ):
+            raise ValueError(
+                "coverage_binary_path must be an absolute container path"
+            )
+
         return cls(
             name=target_dir.name,
             dockerfile_dir=str(target_dir),
@@ -217,6 +228,7 @@ class TargetConfig:
                 "memory", "4g"
             ),
             reattack_harness=cfg.get("reattack_harness"),
+            coverage_binary_path=coverage_binary_path,
             instrumentation=instrumentation,
             symbolic_execution=symbolic_execution,
             manifest=manifest,

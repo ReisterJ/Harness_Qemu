@@ -267,3 +267,247 @@ def test_prebuilt_symcc_agent_forwards_phase_timeout_and_no_deadline(monkeypatch
     ))
     assert captured["phase_timeout_s"] is None
     assert captured["idle_timeout_s"] is None
+
+
+# ── per-input execution coverage (agent seeds only) ───────────────────────────
+
+
+def _coverage_target():
+    target = _target()
+    return TargetConfig(
+        **{
+            **target.__dict__,
+            "coverage_binary_path": "/out/target-cov",
+        }
+    )
+
+
+def _lcov(*records):
+    blocks = []
+    for path, lines, functions in records:
+        block = [f"SF:{path}"]
+        for name, hits in functions:
+            block.append(f"FNDA:{hits},{name}")
+        for number, count in lines:
+            block.append(f"DA:{number},{count}")
+        block.append("end_of_record")
+        blocks.append("\n".join(block))
+    return "\n".join(blocks) + "\n"
+
+
+def test_coverage_summary_reports_new_lines_and_functions_per_input():
+    from harness.dynamic_validation import (
+        ProtocolCoverageSession,
+        _summarize_lcov_coverage,
+    )
+
+    session = ProtocolCoverageSession()
+    first = _summarize_lcov_coverage(
+        _lcov(
+            ("/src/mruby/src/vm.c", [(375, 0), (376, 42), (398, 15)],
+             [("mrb_env_unshare", 42), ("unused_helper", 0)]),
+            ("/src/mruby/src/gc.c", [(1158, 1)], [("incremental_sweep_phase", 1)]),
+        ),
+        session=session,
+    )
+    assert first["lines_hit"] == 3
+    assert first["functions_hit"] == 2
+    assert first["new_lines"] == 3
+    assert {item["name"] for item in first["new_functions"]} == {
+        "mrb_env_unshare", "incremental_sweep_phase",
+    }
+    assert first["cumulative"]["requests"] == 1
+    assert first["top_new_files"][0]["file"].endswith("vm.c")
+    assert first["top_new_files"][0]["sample_new_lines"] == [376, 398]
+    assert first["top_new_files"][0]["new_functions"] == [
+        {"name": "mrb_env_unshare", "hits": 42},
+    ]
+
+    second = _summarize_lcov_coverage(
+        _lcov(
+            ("/src/mruby/src/vm.c", [(376, 7), (376, 7), (500, 3)],
+             [("mrb_env_unshare", 7), ("mrb_vm_exec", 9)]),
+        ),
+        session=session,
+    )
+    assert second["lines_hit"] == 2
+    assert second["new_lines"] == 1
+    assert [item["name"] for item in second["new_functions"]] == ["mrb_vm_exec"]
+    assert second["cumulative"] == {
+        "requests": 2, "files_touched": 2, "lines_hit": 4, "functions_hit": 3,
+    }
+
+
+def test_coverage_summary_is_empty_for_input_that_reaches_nothing_new():
+    from harness.dynamic_validation import (
+        ProtocolCoverageSession,
+        _summarize_lcov_coverage,
+    )
+
+    session = ProtocolCoverageSession()
+    payload = _lcov(("/src/mruby/src/vm.c", [(1, 1)], [("mrb_vm_exec", 1)]))
+    _summarize_lcov_coverage(payload, session=session)
+    repeat = _summarize_lcov_coverage(payload, session=session)
+    assert repeat["new_lines"] == 0
+    assert repeat["new_functions"] == []
+    assert repeat["top_new_files"] == []
+
+
+def test_protocol_request_attaches_coverage_for_the_agent_input(monkeypatch):
+    target = _coverage_target()
+    lcov = _lcov(
+        ("/src/mruby/src/vm.c", [(376, 42), (398, 15)], [("mrb_env_unshare", 42)]),
+    )
+    commands = []
+
+    def fake_exec(container, command, timeout=0):
+        commands.append(command)
+        if command.startswith("command -v llvm-profdata"):
+            return 0, "/usr/bin/llvm-profdata-15\n", ""
+        if command.startswith("command -v llvm-cov"):
+            return 0, "/usr/bin/llvm-cov-15\n", ""
+        if command.startswith("readlink -f"):
+            return 0, f"{INPUT_ROOT}/candidate.bin\n", ""
+        if command.startswith("stat -c"):
+            return 0, "4\n", ""
+        if "find /work/validation/symcc-results/round-001" in command:
+            return 0, "", ""
+        if ".harness-symcc-target-symcc" in command:
+            return 0, "symcc run\n", ""
+        if ".harness-coverage-target-cov" in command:
+            return 0, "", ""
+        if ".harness-clean-target" in command:
+            return 0, "", ""
+        return 0, "", ""
+
+    def fake_read(container, path):
+        if path.endswith("candidate.bin"):
+            return b"seed"
+        if path.endswith(".lcov"):
+            return lcov.encode()
+        return b""
+
+    monkeypatch.setattr(docker_ops, "exec_sh", fake_exec)
+    monkeypatch.setattr(docker_ops, "read_file", fake_read)
+    monkeypatch.setattr(docker_ops, "write_file", lambda *a, **k: None)
+
+    response = _execute_prebuilt_protocol_request(
+        container="target",
+        target=target,
+        raw=json.dumps(_request()).encode(),
+        filename="round-001.json",
+        round_id=1,
+    )
+
+    coverage = response["coverage"]
+    assert coverage["status"] == "completed"
+    assert coverage["lines_hit"] == 2
+    assert coverage["new_lines"] == 2
+    assert coverage["exit_code"] == 0
+    assert coverage["new_functions"] == [{"name": "mrb_env_unshare", "hits": 42}]
+    assert coverage["top_new_files"][0]["new_functions"] == [
+        {"name": "mrb_env_unshare", "hits": 42},
+    ]
+    assert any(".harness-coverage-target-cov" in command for command in commands)
+    assert any(
+        "LLVM_PROFILE_FILE=/work/validation/coverage/round-001.profraw" in command
+        for command in commands
+    )
+    assert any("llvm-profdata-15 merge -sparse" in command for command in commands)
+    assert any("llvm-cov-15 export" in command for command in commands)
+
+
+def test_protocol_request_omits_coverage_without_a_declared_binary(monkeypatch):
+    commands = []
+
+    def fake_exec(container, command, timeout=0):
+        commands.append(command)
+        if command.startswith("readlink -f"):
+            return 0, f"{INPUT_ROOT}/candidate.bin\n", ""
+        if command.startswith("stat -c"):
+            return 0, "4\n", ""
+        return 0, "", ""
+
+    monkeypatch.setattr(docker_ops, "exec_sh", fake_exec)
+    monkeypatch.setattr(
+        docker_ops, "read_file",
+        lambda _c, path: b"seed" if path.endswith("candidate.bin") else b"",
+    )
+    monkeypatch.setattr(docker_ops, "write_file", lambda *a, **k: None)
+
+    response = _execute_prebuilt_protocol_request(
+        container="target",
+        target=_target(),
+        raw=json.dumps(_request()).encode(),
+        filename="round-001.json",
+        round_id=1,
+    )
+    assert "coverage" not in response
+    assert not any("llvm-profdata" in command for command in commands)
+
+
+def test_coverage_degrades_to_unavailable_when_tools_are_missing(monkeypatch):
+    def fake_exec(container, command, timeout=0):
+        if command.startswith("readlink -f"):
+            return 0, f"{INPUT_ROOT}/candidate.bin\n", ""
+        if command.startswith("test -f"):
+            return 0, "", ""
+        if command.startswith("stat -c"):
+            return 0, "4\n", ""
+        return 127, "", "not found"
+
+    monkeypatch.setattr(docker_ops, "exec_sh", fake_exec)
+    monkeypatch.setattr(
+        docker_ops, "read_file",
+        lambda _c, path: b"seed" if path.endswith("candidate.bin") else b"",
+    )
+    monkeypatch.setattr(docker_ops, "write_file", lambda *a, **k: None)
+
+    response = _execute_prebuilt_protocol_request(
+        container="target",
+        target=_coverage_target(),
+        raw=json.dumps(_request()).encode(),
+        filename="round-001.json",
+        round_id=1,
+    )
+    assert response["status"] == "completed"
+    assert response["clean"]["sanitizer_event"] is False
+    assert response["coverage"]["status"] == "unavailable"
+
+
+def test_coverage_binary_is_staged_and_advertised_by_the_protocol(monkeypatch):
+    target = _coverage_target()
+    calls = []
+    writes = {}
+
+    def fake_exec(container, command, timeout=0):
+        calls.append(command)
+        return 0, "", ""
+
+    monkeypatch.setattr(docker_ops, "exec_sh", fake_exec)
+    monkeypatch.setattr(
+        docker_ops, "write_file", lambda _container, path, data: writes.__setitem__(path, data)
+    )
+    context = _prepare_prebuilt_symcc_protocol("target", target)
+
+    assert context["coverage_binary"] == "/out/.harness-coverage-target-cov"
+    assert any(
+        "mv -- /out/target-cov /out/.harness-coverage-target-cov" in command
+        for command in calls
+    )
+    assert any("/work/validation/coverage" in command for command in calls)
+    readme = writes["/work/validation/execution/README.md"].decode()
+    assert "`coverage` block" in readme
+    assert "new_lines" in readme
+
+
+def test_target_config_rejects_relative_coverage_binary(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "image_tag: sample:latest\n"
+        "github_url: local\n"
+        "commit: " + "a" * 40 + "\n"
+        "coverage_binary_path: out/target-cov\n"
+    )
+    with pytest.raises(ValueError, match="coverage_binary_path"):
+        TargetConfig.load(tmp_path)

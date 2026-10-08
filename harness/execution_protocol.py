@@ -16,6 +16,7 @@ REQUEST_ROOT = f"{PROTOCOL_ROOT}/requests"
 PENDING_ROOT = f"{PROTOCOL_ROOT}/pending"
 RESPONSE_ROOT = f"{PROTOCOL_ROOT}/responses"
 PROCESSED_ROOT = f"{PROTOCOL_ROOT}/processed"
+COVERAGE_ROOT = "/work/validation/coverage"
 RUNNER_PATH = "/work/validation/run-input"
 REQUEST_TEMPLATE_PATH = f"{PROTOCOL_ROOT}/request-template.json"
 README_PATH = f"{PROTOCOL_ROOT}/README.md"
@@ -171,11 +172,26 @@ def protocol_template(default_args: list[str] | None = None) -> bytes:
     }, indent=2, ensure_ascii=False) + "\n").encode()
 
 
-def protocol_readme(*, symbolic_enabled: bool) -> bytes:
+def protocol_readme(*, symbolic_enabled: bool, coverage_enabled: bool = False) -> bytes:
     symbolic = (
         "The Harness also runs this same input through the configured prebuilt SymCC binary, "
         "then replays generated inputs on the ordinary target. Treat those results as feedback, not proof."
         if symbolic_enabled else "Only the ordinary target is run."
+    )
+    coverage = (
+        "\nEvery response also carries a `coverage` block: the Harness runs your input through a\n"
+        "coverage build of the same target (no ASan, so `clean` stays the crash oracle) and reports\n"
+        "which source lines and functions that input executed, how many of them are new to this\n"
+        "session (`new_lines`, `new_functions`, per-file detail in `top_new_files`), and the\n"
+        "cumulative totals.  The full report is kept inside the container: `coverage.report.lcov`\n"
+        "lists every `SF:`/`FN:`/`FNDA:`/`DA:` record for this input, so you can query anything it\n"
+        "does not summarize, e.g.\n"
+        "\n"
+        "    grep -n 'FN:376,\\|FNDA:.*mrb_env_unshare' /work/validation/coverage/round-001.lcov\n"
+        "    sed -n '/^SF:.*src\\/vm.c$/,/end_of_record/p' /work/validation/coverage/round-001.lcov\n"
+        "\n"
+        "Coverage is an observation, not a verdict: it never gates a request or a submission.\n"
+        if coverage_enabled else ""
     )
     return f'''# Dynamic execution protocol
 
@@ -187,6 +203,6 @@ Put each candidate below `{INPUT_ROOT}/`, create a JSON request below
 The request uses `schema_version`, a fresh unique `request_id`, `input_path`,
 `program_args` (with `{{input_file}}` exactly once), and optional `timeout_s`/`env`.
 The Harness owns the executable selection and execution. {symbolic}
-Request ids are single-use; use a fresh id for every candidate. Reproduce the final PoC through the
+{coverage}Request ids are single-use; use a fresh id for every candidate. Reproduce the final PoC through the
 ordinary target and satisfy the normal crash-result contract.
 '''.encode()
