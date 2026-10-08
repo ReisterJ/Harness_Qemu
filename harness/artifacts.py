@@ -204,7 +204,8 @@ class DynamicValidationResult:
     candidate_id: str
     status: str  # validated, not_reached, reached_no_crash, reached_no_effect,
                  # wrong_path, environment_blocked, invalid_submission,
-                 # agent_failed, false_positive, iteration_exhausted
+                 # agent_failed, iteration_exhausted; false_positive is
+                 # rejected because the static candidate is trusted
     reached_functions: list[str] = field(default_factory=list)
     reachability_evidence: str = ""
     reason: str = ""

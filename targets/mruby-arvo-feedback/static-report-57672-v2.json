@@ -6,39 +6,24 @@
   "findings": [
     {
       "candidate_id": "candidate_001",
-      "bug_class": "heap-use-after-free",
-      "location": "src/vm.c:398, function mrb_env_unshare",
-      "static_call_chain": "external Ruby input -> parser/compiler -> VM closure/env handling -> mrb_env_unshare",
-      "entry_points": "OSS-Fuzz mruby_fuzzer file input",
-      "attacker_controlled_data": "Ruby source input controls closure creation, environment lifetime, object references, and GC pressure",
-      "reachability_evidence": "The fuzzer executes Ruby source through the ordinary mruby VM, which can create closures and exercise env unshare during block/env lifetime transitions.",
-      "required_conditions": "Input must construct closure/env state and GC pressure so mrb_env_unshare copies or updates env stack while object lifetime/write-barrier state is unsafe.",
-      "root_cause": "The candidate is a write-barrier/lifetime bug around mrb_env_unshare and environment stack copying. Dynamic validation must prove the exact operation is reached before treating any crash as matching this candidate.",
-      "verification_plan": "Submit small runnable Ruby programs early, inspect exact SymCC feedback for mrb_env_unshare, then refine closure and GC-state construction. A target operation hit is not a PoC; ASan reproduction is still required.",
+      "bug_class": "Potential heap-use-after-free related to generational-GC write barriers",
+      "location": "src/vm.c:397-401, function mrb_env_unshare",
+      "static_call_chain": "LLVMFuzzerTestOneInput -> mrb_load_string -> VM execution -> environment close -> mrb_env_unshare",
+      "entry_points": "The file-based libFuzzer entry point passes attacker-supplied bytes to mrb_load_string as Ruby source.",
+      "attacker_controlled_data": "Ruby source can create closures and affect values held in captured environments.",
+      "reachability_evidence": "The fuzzer entry point invokes the Ruby parser and VM; source inspection suggests mrb_env_unshare is on environment-closing paths. Whether a specific input reaches the reported operation remains to be tested.",
+      "required_conditions": "Not determined by static analysis; establish through source-guided dynamic validation.",
+      "root_cause": "The reported environment-copy/close path appears to omit a generational-GC write-barrier notification, which may leave newly referenced values untracked.",
+      "verification_plan": "Use the supported input entry point, inspect relevant source as needed, and determine whether the candidate is reachable and produces a reproducible sanitizer finding.",
+      "confidence": 0.6,
+      "related_candidates": [],
       "observability_targets": [
         {
-          "target_function": "mrb_env_unshare",
-          "target_region": {
-            "source_file": "src/vm.c",
-            "start_line": 397,
-            "end_line": 400
-          },
-          "target_operation": {
-            "source_file": "src/vm.c",
-            "function": "mrb_env_unshare",
-            "line": 398
-          },
-          "target_condition": {
-            "source_file": "src/vm.c",
-            "function": "mrb_env_unshare",
-            "line": 397,
-            "why": "p != NULL branch that controls whether stack_copy executes"
-          },
-          "why": "Exact operation marker for the env stack copy; function or block entry alone is not enough."
+          "source_file": "src/vm.c",
+          "function": "mrb_env_unshare",
+          "line": 397
         }
-      ],
-      "confidence": 0.75,
-      "related_candidates": []
+      ]
     }
   ]
 }

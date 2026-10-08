@@ -439,7 +439,7 @@ not a successful PoC; the final grader must still reproduce the claimed effect.
     if context.get("orchestration") == "prebuilt_protocol":
         return f"""
 
-## Harness execution override — prebuilt SymCC feedback is asynchronous
+## Harness execution override — prebuilt SymCC is mandatory feedback
 
 This is the final execution instruction and overrides any general build/run
 examples above. Do not compile a source slice and do not invoke either target
@@ -447,30 +447,12 @@ binary directly. For every candidate input, save it under
 `{context.get('input_root', '/work/validation/inputs')}/`, create a fresh JSON
 request from `{context.get('request_template', '/work/validation/execution/request-template.json')}`,
 and run `{context.get('runner', '/work/validation/run-input')} REQUEST.json`.
-The first runnable, target-format input MUST be submitted through this protocol
-no later than the earlier of 5 minutes after the phase starts or 25 meaningful
-tool calls. This is a hard requirement, not a suggestion or priority. Keep
-initial reconnaissance within that limit; submit the best valid baseline or
-candidate input available, then use its measured result to guide further source
-analysis and iteration. Do not wait until you believe an input is close to the
-suspected site; do not delay the first request while trying to prove proximity.
-The response waits only for the ordinary target run; SymCC is queued in the
-background. Every accepted input is queued; only two SymCC jobs run at once and
-additional jobs wait asynchronously rather than being dropped. The Harness
-snapshots each request's bytes, so later edits to the candidate file cannot
-change which input that request validates. Inspect the clean-target result,
-then continue source analysis and input iteration without waiting for SymCC. At a useful decision point, query
-`{context.get('feedback_reader', '/work/validation/read-feedback')} REQUEST_ID`.
-Only query when the run response says SymCC is `queued`. If the reader returns
-`pending`, do not poll or wait—continue working and check later. The feedback
-separately reports (1) one concrete, non-symbolic execution of the submitted
-input, which is the authoritative per-input location trace, and (2) the
-symbolic exploration status and its generated seeds. A symbolic exploration
-timeout does not invalidate a completed concrete trace. Generated inputs each
-have their own clean replay and concrete trace; never attribute their hits to
-the submitted input. SymCC output is advisory for input selection, not a PoC.
-Preserve the existing final crash-result or logic submission contract; Grade
-remains the final reproduction check.
+Wait for and inspect its JSON response before deciding the next input. The
+Harness runs both prebuilt binaries on the same input and replays SymCC outputs
+on the ordinary target. Read source between iterations and use those concrete
+observations to refine the input. SymCC output is feedback only: it is not
+reachability proof or a PoC. Preserve the existing final crash-result or logic
+submission contract; Grade remains the final reproduction check.
 """
     if context.get("orchestration") != "harness":
         return ""
@@ -614,29 +596,6 @@ and treat any provider error as an environment limitation:
         context.get("provider") == "symcc"
         and context.get("orchestration") == "prebuilt_protocol"
     ):
-        feedback_context = context.get("feedback")
-        if not isinstance(feedback_context, dict):
-            feedback_context = {}
-        feedback_goal = feedback_context.get("goal")
-        if not isinstance(feedback_goal, dict):
-            feedback_goal = {}
-        feedback_targets = feedback_goal.get("targets")
-        if not isinstance(feedback_targets, list):
-            feedback_targets = []
-        feedback_map_path = feedback_context.get("map_path")
-        if not isinstance(feedback_map_path, str) or not feedback_map_path.startswith("/"):
-            feedback_map_path = "not configured"
-        target_map_summary = json.dumps(
-            {
-                "map_path": feedback_map_path,
-                "map_status": feedback_context.get("map_status", "unknown"),
-                "source_commit": feedback_context.get("source_commit", "unknown"),
-                "target_anchor_count": len(feedback_targets),
-                "resolved_marker_count": feedback_context.get("target_marker_count", 0),
-            },
-            indent=2,
-            ensure_ascii=False,
-        )
         return f"""
 
 ## Prebuilt SymCC feedback through the Harness
@@ -646,139 +605,20 @@ ordinary target and a SymCC-instrumented target were both prepared before this
 dynamic phase from commit `{context.get('artifact_commit', 'unknown')}`. Do not
 build a source slice and do not invoke a compiler for SymCC.
 
-### Precomputed target mapping — use it; do not rediscover it
-
-Before the agent starts, the Harness loads and commit-checks the configured
-SymCC feedback map and resolves the candidate's source anchor. The relevant
-map summary is:
-
-```json
-{target_map_summary}
-```
-
-Do not search the filesystem for the candidate ID, target IDs, or feedback
-map. In particular, never run recursive `grep`/`find` from `/` or another
-filesystem-wide root. For source inspection, search only the specific files or
-symbols under `{context.get('source_root', '/src')}`. If a concrete trace and
-the candidate source appear inconsistent, inspect only the configured map
-directory `{feedback_map_path}` with a targeted command bounded to 30 seconds;
-otherwise use `symcc_observation.exact_target_reached`,
-`symcc_observation.target_operation_reached`, and the reported source
-locations. If the map status is not `ready`, report that mapping
-limitation; do not guess another map path or scan the container.
-
 Create each candidate input under `{context.get('input_root', '/work/validation/inputs')}/`,
 write a fresh request using `{context.get('request_template', '/work/validation/execution/request-template.json')}`,
 then call `{context.get('runner', '/work/validation/run-input')} REQUEST.json`.
-This phase permits at most {max(1, min(int(max_iterations), 100))} input requests. One
-`run-input` submission consumes one numbered validation round, including controls
-and variants. Submit one request, inspect its clean result and any
-`ready_feedback`, then decide the next request. The Harness enforces this limit;
-after it is reached, further requests receive `iteration_limit_reached` and are
-not executed. Stop submitting inputs when that status appears.
-Mandatory first-input deadline: submit the first runnable, target-format input
-within the first 5 minutes or first 25 meaningful tool calls, whichever comes
-first. This is a hard requirement, not a suggestion. Do not wait until you
-believe an input is close to the suspected site. A valid baseline input and its
-measured path are useful feedback; use that observation to guide the next input.
-If a ready-to-test candidate already exists, submit it before building auxiliary
-probes or further tuning it.
-The call waits only for that exact input's ordinary-target result. The Harness
-snapshots its bytes before execution and queues every accepted SymCC job in a
-bounded background queue (two run concurrently; excess jobs wait, not skip),
-so continue source analysis and constructing/testing inputs rather than
-waiting for it. Never run `sleep` or a polling loop to wait for SymCC; this
-also forbids `timeout sleep`, `watch`, or any command whose purpose is to block
-until feedback becomes ready. The
-`read-feedback` command is nonblocking: query it once at a useful decision point,
-then continue substantive source analysis or input work if the result is still
-pending. At a useful decision point, query
-`{context.get('feedback_reader', '/work/validation/read-feedback')} REQUEST_ID`.
-Only query when the response says SymCC is `queued`. If the reader returns `pending`, do
-not poll or wait; continue work and check later. Set `parent_input_id` when a
-candidate derives from a previous request or generated seed. Once ready,
-use `symcc_observation` for the submitted input's separate concrete trace and
-distinguish it from each generated seed's trace. The symbolic-exploration
-process may time out; that must not be confused with the concrete trace status.
-`exact_target_reached=true` / `target_operation_reached=true` is the only exact
-positive for the configured vulnerability operation in that run. Legacy
-`target_reached` is only a compatibility alias for the exact marker in new
-feedback. `false` is exact only when the concrete trace is complete; `unknown`
-cannot establish a negative.
-Use `observed_locations` as positions actually observed in that concrete
-input's trace. The list is target-function/file prioritized, deduplicated, and
-not a chronological execution path; inspect its selection/count/truncation
-fields before drawing conclusions. Each generated replay has its own input hash
-and `symcc_observation.observed_locations`; do not attribute one input's trace
-to another. Compare these observed source positions and the exact target marker
-status when choosing the next input. Do not use CFG distance or a statically
-chosen closest location as navigation feedback. If an input reaches the target,
-continue source reasoning and clean-target tests to derive the crash/invalid-
-effect condition; a site hit is not a PoC.
-When you submit a later input, its response may include `ready_feedback` for
-earlier SymCC jobs that completed asynchronously. This feedback is mandatory
-evidence for the next input decision: inspect it before choosing the next
-candidate, and connect every observation to its request/input ID and parent.
-The feedback contains bounded, target-context-prioritized locations actually
-observed for the submitted input and each replayed generated seed; it is not an
-ordered path and may be limited, as indicated by its metadata. If you parse or
-redirect runner output, preserve a concise summary of every record including
-these locations, input identity, exact target status, trace completeness, and
-SymCC/replay status. Do not replace actual observations with inferred graph
-distance or silently discard `ready_feedback`. The original response is not
-rewritten after the job finishes. This is a nonblocking delivery mechanism,
-not a reason to wait before continuing.
-For every submitted input, write an iteration JSON record containing its exact
-`request_id` and `input_id` from the protocol response. Treat
-`symcc_observation.exact_target_reached` as authoritative for candidate-site
-reach: `false` plus a complete, valid trace is a confirmed miss for that
-concrete input; `unknown` is neither hit nor miss. Do not turn `distance: 0`,
-a closest block, `target_function_entered: true`, `target_block_entered: true`,
-or `target_block_reached: true` into an exact operation hit. A function or
-block-level hit only means execution entered nearby code; it does not prove the
-target operation marker fired. Always preserve and follow `allowed_conclusion`
-when it is present. The Harness will reconcile your iteration's site/sanitizer
-flags against that request's machine record before accepting a candidate.
-Configured SymCC arguments are
+The Harness runs that exact input against the ordinary target and the prebuilt
+SymCC target, then replays SymCC-generated inputs through the ordinary target.
+Read the JSON response and compare the concrete execution with generated-input
+replays before revising your hypothesis. Configured SymCC arguments are
 `{json.dumps(context.get('symcc_program_args', ['{input_file}']), ensure_ascii=False)}`.
 
 You remain responsible for reading source and constructing semantically valid
-inputs. A generated testcase is not a PoC; use its per-run source trace to know
-whether that concrete input hit the configured static target. Keep the original
-candidate and final crash-result/logic-response contract; final acceptance
-remains the Grade phase's responsibility.
-
-The dynamic `run-input` wrapper is only for exploration and in-container
-confirmation. In `crash-result.xml`, `reproduction_command` must instead be the
-ordinary target invocation described by the runtime contract, using the
-literal `poc_path`; Grade runs that command in a fresh container and does not
-receive this phase's request JSON files. Do not put a `run-input` command or a
-request JSON path in `reproduction_command`. To perform the last confirmation
-inside this guarded dynamic container, create a fresh execution request for the
-saved PoC and use `run-input`; do not try to bypass the guard by invoking the
-target binary directly.
-
-When you stop dynamic exploration without a validated crash, do not end with
-only a narrative summary or a question asking whether to continue. Your final
-status must be based on the latest available protocol evidence. If any accepted
-request still has queued or pending SymCC feedback, you MUST run the nonblocking
-`read-feedback REQUEST_ID` command once for each such recent request before the
-final status. If feedback is still pending, say so with the request ID and emit
-the final status immediately; do not wait for the pending feedback to become
-ready. If feedback is ready, preserve its exact-target fields and
-`allowed_conclusion`.
-If the Harness request limit has been reached and there is no validated PoC, the
-next assistant message after these final nonblocking checks must be the final
-inline status tags, not another wait, sleep, source-reconnaissance pass, or
-question.
-Your final
-response must include the normal inline status tags (`dynamic_status`,
-`candidate_id`, `reached_functions`, `reachability_evidence`, and `reason`)
-exactly once. Use evidence-based status: a complete trace miss proves only that
-the submitted input missed the marker, not that the candidate is globally
-unreachable. Reserve `reached_no_crash` for a run that actually exercised the
-candidate path without the required crash. A validated crash still requires
-the `crash-result.xml` contract above.
+inputs. SymCC feedback is advisory: a generated testcase is not a PoC, and
+testcase generation alone does not prove that the reported source location was
+reached. Keep the original candidate and final crash-result/logic-response
+contract; final acceptance remains the Grade phase's responsibility.
 """
     if context.get("provider") == "symcc":
         return f"""
@@ -1082,7 +922,7 @@ At the end of every round, write a bounded JSON record to
   "candidate_id": "{candidate_id}",
   "hypothesis": {{"entry_point": "...", "target_site": "...", "trigger_condition": "..."}},
   "observations": {{
-    "site_reached": null,
+    "site_reached": false,
     "sanitizer_event": false,
     "bad_state_observed": false,
     "bad_effect_observed": false,
@@ -1095,10 +935,6 @@ At the end of every round, write a bounded JSON record to
 
 The observation fields must come from commands or provider reports; do not set
 them merely because the static report or model reasoning predicts them.
-`site_reached` is tri-state: use `true` only for an exact runtime hit, `false`
-only for a complete trace proving this execution missed, and `null` when the
-trace is incomplete, unavailable, or ambiguous. A heuristic distance or source
-reasoning cannot convert `null` to `false` or `true`.
 Write each record immediately after its probe and before launching the next
 search; do not defer all round records until the end of the phase.
 For memory bugs, a sanitizer event from a different function is a wrong path,

@@ -216,37 +216,21 @@ def protocol_readme(
     *, symbolic_enabled: bool, max_requests: int = 8,
     max_concurrent_symcc_jobs: int = 1,
 ) -> bytes:
+    """Container-side README for the execution protocol.
+
+    Rolled back (2026-10-08) to the 2026-09-23 text: no feedback reader, no
+    auto-delivered `ready_feedback`.  The round cap stays documented because
+    the prompt still states a per-phase request budget.
+    """
     symbolic = (
-        "After the ordinary target result returns, the Harness queues this same input for the "
-        "configured prebuilt SymCC binary in the background, records its instrumented source "
-        "trace, and replays bounded generated inputs. `run-input` does not wait for SymCC."
+        "The Harness also runs this same input through the configured prebuilt SymCC binary, "
+        "then replays generated inputs on the ordinary target. Treat those results as feedback, not proof."
         if symbolic_enabled else "Only the ordinary target is run."
     )
-    feedback = (
-        f"The Harness accepts at most {max(1, int(max_requests))} input requests in this phase; "
-        "each request consumes one numbered validation round. Requests beyond the limit receive "
-        "`iteration_limit_reached` and are not executed. Submit one request per round and stop "
-        "when this status is returned. For each accepted request, the Harness snapshots the "
-        "submitted bytes under a unique request ID before execution; the clean target, concrete "
-        "SymCC trace, and symbolic exploration all use that request-scoped copy. "
-        "Every accepted input is queued for SymCC in a separate, network-isolated worker "
-        "container with its own memory limit; at most "
-        f"{max(1, int(max_concurrent_symcc_jobs))} job(s) run concurrently, while later "
-        "jobs wait in the bounded background queue rather than being discarded. "
-        "The worker receives only the request-scoped input and its private output/trace "
-        "directory; if the agent finishes first, the Harness stops the outstanding worker. "
-        "A later run-input response includes a `ready_feedback` array for earlier jobs that "
-        "finished since your previous submission; it is mandatory evidence for the next input. "
-        "If you parse or redirect runner output, preserve and print a concise summary of every "
-        "ready-feedback record; do not filter it down to only the clean-target result. "
-        f"For an individual request, `{FEEDBACK_READER_PATH} round-001` remains available and returns "
-        "`pending` immediately if the background job is still running. Do not run `sleep`, "
-        "`watch`, a polling loop, or any blocking wait for SymCC; continue source analysis "
-        "and input work. Before ending the dynamic phase "
-        "without a validated PoC, read each still-pending request once with `read-feedback` and "
-        "include the latest ready/pending status in your iteration evidence. If feedback is "
-        "still pending at the request limit, emit the final status immediately instead of "
-        "waiting for it to become ready. "
+    limit_note = (
+        f"The Harness accepts at most {max(1, int(max_requests))} input requests in this "
+        "phase; requests beyond the limit receive `iteration_limit_reached` and are not "
+        "executed."
         if symbolic_enabled else ""
     )
     return f'''# Dynamic execution protocol
@@ -257,11 +241,10 @@ Put each candidate below `{INPUT_ROOT}/`, create a JSON request below
     {RUNNER_PATH} {REQUEST_ROOT}/round-001.json
 
 The request uses `schema_version`, a fresh unique `request_id`, `input_path`,
-`program_args` (with `{{input_file}}` exactly once), and optional `timeout_s`/`env`.
-Set `parent_input_id` to the originating request id or input SHA-256 when this
-candidate was derived from a prior candidate or generated seed.
+`program_args` (with `{{input_file}}` exactly once), `timeout_s`/`env`, and an
+optional `parent_input_id` (the originating request id or input SHA-256).
 The Harness owns the executable selection and execution. {symbolic}
-{feedback}
+{limit_note}
 Request ids are single-use; use a fresh id for every candidate. Reproduce the final PoC through the
 ordinary target and satisfy the normal crash-result contract. The `run-input`
 wrapper is only for exploration and confirmation inside this guarded phase.

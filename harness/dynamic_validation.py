@@ -200,16 +200,13 @@ async def run_dynamic_validation(
         _prepare_iteration_workspace(
             container, candidate, iteration_limit, target.detector
         )
-        symbolic_feedback_runtime: dict[str, Any] | None = None
         symbolic_context = (
             _prepare_prebuilt_symcc_protocol(
-                container, target, candidate, max_requests=iteration_limit
+                container, target, max_requests=iteration_limit
             )
             if symbolic_provider == "symcc"
             else symbolic_session.prepare_agent(container) if symbolic_session else None
         )
-        if symbolic_context and symbolic_provider == "symcc":
-            symbolic_feedback_runtime = symbolic_context.pop("_feedback_runtime", None)
         if provider is not None:
             prepare_started = time.time()
             instrumentation_prepared = provider.prepare(
@@ -266,11 +263,8 @@ async def run_dynamic_validation(
                 transcript_path=transcript_path,
                 progress_prefix=progress_prefix,
                 result_path=symbolic_execution_result_path,
-                feedback_runtime=symbolic_feedback_runtime,
-                max_iterations=iteration_limit,
                 phase_timeout_s=phase_timeout_s,
                 supervisor_nudge=supervisor_nudge,
-                completion_predicate=_make_dynamic_completion_predicate(supervisor),
             )
             timings.update(protocol_timings)
         else:
@@ -504,12 +498,6 @@ async def run_dynamic_validation(
                 status, reason = _status_without_iteration_records(status, reason)
             if status not in _DYNAMIC_STATUSES:
                 status = "reached_no_crash"
-            if symbolic_provider == "symcc":
-                status, reason = _status_for_symcc_missing_poc_submission(
-                    status=status,
-                    reason=reason,
-                    iterations=iterations,
-                )
             return dynamic_result(
                 candidate_id=selected_id,
                 status=status,
@@ -1528,58 +1516,22 @@ def _prepare_prebuilt_symcc_protocol(
     )
     if rc:
         raise RuntimeError(f"cannot enable execution protocol client: {err[-300:]}")
-    docker_ops.write_file(container, FEEDBACK_READER_PATH, protocol_feedback_reader_script())
-    rc, _out, err = docker_ops.exec_sh(
-        container, f"chmod 0555 -- {shlex.quote(FEEDBACK_READER_PATH)}", timeout=15
-    )
-    if rc:
-        raise RuntimeError(f"cannot enable feedback reader: {err[-300:]}")
-    rc, _out, err = docker_ops.exec_sh(
-        container,
-        f"mkdir -p -- {shlex.quote(FEEDBACK_ROOT)} {shlex.quote(PROCESSED_ROOT)}",
-        timeout=15,
-    )
-    if rc:
-        raise RuntimeError(f"cannot initialize execution protocol directories: {err[-300:]}")
+    docker_ops.write_file(container, REQUEST_TEMPLATE_PATH, protocol_template())
     docker_ops.write_file(
-        container, REQUEST_TEMPLATE_PATH, protocol_template(symcc_args)
+        container, EXECUTION_README_PATH, protocol_readme(symbolic_enabled=True)
     )
-    docker_ops.write_file(
-        container, EXECUTION_README_PATH,
-        protocol_readme(
-            symbolic_enabled=True,
-            max_requests=max_requests,
-            max_concurrent_symcc_jobs=max_concurrent_symcc_jobs,
-        ),
-    )
-    feedback_runtime = _load_symcc_feedback_runtime(
-        container=container, target=target, candidate=candidate
-    )
-    prompt_feedback = {
-        key: value for key, value in feedback_runtime.items()
-        if key not in {"graph", "marker_ids", "target_block_ids"}
-    }
     return {
         "schema_version": 1,
         "provider": "symcc",
         "status": "ready",
         "orchestration": "prebuilt_protocol",
         "runner": RUNNER_PATH,
-        "feedback_reader": FEEDBACK_READER_PATH,
         "input_root": INPUT_ROOT,
         "request_root": REQUEST_ROOT,
         "response_root": RESPONSE_ROOT,
-        "feedback_root": FEEDBACK_ROOT,
         "prebuilt_binary": True,
         "artifact_commit": artifact_commit,
-        "worker_isolated": True,
-        "worker_network": "none",
-        "worker_memory_limit": memory_limit,
-        "worker_cpus": sidecar_cpus,
-        "max_concurrent_jobs": max_concurrent_symcc_jobs,
         "symcc_program_args": symcc_args,
-        "feedback": prompt_feedback,
-        "_feedback_runtime": feedback_runtime,
     }
 
 
@@ -2277,250 +2229,160 @@ def _read_symcc_trace_feedback(
 
 def _execute_prebuilt_protocol_request(
     *, container: str, target: TargetConfig, raw: bytes, filename: str,
-    round_id: int, feedback_runtime: dict[str, Any] | None = None,
+    round_id: int,
 ) -> dict[str, Any]:
-    """Synchronous convenience wrapper retained for focused unit tests."""
-    immediate, job = _prepare_prebuilt_protocol_request(
-        container=container, target=target, raw=raw, filename=filename,
-        round_id=round_id,
-    )
-    if job is None:
-        return immediate
-    return _execute_prebuilt_protocol_symcc_request(
-        container=container, target=target, job=job,
-        feedback_runtime=feedback_runtime,
-    )
-
-
-def _compact_protocol_feedback(record: dict[str, Any]) -> dict[str, Any]:
-    """为下一次 agent 请求准备紧凑的异步反馈，不复制原始求解器日志。"""
-    def compact_observation(
-        value: Any, *, location_limit: int = 32
-    ) -> dict[str, Any] | None:
-        if not isinstance(value, dict):
-            return None
-        keys = (
-            "feedback_schema_version",
-            "status", "trace_status", "trace_complete", "trace_truncated",
-            "target_ids_configured", "target_ids_valid",
-            "exact_target_reached", "target_operation_reached",
-            "target_function_entered", "target_block_entered",
-            "target_reached", "target_block_reached", "target_reachability",
-            "target_anchor_granularity", "observed_block_count",
-            "allowed_conclusion", "reason",
+    try:
+        request = parse_request(raw, filename=filename)
+    except (ExecutionRequestError, UnicodeDecodeError) as exc:
+        return {"schema_version": 1, "status": "invalid_request", "errors": [str(exc)]}
+    try:
+        rc, resolved_input, err = docker_ops.exec_sh(
+            container,
+            f"readlink -f -- {shlex.quote(request.input_path)}",
+            timeout=15,
         )
-        compact = {key: value[key] for key in keys if key in value}
-        locations = value.get("observed_locations")
-        if isinstance(locations, list):
-            total = value.get("observed_location_count", len(locations))
-            if isinstance(total, bool) or not isinstance(total, int) or total < 0:
-                total = len(locations)
-            selected = locations[:max(0, location_limit)]
-            compact["observed_location_count"] = total
-            compact["observed_locations_included"] = len(selected)
-            compact["observed_locations_limited"] = bool(
-                value.get("observed_locations_limited")
-                or total > len(selected)
-                or len(locations) > len(selected)
+        resolved_input = resolved_input.strip()
+        if rc or not resolved_input.startswith(INPUT_ROOT + "/"):
+            raise ValueError(
+                f"input must resolve to a regular file below {INPUT_ROOT}: {err[-300:]}"
             )
-            compact["observed_locations_ordered"] = bool(
-                value.get("observed_locations_ordered", False)
-            )
-            if value.get("observed_locations_selection"):
-                compact["observed_locations_selection"] = value[
-                    "observed_locations_selection"
-                ]
-            compact["observed_locations"] = selected
-        return compact
-
-    clean = record.get("clean") if isinstance(record.get("clean"), dict) else {}
-    symcc = record.get("symcc") if isinstance(record.get("symcc"), dict) else {}
-    generated = record.get("generated_replays")
-    compact_generated: list[dict[str, Any]] = []
-    if isinstance(generated, list):
-        for item in generated[:8]:
-            if not isinstance(item, dict):
-                continue
-            replay = item.get("replay") if isinstance(item.get("replay"), dict) else {}
-            compact_generated.append({
-                "path": item.get("path"),
-                "size": item.get("size"),
-                "sha256": item.get("sha256"),
-                "clean_replay": {
-                    key: replay[key] for key in
-                    ("status", "exit_code", "sanitizer_event") if key in replay
-                },
-                "symcc_observation": compact_observation(
-                    item.get("symcc_observation"), location_limit=12
-                ),
-            })
-
-    compact: dict[str, Any] = {
-        "schema_version": 1,
-        "request_id": record.get("request_id"),
-        "round_id": record.get("round_id"),
-        "input_id": record.get("input_id"),
-        "input_sha256": record.get("input_sha256"),
-        "snapshot_path": record.get("snapshot_path"),
-        "parent_input_id": record.get("parent_input_id"),
-        "target_commit": record.get("target_commit"),
-        "feedback_status": record.get("feedback_status"),
-        "clean": {
-            key: clean[key] for key in
-            ("status", "exit_code", "sanitizer_event") if key in clean
-        },
-        "symcc": {
-            key: symcc[key] for key in
-            ("status", "duration_s", "testcase_count", "errors") if key in symcc
-        },
-        "input_trace_execution": {
-            key: record["input_trace_execution"][key]
-            for key in ("status", "exit_code", "duration_s")
-            if key in record.get("input_trace_execution", {})
-        },
-        "symcc_queue_wait_s": record.get("symcc_queue_wait_s"),
-        "symcc_observation": compact_observation(
-            record.get("symcc_observation")
-        ),
-        "generated_replays": compact_generated,
-    }
-    if record.get("feedback_error"):
-        compact["feedback_error"] = str(record["feedback_error"])[:500]
-    worker = symcc.get("worker")
-    if isinstance(worker, dict):
-        compact["symcc"]["worker"] = {
-            key: worker[key] for key in
-            ("isolated", "network", "memory_limit", "cpus", "oom_kill_count")
-            if key in worker
+        rc, _out, err = docker_ops.exec_sh(
+            container, f"test -f {shlex.quote(resolved_input)}", timeout=15
+        )
+        if rc:
+            raise ValueError(f"input is not a regular file: {request.input_path}: {err[-300:]}")
+        rc, size_text, err = docker_ops.exec_sh(
+            container,
+            f"stat -c %s -- {shlex.quote(resolved_input)}",
+            timeout=15,
+        )
+        if rc:
+            raise ValueError(f"input file does not exist: {request.input_path}")
+        try:
+            input_size = int(size_text.strip())
+        except ValueError as exc:
+            raise ValueError(f"cannot determine input size: {err[-300:]}") from exc
+        if input_size > 16 * 1024 * 1024:
+            raise ValueError("input exceeds the 16 MiB execution-protocol limit")
+        input_bytes = docker_ops.read_file(container, resolved_input)
+        if len(input_bytes) != input_size:
+            raise ValueError("input read was incomplete")
+    except Exception as exc:
+        return {
+            "schema_version": 1, "status": "invalid_request",
+            "request_id": request.request_id, "errors": [str(exc)],
         }
-    if record.get("error"):
-        compact["error"] = str(record["error"])[:500]
-    return compact
+    digest = hashlib.sha256(input_bytes).hexdigest()
+    clean_binary = _symcc_hidden_path(target.binary_path, "clean")
+    symcc_cfg = target.symcc_runtime or {}
+    symcc_binary = _symcc_hidden_path(str(symcc_cfg["binary_path"]), "symcc")
+    clean = _run_protocol_binary(
+        container=container, binary=clean_binary, request=request,
+        input_path=request.input_path,
+    )
+    out_dir = f"/work/validation/symcc-results/{request.request_id}"
+    rc, _out, err = docker_ops.exec_sh(
+        container, f"rm -rf -- {shlex.quote(out_dir)} && mkdir -p -- {shlex.quote(out_dir)}",
+        timeout=15,
+    )
+    if rc:
+        symcc = {"status": "setup_failed", "errors": [err[-500:]], "testcase_count": 0}
+        replays = []
+    else:
+        symcc_request = ExecutionRequest(
+            request.request_id, request.input_path,
+            tuple(symcc_cfg.get("program_args") or request.program_args),
+            request.timeout_s, request.env,
+        )
+        symcc = _run_protocol_binary(
+            container=container, binary=symcc_binary, request=symcc_request,
+            input_path=request.input_path, symcc_output=out_dir,
+        )
+        list_cmd = (
+            f"find {shlex.quote(out_dir)} -maxdepth 1 -type f "
+            "-printf '%p\\t%s\\n' 2>/dev/null | "
+            "sort | head -n 32"
+        )
+        list_rc, listing, list_err = docker_ops.exec_sh(container, list_cmd, timeout=15)
+        generated: list[dict[str, Any]] = []
+        if list_rc == 0:
+            total = 0
+            for index, row in enumerate(listing.splitlines()):
+                path, sep, size_text = row.rpartition("\t")
+                if not sep or not path.startswith(out_dir + "/"):
+                    continue
+                try:
+                    size = int(size_text)
+                except ValueError:
+                    continue
+                if size < 0 or size > 1024 * 1024 or total + size > 16 * 1024 * 1024:
+                    continue
+                data = docker_ops.read_file(container, path)
+                if len(data) != size:
+                    continue
+                total += size
+                replay_path = f"{INPUT_ROOT}/symcc-{request.request_id}-{index:03d}.bin"
+                docker_ops.write_file(container, replay_path, data)
+                replay_request = ExecutionRequest(
+                    request.request_id,
+                    request.input_path,
+                    request.program_args,
+                    min(request.timeout_s, 10),
+                    request.env,
+                )
+                replay = _run_protocol_binary(
+                    container=container, binary=clean_binary, request=replay_request,
+                    input_path=replay_path,
+                )
+                generated.append({
+                    "path": replay_path,
+                    "size": size,
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                    "replay": replay,
+                })
+        else:
+            list_err = list_err[-500:]
+        replays = generated
+        symcc.update({
+            "testcase_count": len(generated),
+            "testcases": [
+                {key: item[key] for key in ("path", "size", "sha256")}
+                for item in generated
+            ],
+        })
+        if list_rc:
+            symcc.setdefault("errors", []).append(f"cannot list SymCC outputs: {list_err}")
+    return {
+        "schema_version": 1,
+        "protocol": "dynamic-execution",
+        "status": "completed",
+        "request_id": request.request_id,
+        "round_id": round_id,
+        "input_path": request.input_path,
+        "input_size": len(input_bytes),
+        "input_sha256": digest,
+        "clean": clean,
+        "symcc": symcc,
+        "generated_replays": replays,
+        "site_reached": None,
+        "site_reachability_note": (
+            "SymCC execution and clean-target replay are reported; no source-site "
+            "reachability is inferred from testcase generation alone."
+        ),
+    }
 
 
 async def _prebuilt_protocol_worker(
     *, container: str, target: TargetConfig, stop: asyncio.Event,
     result_path: str | None,
-    feedback_runtime: dict[str, Any] | None = None,
-    max_requests: int = _DEFAULT_MAX_ITERATIONS,
 ) -> dict[str, Any]:
-    request_limit = max(1, min(int(max_requests), _MAX_ITERATION_RECORDS))
-    worker_started = time.monotonic()
-    worker_started_wall_time_s = time.time()
-    _memory_limit, _cpus, max_inflight_symcc_jobs = _symcc_sidecar_settings(
-        target.symcc_runtime or {}
-    )
-    symcc_slots = asyncio.Semaphore(max_inflight_symcc_jobs)
     seen: set[str] = set()
     records: list[dict[str, Any]] = []
-    jobs: set[asyncio.Task] = set()
-    stats = {
-        "processed": 0, "invalid": 0, "errors": 0,
-        "symcc_errors": 0, "symcc_skipped_busy": 0,
-        "symcc_abandoned": 0, "symcc_duration_s": 0.0,
-        "symcc_queued": 0, "symcc_queue_wait_s": 0.0,
-        "feedback_auto_delivered": 0,
-        "iteration_limit_rejections": 0,
-        "time_to_first_request_s": None,
-    }
-    feedback_delivered: set[str] = set()
+    stats = {"processed": 0, "invalid": 0, "errors": 0, "symcc_duration_s": 0.0}
     command = (
         f"find {shlex.quote(PENDING_ROOT)} -maxdepth 1 -type f "
         "-name '*.json' -print | sort"
     )
-
-    def attach_ready_feedback(response: dict[str, Any]) -> list[str]:
-        """把此前完成的异步结果压缩后附加到下一次请求响应。"""
-        ready = [
-            record for record in records
-            if record.get("request_id") not in feedback_delivered
-            and record.get("feedback_status") in {"ready", "publish_error"}
-        ]
-        response["ready_feedback"] = [
-            _compact_protocol_feedback(record) for record in ready
-        ]
-        return [str(record["request_id"]) for record in ready if record.get("request_id")]
-
-    def mark_feedback_delivered(request_ids: list[str]) -> None:
-        feedback_delivered.update(request_ids)
-        stats["feedback_auto_delivered"] += len(request_ids)
-
-    async def run_feedback_job(job: dict[str, Any], record: dict[str, Any]) -> None:
-        request: ExecutionRequest = job["request"]
-        feedback_path = f"{FEEDBACK_ROOT}/{request.request_id}.json"
-        temp_path = feedback_path + ".tmp"
-        started = time.monotonic()
-        try:
-            result = await asyncio.to_thread(
-                _execute_prebuilt_protocol_symcc_request,
-                container=container, target=target, job=job,
-                feedback_runtime=feedback_runtime,
-            )
-            symcc = result.get("symcc") or {}
-            stats["symcc_duration_s"] += float(symcc.get("duration_s") or 0.0)
-            if symcc.get("status") != "completed":
-                stats["symcc_errors"] += 1
-        except Exception as exc:
-            stats["symcc_errors"] += 1
-            result = {
-                "schema_version": 1,
-                "protocol": "dynamic-execution-feedback",
-                "status": "execution_error",
-                "request_id": request.request_id,
-                "round_id": job["round_id"],
-                "input_path": request.input_path,
-                "input_sha256": job["input_sha256"],
-                "error": f"{type(exc).__name__}: {exc}",
-                "symcc": {"status": "execution_error"},
-                "generated_replays": [],
-            }
-        result["feedback_status"] = "ready"
-        record.update(result)
-        try:
-            payload = (
-                json.dumps(
-                    _compact_protocol_feedback(result),
-                    indent=2,
-                    ensure_ascii=False,
-                )
-                + "\n"
-            ).encode()
-            await asyncio.to_thread(docker_ops.write_file, container, temp_path, payload)
-            rc, _out, err = await asyncio.to_thread(
-                docker_ops.exec_sh,
-                container,
-                f"mv -- {shlex.quote(temp_path)} {shlex.quote(feedback_path)}",
-                timeout=15,
-            )
-            if rc:
-                raise RuntimeError(f"cannot publish SymCC feedback: {err[-300:]}")
-        except Exception as exc:
-            stats["errors"] += 1
-            record["feedback_status"] = "publish_error"
-            record["feedback_error"] = f"{type(exc).__name__}: {exc}"
-        record["feedback_wall_time_s"] = round(time.monotonic() - started, 3)
-        record["feedback_ready_wall_time_s"] = round(
-            time.monotonic() - worker_started, 3
-        )
-
-    async def run_queued_feedback_job(
-        job: dict[str, Any], record: dict[str, Any], enqueued_at: float
-    ) -> None:
-        try:
-            async with symcc_slots:
-                queue_wait = max(0.0, time.monotonic() - enqueued_at)
-                record["symcc_queue_wait_s"] = round(queue_wait, 3)
-                stats["symcc_queue_wait_s"] += queue_wait
-                await run_feedback_job(job, record)
-        except asyncio.CancelledError:
-            cancel_event = job.get("cancel_event")
-            if isinstance(cancel_event, threading.Event):
-                cancel_event.set()
-            sidecar_name = job.get("sidecar_name")
-            if isinstance(sidecar_name, str):
-                await asyncio.to_thread(docker_ops.rm, sidecar_name)
-            raise
-
     while not stop.is_set():
         try:
             rc, listing, _err = await asyncio.to_thread(
@@ -2535,74 +2397,31 @@ async def _prebuilt_protocol_worker(
                 if not path.startswith(PENDING_ROOT + "/") or not name.endswith(".json") or name in seen:
                     continue
                 seen.add(name)
-                if stats["time_to_first_request_s"] is None:
-                    stats["time_to_first_request_s"] = round(
-                        time.monotonic() - worker_started, 3
-                    )
                 try:
                     raw = await asyncio.to_thread(docker_ops.read_file, container, path)
-                    if stats["processed"] >= request_limit:
-                        request_id = name.removesuffix(".json")
-                        response = {
-                            "schema_version": 1,
-                            "protocol": "dynamic-execution",
-                            "status": "iteration_limit_reached",
-                            "request_id": request_id,
-                            "iteration_limit": request_limit,
-                            "accepted_requests": stats["processed"],
-                            "message": (
-                                "The Harness-enforced dynamic iteration limit has been "
-                                "reached. This input was not run by the clean target or "
-                                "SymCC; stop submitting requests and report the evidence "
-                                "collected so far."
-                            ),
-                        }
-                        delivered_ids = attach_ready_feedback(response)
-                        await asyncio.to_thread(
-                            docker_ops.write_file, container,
-                            f"{RESPONSE_ROOT}/{name}",
-                            (json.dumps(response, indent=2, ensure_ascii=False) + "\n").encode(),
-                        )
-                        mark_feedback_delivered(delivered_ids)
-                        await asyncio.to_thread(
-                            docker_ops.exec_sh, container,
-                            f"mv -- {shlex.quote(path)} {shlex.quote(PROCESSED_ROOT + '/' + name)}",
-                            timeout=15,
-                        )
-                        stats["iteration_limit_rejections"] += 1
-                        continue
-                    response, job = await asyncio.to_thread(
-                        _prepare_prebuilt_protocol_request,
+                    response = await asyncio.to_thread(
+                        _execute_prebuilt_protocol_request,
                         container=container, target=target, raw=raw,
                         filename=name, round_id=stats["processed"] + 1,
                     )
-                    response["request_wall_time_s"] = round(
-                        time.monotonic() - worker_started, 3
-                    )
                     if response.get("status") == "invalid_request":
                         stats["invalid"] += 1
-                    delivered_ids = attach_ready_feedback(response)
-                    records.append(response)
-                    stats["processed"] += 1
+                    elif response.get("status") != "completed":
+                        stats["errors"] += 1
+                    symcc = response.get("symcc") or {}
+                    stats["symcc_duration_s"] += float(symcc.get("duration_s") or 0)
                     await asyncio.to_thread(
                         docker_ops.write_file, container,
                         f"{RESPONSE_ROOT}/{name}",
                         (json.dumps(response, indent=2, ensure_ascii=False) + "\n").encode(),
                     )
-                    mark_feedback_delivered(delivered_ids)
                     await asyncio.to_thread(
                         docker_ops.exec_sh, container,
                         f"mv -- {shlex.quote(path)} {shlex.quote(PROCESSED_ROOT + '/' + name)}",
                         timeout=15,
                     )
-                    if job is not None:
-                        enqueued_at = time.monotonic()
-                        task = asyncio.create_task(
-                            run_queued_feedback_job(job, response, enqueued_at)
-                        )
-                        jobs.add(task)
-                        stats["symcc_queued"] += 1
-                        task.add_done_callback(jobs.discard)
+                    records.append(response)
+                    stats["processed"] += 1
                 except Exception as exc:
                     stats["errors"] += 1
                     response = {
@@ -2611,7 +2430,6 @@ async def _prebuilt_protocol_worker(
                         "request_file": name,
                         "errors": [f"{type(exc).__name__}: {exc}"],
                     }
-                    delivered_ids = attach_ready_feedback(response)
                     records.append(response)
                     try:
                         await asyncio.to_thread(
@@ -2619,7 +2437,6 @@ async def _prebuilt_protocol_worker(
                             f"{RESPONSE_ROOT}/{name}",
                             (json.dumps(response, indent=2) + "\n").encode(),
                         )
-                        mark_feedback_delivered(delivered_ids)
                         await asyncio.to_thread(
                             docker_ops.exec_sh, container,
                             f"mv -- {shlex.quote(path)} {shlex.quote(PROCESSED_ROOT + '/' + name)}",
@@ -2631,309 +2448,85 @@ async def _prebuilt_protocol_worker(
             await asyncio.wait_for(stop.wait(), timeout=0.25)
         except asyncio.TimeoutError:
             pass
-
-    # No agent remains to consume feedback after exploration ends. Cancel
-    # outstanding work instead of extending the dynamic phase just to wait for
-    # SymCC; already-published feedback remains available in the result files.
-    unfinished = [task for task in jobs if not task.done()]
-    if unfinished:
-        for task in unfinished:
-            task.cancel()
-        await asyncio.gather(*unfinished, return_exceptions=True)
-        stats["symcc_abandoned"] = len(unfinished)
-        for record in records:
-            if (record.get("symcc") or {}).get("status") == "queued":
-                record["feedback_status"] = "abandoned_agent_finished"
-                record["symcc"] = {
-                    "status": "abandoned",
-                    "message": "agent finished before background feedback was ready",
-                }
-    feedback_ready_ids = [
-        str(record.get("request_id"))
-        for record in records
-        if record.get("request_id")
-        and record.get("feedback_status") in {"ready", "publish_error"}
-    ]
-    feedback_read_events = await asyncio.to_thread(
-        _read_feedback_read_events, container
-    )
-    feedback_manually_read_ids = sorted({
-        str(event["request_id"])
-        for event in feedback_read_events
-        if event.get("request_id")
-    })
-    feedback_ready_manually_read_ids = sorted({
-        str(event["request_id"])
-        for event in feedback_read_events
-        if event.get("request_id") and event.get("status") == "ready"
-    })
-    feedback_ready_not_auto_delivered_ids = [
-        request_id for request_id in feedback_ready_ids
-        if request_id not in feedback_delivered
-    ]
-    feedback_ready_unconsumed_ids = [
-        request_id for request_id in feedback_ready_ids
-        if request_id not in feedback_delivered
-        and request_id not in feedback_ready_manually_read_ids
-    ]
-    evidence_ledger = _prebuilt_protocol_evidence_ledger(
-        records,
-        feedback_read_events,
-        worker_started_wall_time_s=worker_started_wall_time_s,
-    )
     summary = {
-        "schema_version": 1, "provider": "symcc-prebuilt",
-        "status": "incomplete" if unfinished else "completed",
-        "worker_started_wall_time_s": round(worker_started_wall_time_s, 3),
-        "iteration_limit": request_limit,
+        "schema_version": 1, "provider": "symcc-prebuilt", "status": "completed",
         "requests": stats["processed"], "invalid_requests": stats["invalid"],
-        "iteration_limit_rejections": stats["iteration_limit_rejections"],
-        "errors": stats["errors"], "symcc_errors": stats["symcc_errors"],
-        "symcc_queued": stats["symcc_queued"],
-        "symcc_queue_wait_s": round(stats["symcc_queue_wait_s"], 3),
-        "symcc_skipped_busy": stats["symcc_skipped_busy"],
-        "symcc_abandoned": stats["symcc_abandoned"],
-        "feedback_auto_delivered": stats["feedback_auto_delivered"],
-        "feedback_ready": len(feedback_ready_ids),
-        "feedback_ready_not_auto_delivered": len(
-            feedback_ready_not_auto_delivered_ids
-        ),
-        "feedback_ready_not_auto_delivered_ids": (
-            feedback_ready_not_auto_delivered_ids[:20]
-        ),
-        "feedback_manual_reads": len(feedback_read_events),
-        "feedback_manually_read_ids": feedback_manually_read_ids[:20],
-        "feedback_ready_manually_read": len(feedback_ready_manually_read_ids),
-        "feedback_ready_manually_read_ids": (
-            feedback_ready_manually_read_ids[:20]
-        ),
-        "feedback_ready_unconsumed": len(feedback_ready_unconsumed_ids),
-        "feedback_ready_unconsumed_ids": feedback_ready_unconsumed_ids[:20],
-        "time_to_first_request_s": stats["time_to_first_request_s"],
-        "symcc_execution_s": round(stats["symcc_duration_s"], 3),
-        "metrics": _prebuilt_protocol_metrics(records),
-        "evidence_ledger": evidence_ledger,
+        "errors": stats["errors"], "symcc_execution_s": round(stats["symcc_duration_s"], 3),
         "records": records,
     }
     if result_path:
         output = Path(result_path)
         output.mkdir(parents=True, exist_ok=True)
         (output / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
-        ledger_text = "".join(
-            json.dumps(event, ensure_ascii=False) + "\n"
-            for event in evidence_ledger
-        )
-        (output / "evidence_ledger.jsonl").write_text(ledger_text)
-        if output.name == "symbolic_execution":
-            (output.parent / "evidence_ledger.jsonl").write_text(ledger_text)
         with (output / "requests.jsonl").open("w") as stream:
             for record in records:
                 stream.write(json.dumps(record, ensure_ascii=False) + "\n")
     return summary
 
 
-def _read_feedback_read_events(container: str) -> list[dict[str, Any]]:
-    """Read the protocol-local audit log written by read-feedback.
+async def _run_prebuilt_symcc_agent(
+    *, prompt: str, target: TargetConfig, container: str, model: str,
+    max_turns: int, system_prompt: str | None, max_resume_attempts: int,
+    transcript_path: str | None, progress_prefix: str | None,
+    result_path: str | None,
+    phase_timeout_s: float | None = None,
+    supervisor_nudge=None,
+) -> tuple[AgentResult, dict[str, float], dict[str, Any]]:
+    """Run the prebuilt-SymCC execution-protocol agent (2026-09-23 behavior).
 
-    The log is advisory telemetry only.  Missing files, malformed JSONL, and
-    oversized logs must not fail the dynamic phase.
+    Rolled back from the target-site feedback design: the worker executes each
+    request synchronously and returns the neutral per-round record, and the
+    agent session runs to its natural end.  There is no feedback runtime, no
+    completion predicate, and no feedback-driven nudge; only the optional
+    supervisor progress nudge remains.
     """
+    started = time.time()
+    stop = asyncio.Event()
+    worker = asyncio.create_task(_prebuilt_protocol_worker(
+        container=container, target=target, stop=stop, result_path=result_path
+    ))
     try:
-        raw = docker_ops.read_file(container, FEEDBACK_READ_LOG)
-    except Exception:
-        return []
-    if not raw:
-        return []
-    raw = raw[:1024 * 1024]
-    events: list[dict[str, Any]] = []
-    for line in raw.splitlines()[:2000]:
+        result = await run_agent(
+            prompt=prompt, max_turns=max_turns, model=model, container=container,
+            transcript_path=transcript_path, progress_prefix=progress_prefix,
+            system_prompt=system_prompt, max_resume_attempts=max_resume_attempts,
+            tools=["Read", "Write", "Bash"],
+            phase_timeout_s=phase_timeout_s,
+            idle_timeout_s=phase_timeout_s,
+            progress_nudge=supervisor_nudge,
+        )
+    finally:
+        stop.set()
         try:
-            item = json.loads(line.decode("utf-8", errors="strict"))
-        except Exception:
-            continue
-        if not isinstance(item, dict):
-            continue
-        request_id = item.get("request_id")
-        status = item.get("status")
-        if (
-            isinstance(request_id, str)
-            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}", request_id)
-            and status in {"ready", "pending"}
-        ):
-            event: dict[str, Any] = {"request_id": request_id, "status": status}
-            wall_time_s = item.get("wall_time_s")
-            if (
-                isinstance(wall_time_s, (int, float))
-                and not isinstance(wall_time_s, bool)
-                and math.isfinite(float(wall_time_s))
-            ):
-                event["wall_time_s"] = float(wall_time_s)
-            events.append(event)
-    return events
-
-
-def _prebuilt_protocol_evidence_ledger(
-    records: list[dict[str, Any]],
-    feedback_read_events: list[dict[str, Any]],
-    *,
-    worker_started_wall_time_s: float | None = None,
-) -> list[dict[str, Any]]:
-    """Build a compact, chronological evidence ledger for experiment audits.
-
-    The ledger is derived from machine-owned protocol records plus the
-    read-feedback audit log.  It intentionally records observable events instead
-    of agent explanations, so later analysis can distinguish "feedback did not
-    exist", "feedback existed but was not consumed", and "feedback was consumed
-    but did not improve the next input".
-    """
-
-    events: list[dict[str, Any]] = []
-
-    def number(value: Any) -> float | None:
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            return None
-        value = float(value)
-        if not math.isfinite(value):
-            return None
-        return round(value, 3)
-
-    def add(event: dict[str, Any]) -> None:
-        event = {key: value for key, value in event.items() if value is not None}
-        events.append(event)
-
-    for record in records:
-        if not isinstance(record, dict):
-            continue
-        request_id = record.get("request_id")
-        if not isinstance(request_id, str) or not request_id:
-            request_id = None
-        base = {
-            "request_id": request_id,
-            "round_id": record.get("round_id"),
-            "input_id": record.get("input_id") or record.get("input_sha256"),
-            "parent_input_id": record.get("parent_input_id"),
-        }
-        request_t = number(record.get("request_wall_time_s"))
-        status = record.get("status")
-        add({
-            "t": request_t,
-            "event": (
-                "execution_request_rejected"
-                if status in {"invalid_request", "iteration_limit_reached", "execution_error"}
-                else "execution_request_accepted"
-            ),
-            **base,
-            "status": status,
-            "input_size": record.get("input_size"),
-        })
-
-        clean = record.get("clean")
-        if isinstance(clean, dict):
-            add({
-                "t": request_t,
-                "event": "ordinary_execution_done",
-                **base,
-                "clean_status": clean.get("status"),
-                "exit_code": clean.get("exit_code"),
-                "sanitizer_event": clean.get("sanitizer_event"),
-                "duration_s": clean.get("duration_s"),
-            })
-            if clean.get("sanitizer_event") is True:
-                add({
-                    "t": request_t,
-                    "event": "sanitizer_event_observed",
-                    **base,
-                    "clean_status": clean.get("status"),
-                    "exit_code": clean.get("exit_code"),
-                })
-
-        feedback_status = record.get("feedback_status")
-        feedback_t = number(record.get("feedback_ready_wall_time_s"))
-        observation = (
-            record.get("symcc_observation")
-            if isinstance(record.get("symcc_observation"), dict)
-            else {}
+            summary = await asyncio.wait_for(worker, timeout=15)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            worker.cancel()
+            try:
+                await worker
+            except (asyncio.CancelledError, Exception):
+                pass
+            summary = {
+                "schema_version": 1, "provider": "symcc-prebuilt", "status": "incomplete",
+                "errors": ["execution protocol worker did not stop cleanly"],
+            }
+    _annotate_first_request_policy(summary, result)
+    if result_path:
+        output = Path(result_path)
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "summary.json").write_text(
+            json.dumps(summary, indent=2, ensure_ascii=False) + "\n"
         )
-        generated = (
-            record.get("generated_replays")
-            if isinstance(record.get("generated_replays"), list)
-            else []
-        )
-        if feedback_status in {"ready", "publish_error"}:
-            generated_exact_hits = 0
-            generated_crashes = 0
-            for item in generated:
-                if not isinstance(item, dict):
-                    continue
-                seed_observation = item.get("symcc_observation")
-                if (
-                    isinstance(seed_observation, dict)
-                    and seed_observation.get("exact_target_reached") is True
-                ):
-                    generated_exact_hits += 1
-                replay = item.get("replay")
-                if isinstance(replay, dict) and replay.get("sanitizer_event") is True:
-                    generated_crashes += 1
-            add({
-                "t": feedback_t,
-                "event": "symcc_feedback_ready",
-                **base,
-                "feedback_status": feedback_status,
-                "symcc_status": (
-                    record.get("symcc", {}).get("status")
-                    if isinstance(record.get("symcc"), dict) else None
-                ),
-                "exact_target_reached": observation.get("exact_target_reached"),
-                "target_operation_reached": observation.get("target_operation_reached"),
-                "target_function_entered": observation.get("target_function_entered"),
-                "target_block_entered": observation.get("target_block_entered"),
-                "target_reachability": observation.get("target_reachability"),
-                "allowed_conclusion": observation.get("allowed_conclusion"),
-                "generated_replays": len(generated),
-                "generated_replay_exact_hits": generated_exact_hits,
-                "generated_replay_crashes": generated_crashes,
-            })
-        elif feedback_status in {"abandoned_agent_finished"}:
-            add({
-                "t": feedback_t,
-                "event": "symcc_feedback_abandoned",
-                **base,
-                "feedback_status": feedback_status,
-                "symcc_status": (
-                    record.get("symcc", {}).get("status")
-                    if isinstance(record.get("symcc"), dict) else None
-                ),
-            })
-
-    for read in feedback_read_events:
-        if not isinstance(read, dict):
-            continue
-        wall_time_s = number(read.get("wall_time_s"))
-        relative_t = None
-        if (
-            wall_time_s is not None
-            and isinstance(worker_started_wall_time_s, (int, float))
-            and not isinstance(worker_started_wall_time_s, bool)
-        ):
-            relative_t = max(0.0, round(wall_time_s - float(worker_started_wall_time_s), 3))
-        add({
-            "t": relative_t,
-            "event": "agent_feedback_read",
-            "request_id": read.get("request_id"),
-            "feedback_read_status": read.get("status"),
-            "wall_time_s": wall_time_s,
-        })
-
-    events.sort(
-        key=lambda item: (
-            float("inf") if item.get("t") is None else float(item.get("t")),
-            str(item.get("event") or ""),
-            str(item.get("request_id") or ""),
-        )
-    )
-    for index, event in enumerate(events, start=1):
-        event["seq"] = index
-    return events
+        records = summary.get("records") or []
+        with (output / "requests.jsonl").open("w") as stream:
+            for record in records:
+                stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return result, {
+        "dynamic_validation": time.time() - started,
+        "execution_protocol_requests": float(summary.get("requests", 0)),
+        "execution_protocol_invalid": float(summary.get("invalid_requests", 0)),
+        "execution_protocol_errors": float(summary.get("errors", 0)),
+        "symbolic_execution_session": float(summary.get("symcc_execution_s", 0)),
+    }, summary
 
 
 def _generic_dynamic_evidence_ledger(
@@ -3036,6 +2629,7 @@ def _generic_dynamic_evidence_ledger(
     return events
 
 
+
 def _persist_generic_dynamic_evidence_ledger(
     result_path: str | None,
     result: DynamicValidationResult,
@@ -3054,87 +2648,6 @@ def _persist_generic_dynamic_evidence_ledger(
     except OSError:
         return
 
-
-def _prebuilt_protocol_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
-    """Derive experiment-facing timing and feedback-quality metrics."""
-    first_feedback_s: float | None = None
-    first_exact_target_s: float | None = None
-    first_sanitizer_s: float | None = None
-    completed_jobs = 0
-    timed_out_jobs = 0
-    crashed_jobs = 0
-    unknown_traces = 0
-    exact_hits = 0
-    generated_replays = 0
-    generated_exact_hits = 0
-
-    for record in records:
-        if not isinstance(record, dict):
-            continue
-        clean = record.get("clean")
-        if isinstance(clean, dict) and clean.get("sanitizer_event") is True:
-            first_sanitizer_s = _min_optional_float(
-                first_sanitizer_s, record.get("request_wall_time_s")
-            )
-
-        feedback_ready = record.get("feedback_ready_wall_time_s")
-        if record.get("feedback_status") in {"ready", "publish_error"}:
-            first_feedback_s = _min_optional_float(first_feedback_s, feedback_ready)
-
-        observation = record.get("symcc_observation")
-        if isinstance(observation, dict):
-            if observation.get("exact_target_reached") is True:
-                exact_hits += 1
-                first_exact_target_s = _min_optional_float(
-                    first_exact_target_s, feedback_ready
-                )
-            elif observation.get("target_reachability") == "unknown":
-                unknown_traces += 1
-
-        symcc = record.get("symcc")
-        if isinstance(symcc, dict):
-            status = symcc.get("status")
-            if status == "completed":
-                completed_jobs += 1
-            elif status == "timed_out":
-                timed_out_jobs += 1
-            elif status in {"failed", "execution_error", "resource_exhausted"}:
-                crashed_jobs += 1
-
-        generated = record.get("generated_replays")
-        if isinstance(generated, list):
-            generated_replays += sum(1 for item in generated if isinstance(item, dict))
-            for item in generated:
-                if not isinstance(item, dict):
-                    continue
-                seed_observation = item.get("symcc_observation")
-                if (
-                    isinstance(seed_observation, dict)
-                    and seed_observation.get("exact_target_reached") is True
-                ):
-                    generated_exact_hits += 1
-
-    return {
-        "time_to_first_feedback_s": first_feedback_s,
-        "time_to_first_exact_target_reach_s": first_exact_target_s,
-        "time_to_first_sanitizer_s": first_sanitizer_s,
-        "exact_target_hit_records": exact_hits,
-        "unknown_trace_records": unknown_traces,
-        "symcc_completed_jobs": completed_jobs,
-        "symcc_timed_out_jobs": timed_out_jobs,
-        "symcc_crashed_jobs": crashed_jobs,
-        "generated_replays": generated_replays,
-        "generated_replay_exact_hits": generated_exact_hits,
-    }
-
-
-def _min_optional_float(current: float | None, value: Any) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return current
-    if not math.isfinite(float(value)):
-        return current
-    candidate = round(float(value), 3)
-    return candidate if current is None else min(current, candidate)
 
 
 def _dynamic_completion_predicate(result: AgentResult) -> bool:
@@ -3155,6 +2668,7 @@ def _dynamic_completion_predicate(result: AgentResult) -> bool:
     if status == "validated":
         return parse_xml_tag(text, "poc_path") is not None
     return parse_xml_tag(text, "reason") is not None
+
 
 
 def _make_dynamic_completion_predicate(
@@ -3179,6 +2693,7 @@ def _make_dynamic_completion_predicate(
     return _predicate
 
 
+
 def _make_validation_supervisor(
     mode: str | None,
     *,
@@ -3196,6 +2711,7 @@ def _make_validation_supervisor(
     return SearchPolicySupervisor(mode=mode, event_path=event_path)
 
 
+
 def _supervisor_decision_handler(container: str, target: TargetConfig):
     """Return a side-effect hook for supervisor interventions."""
 
@@ -3204,6 +2720,7 @@ def _supervisor_decision_handler(container: str, target: TargetConfig):
             _terminate_target_search_processes(container, target)
 
     return _handle
+
 
 
 def _terminate_target_search_processes(container: str, target: TargetConfig) -> None:
@@ -3237,70 +2754,6 @@ def _terminate_target_search_processes(container: str, target: TargetConfig) -> 
         return
 
 
-async def _run_prebuilt_symcc_agent(
-    *, prompt: str, target: TargetConfig, container: str, model: str,
-    max_turns: int, system_prompt: str | None, max_resume_attempts: int,
-    transcript_path: str | None, progress_prefix: str | None,
-    result_path: str | None,
-    feedback_runtime: dict[str, Any] | None = None,
-    max_iterations: int = _DEFAULT_MAX_ITERATIONS,
-    phase_timeout_s: float | None = None,
-    supervisor_nudge=None,
-    completion_predicate=None,
-) -> tuple[AgentResult, dict[str, float], dict[str, Any]]:
-    started = time.time()
-    stop = asyncio.Event()
-    worker = asyncio.create_task(_prebuilt_protocol_worker(
-        container=container, target=target, stop=stop, result_path=result_path,
-        feedback_runtime=feedback_runtime,
-        max_requests=max_iterations,
-    ))
-    try:
-        result = await run_agent(
-            prompt=prompt, max_turns=max_turns, model=model, container=container,
-            transcript_path=transcript_path, progress_prefix=progress_prefix,
-            system_prompt=system_prompt, max_resume_attempts=max_resume_attempts,
-            tools=["Read", "Write", "Bash"],
-            phase_timeout_s=phase_timeout_s,
-            idle_timeout_s=phase_timeout_s,
-            progress_nudge=combine_progress_nudges(
-                supervisor_nudge,
-                _prebuilt_progress_nudge(container),
-            ),
-            completion_predicate=completion_predicate
-            or _make_dynamic_completion_predicate(None),
-        )
-    finally:
-        stop.set()
-        try:
-            summary = await asyncio.wait_for(worker, timeout=15)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            worker.cancel()
-            try:
-                await worker
-            except (asyncio.CancelledError, Exception):
-                pass
-            summary = {
-                "schema_version": 1, "provider": "symcc-prebuilt", "status": "incomplete",
-                "errors": ["execution protocol worker did not stop cleanly"],
-            }
-    _annotate_first_request_policy(summary, result)
-    if result_path:
-        output = Path(result_path)
-        output.mkdir(parents=True, exist_ok=True)
-        (output / "summary.json").write_text(
-            json.dumps(summary, indent=2, ensure_ascii=False) + "\n"
-        )
-    return result, {
-        "dynamic_validation": time.time() - started,
-        "execution_protocol_requests": float(summary.get("requests", 0)),
-        "execution_protocol_limit_rejections": float(
-            summary.get("iteration_limit_rejections", 0)
-        ),
-        "execution_protocol_invalid": float(summary.get("invalid_requests", 0)),
-        "execution_protocol_errors": float(summary.get("errors", 0)),
-        "symbolic_execution_session": float(summary.get("symcc_execution_s", 0)),
-    }, summary
 
 
 def _annotate_first_request_policy(

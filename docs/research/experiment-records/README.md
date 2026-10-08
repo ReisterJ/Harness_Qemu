@@ -56,6 +56,8 @@ YYYY-MM-DD-<target>-<experiment-topic>.md
 | 日期 | 记录 | 实验问题 | Primary | Additional | 主要结论 |
 | --- | --- | --- | --- | --- | --- |
 | 2026-10-04 | [MRuby 57672 supervisor ablation](2026-10-04-mruby-57672-supervisor-ablation.md) | supervisor 是否减少无意义搜索 | 否 | 是 | supervisor 显著减少 broad fuzzing 时间；未复现目标 UAF，但发现稳定 bignum ASan crash |
+| 2026-10-05 | [MRuby 57672 supervisor postfix rerun](2026-10-05-mruby-57672-supervisor-postfix-rerun.md) | 修复后 supervisor 是否按预期纠偏 | 否 | 否 | supervisor 成功拦截后台 fuzz / broad fuzzing；但 off 组暴露 SymCC 产物，不能作为干净对照 |
+| 2026-10-06 | [MRuby 57672 clean off / supervisor ablation](2026-10-06-mruby-57672-clean-supervisor-ablation.md) | 干净 off 条件下 supervisor 是否改变已知漏洞复现过程 | 否 | 未确认 | 两组均未产出目标 UAF PoC；rules 组有未验收的逻辑异常线索，时间差约 100 秒，单次实验不足以支持效果结论 |
 
 ## 待回填
 
