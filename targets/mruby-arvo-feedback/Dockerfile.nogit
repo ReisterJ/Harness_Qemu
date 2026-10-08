@@ -1,5 +1,0 @@
-# Same target with /src/mruby/.git removed (experiment convention).
-ARG BASE_TAG=local/arvo-57672-site-feedback:20261007-idcache
-FROM ${BASE_TAG}
-USER root
-RUN rm -rf /src/mruby/.git && test ! -e /src/mruby/.git

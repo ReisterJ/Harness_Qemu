@@ -1,7 +1,0 @@
-image_tag: local/arvo-57672-off-clean:20261006
-github_url: https://github.com/mruby/mruby
-commit: 2de602b8696bc21e4cbc2c6e08e2fae27b1ad79b
-binary_path: /out/mruby_fuzzer
-source_root: /src/mruby
-detector: asan
-memory_limit: 4g
