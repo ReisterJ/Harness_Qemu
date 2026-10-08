@@ -5,14 +5,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import math
 import time
 import json
 import re
 import shlex
-import tempfile
-import threading
-import uuid
 import xml.etree.ElementTree as ET
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -23,18 +19,13 @@ from . import docker_ops
 from .agent import AgentResult, parse_xml_tag, run_agent
 from .artifacts import (
     POC_KINDS,
-    AdditionalCrashSubmission,
     CrashArtifact,
     DynamicValidationResult,
     LogicArtifact,
     StaticFinding,
 )
 from .config import TargetConfig
-from .docker_params import DockerMount, DockerRunParams
 from .execution_protocol import (
-    FEEDBACK_READER_PATH,
-    FEEDBACK_READ_LOG,
-    FEEDBACK_ROOT,
     INPUT_ROOT,
     PENDING_ROOT,
     PROCESSED_ROOT,
@@ -43,11 +34,9 @@ from .execution_protocol import (
     REQUEST_TEMPLATE_PATH,
     RESPONSE_ROOT,
     RUNNER_PATH,
-    SNAPSHOT_ROOT,
     ExecutionRequest,
     ExecutionRequestError,
     parse_request,
-    protocol_feedback_reader_script,
     protocol_readme,
     protocol_runner_script,
     protocol_template,
@@ -63,19 +52,7 @@ from .prompts.dynamic_validation_prompt import (
 )
 from .runtimes import open_runtime_session
 from .symbolic import KleeSession, SymccSession, select_symbolic_execution
-from .symbolic.feedback import (
-    FeedbackMapError,
-    load_json_map_files,
-    parse_trace,
-    resolve_target_ids,
-    summarize_trace,
-)
 from .symbolic.seed_plan import SeedPlanError, parse_seed_plan
-from .supervisor import (
-    SearchPolicySupervisor,
-    combine_progress_nudges,
-    make_supervisor_progress_nudge,
-)
 
 _DYNAMIC_STATUSES = {
     "not_reached",
@@ -93,42 +70,12 @@ _DYNAMIC_STATUSES = {
 _DEFAULT_MAX_ITERATIONS = 8
 _MAX_ITERATION_RECORDS = 100
 _MAX_ITERATION_BYTES = 50_000
-_FIRST_INPUT_DEADLINE_S = 300.0
-_FIRST_INPUT_TOOL_CALL_LIMIT = 25
-_FIRST_INPUT_NUDGE_TOOL_CALLS = max(1, _FIRST_INPUT_TOOL_CALL_LIMIT - 5)
-_FEEDBACK_READY_NUDGE_GRACE_TOOL_CALLS = 10
-_FEEDBACK_READ_FOLLOWUP_NUDGE_GRACE_TOOL_CALLS = 20
 _CRASH_RESULT_XML_PATH = "/work/validation/crash-result.xml"
 _CRASH_RESULT_TEMPLATE_PATH = "/work/validation/crash-result-template.xml"
-_ADDITIONAL_CRASHES_PATH = "/work/validation/additional-crashes.jsonl"
-_ADDITIONAL_CRASH_ROOT = "/work/validation/additional-crashes"
-_ADDITIONAL_CRASH_TEMPLATE_PATH = "/work/validation/additional-crash-template.json"
-_MAX_ADDITIONAL_CRASHES = 10
-_MAX_ADDITIONAL_CRASH_BYTES = 10 * 1024 * 1024
 _CRASH_RESULT_FIELDS = (
     "candidate_id", "poc_path", "reproduction_command", "poc_kind",
     "crash_type", "exit_code", "crash_output", "dup_check",
 )
-
-
-def _additional_crash_template_json(candidate_id: str) -> bytes:
-    """Return a concrete JSONL object template for incidental crashes."""
-    template = {
-        "finding_id": "extra-001",
-        "summary": "short independent root-cause description",
-        "poc_path": "/work/validation/additional-crashes/extra-001/poc.bin",
-        "reproduction_command": (
-            "<target-binary> /work/validation/additional-crashes/extra-001/poc.bin"
-        ),
-        "poc_kind": "file",
-        "crash_type": "heap-buffer-overflow",
-        "exit_code": 134,
-        "crash_output": "bounded sanitizer report",
-        "dup_check": (
-            f"why this is distinct from primary candidate {candidate_id}"
-        ),
-    }
-    return json.dumps(template, indent=2, ensure_ascii=False).encode() + b"\n"
 
 
 async def run_dynamic_validation(
@@ -152,15 +99,8 @@ async def run_dynamic_validation(
     symbolic_execution_result_path: str | None = None,
     crash_result_path: str | None = None,
     max_iterations: int = _DEFAULT_MAX_ITERATIONS,
-    phase_timeout_s: float | None = None,
-    supervisor_mode: str = "rules",
-    supervisor_result_path: str | None = None,
 ) -> tuple[DynamicValidationResult, AgentResult, dict[str, float]]:
     """Try to produce a crash or semantic-logic PoC for one static candidate."""
-    if phase_timeout_s is not None and (
-        not math.isfinite(phase_timeout_s) or phase_timeout_s <= 0
-    ):
-        raise ValueError("phase_timeout_s must be a positive finite number or None")
     timings: dict[str, float] = {}
     mounts = [(str(found_bugs_path), "/tmp/found_bugs.jsonl")] if found_bugs_path else None
     provider = select_provider(instrumentation, target.instrumentation)
@@ -178,15 +118,6 @@ async def run_dynamic_validation(
     instrumentation_prepared: InstrumentationReport | None = None
     instrumentation_result: InstrumentationReport | None = None
     symbolic_result: dict | None = None
-    supervisor = _make_validation_supervisor(
-        supervisor_mode,
-        supervisor_result_path=supervisor_result_path,
-        transcript_path=transcript_path,
-    )
-    supervisor_nudge = make_supervisor_progress_nudge(
-        supervisor,
-        on_decision=_supervisor_decision_handler(container_name, target),
-    )
     with _open_dynamic_session(
         target,
         container_name=container_name,
@@ -196,14 +127,11 @@ async def run_dynamic_validation(
         symbolic_result_path=symbolic_execution_result_path,
     ) as (session, symbolic_session):
         container = session.container
-        _hide_source_vcs_metadata(container, target)
         _prepare_iteration_workspace(
             container, candidate, iteration_limit, target.detector
         )
         symbolic_context = (
-            _prepare_prebuilt_symcc_protocol(
-                container, target, max_requests=iteration_limit
-            )
+            _prepare_prebuilt_symcc_protocol(container, target)
             if symbolic_provider == "symcc"
             else symbolic_session.prepare_agent(container) if symbolic_session else None
         )
@@ -250,7 +178,6 @@ async def run_dynamic_validation(
                 instrumentation_context=instrumentation_context,
                 symbolic_context=symbolic_context,
                 max_iterations=iteration_limit,
-                phase_timeout_s=phase_timeout_s,
             )
             result, protocol_timings, symbolic_result = await _run_prebuilt_symcc_agent(
                 prompt=prompt,
@@ -263,8 +190,6 @@ async def run_dynamic_validation(
                 transcript_path=transcript_path,
                 progress_prefix=progress_prefix,
                 result_path=symbolic_execution_result_path,
-                phase_timeout_s=phase_timeout_s,
-                supervisor_nudge=supervisor_nudge,
             )
             timings.update(protocol_timings)
         else:
@@ -285,7 +210,6 @@ async def run_dynamic_validation(
                 instrumentation_context=instrumentation_context,
                 symbolic_context=symbolic_context,
                 max_iterations=iteration_limit,
-                phase_timeout_s=phase_timeout_s,
             )
             result = await run_agent(
                 prompt=prompt,
@@ -297,16 +221,10 @@ async def run_dynamic_validation(
                 system_prompt=system_prompt,
                 max_resume_attempts=max_resume_attempts,
                 tools=["Read", "Write", "Bash"],
-                phase_timeout_s=phase_timeout_s,
-                idle_timeout_s=phase_timeout_s,
-                progress_nudge=supervisor_nudge,
-                completion_predicate=_make_dynamic_completion_predicate(supervisor),
             )
             timings["dynamic_validation"] = time.time() - started
         timings["dynamic_agent_tool_calls"] = float(result.tool_call_count)
         timings["dynamic_agent_messages"] = float(result.assistant_message_count)
-        if supervisor is not None:
-            timings["supervisor_events"] = float(supervisor.event_count)
         if symbolic_session is not None:
             symbolic_result = symbolic_session.collect()
             timings["symbolic_execution_session"] = float(
@@ -320,14 +238,6 @@ async def run_dynamic_validation(
         iterations, iteration_errors = _collect_iteration_records(
             container, candidate.candidate_id, iteration_limit
         )
-        if symbolic_provider == "symcc":
-            iterations, symcc_iteration_errors = _reconcile_symcc_iterations(
-                iterations,
-                symbolic_result or {},
-                candidate_id=candidate.candidate_id,
-                detector=target.detector,
-            )
-            iteration_errors.extend(symcc_iteration_errors)
         _persist_iteration_records(
             iterations, iteration_errors, instrumentation_result_path
         )
@@ -356,13 +266,6 @@ async def run_dynamic_validation(
                     if function not in observed_reached:
                         observed_reached.append(function)
 
-        if target.detector == "logic":
-            additional_crashes, additional_crash_errors = [], []
-        else:
-            additional_crashes, additional_crash_errors = _collect_additional_crashes(
-                container, target.detector
-            )
-
         def dynamic_result(**kwargs) -> DynamicValidationResult:
             if observed_reached:
                 reported = list(kwargs.get("reached_functions") or [])
@@ -375,25 +278,7 @@ async def run_dynamic_validation(
                 kwargs["symbolic_execution"] = symbolic_result
             kwargs["iterations"] = iterations
             kwargs["iteration_errors"] = iteration_errors
-            kwargs["additional_crashes"] = additional_crashes
-            kwargs["additional_crash_errors"] = additional_crash_errors
-            kwargs.setdefault(
-                "status_breakdown",
-                _dynamic_status_breakdown(
-                    status=str(kwargs.get("status") or "unknown"),
-                    detector=target.detector,
-                    iterations=iterations,
-                    symbolic_result=symbolic_result,
-                    additional_crashes=additional_crashes,
-                ),
-            )
-            result_obj = DynamicValidationResult(**kwargs)
-            if symbolic_result is None:
-                _persist_generic_dynamic_evidence_ledger(
-                    symbolic_execution_result_path,
-                    result_obj,
-                )
-            return result_obj
+            return DynamicValidationResult(**kwargs)
 
         text = result.find_tagged_message("poc_path")
         status_text = result.find_tagged_message("dynamic_status")
@@ -441,15 +326,11 @@ async def run_dynamic_validation(
                     reason=crash_xml_error or "invalid crash result file",
                 ), result, timings
             if crash_xml_present:
-                # The XML file is the authoritative crash submission. Keep
-                # textual reachability evidence as context, but do not treat
-                # inline reached_functions as execution evidence: a previous
-                # assistant message can contain copied prompt text or stale
-                # metadata. Actual instrumentation evidence is appended below.
                 result_data = dict(inline_data)
                 result_data.update(crash_data or {})
-                result_data["reached_functions"] = ""
-                result_data["dynamic_status"] = "validated"
+                result_data["dynamic_status"] = (
+                    result_data["dynamic_status"] or "validated"
+                )
             else:
                 if inline_data["poc_path"]:
                     return dynamic_result(
@@ -476,25 +357,21 @@ async def run_dynamic_validation(
         reachability = result_data["reachability_evidence"]
         reason = result_data["reason"]
         if not poc_path or not reproduction_command:
-            reported_status = (result_data["dynamic_status"] or "").strip()
             status = (
-                reported_status
-                or (
-                    "agent_blocked"
-                    if result.error and result.error.startswith("agent/")
-                    else "agent_failed"
-                    if result.error
-                    else "invalid_submission"
-                )
+                "agent_blocked"
+                if result.error and result.error.startswith("agent/")
+                else "agent_failed"
+                if result.error
+                else result_data["dynamic_status"] or "invalid_submission"
             )
-            if reported_status or not result.error:
+            if not result.error:
                 status, reason = _status_for_missing_poc_submission(
                     status=status,
                     reason=reason,
                     iterations=iterations,
                     detector=target.detector,
                 )
-            if not iterations and (reported_status or not result.error):
+            if not iterations and not result.error:
                 status, reason = _status_without_iteration_records(status, reason)
             if status not in _DYNAMIC_STATUSES:
                 status = "reached_no_crash"
@@ -550,19 +427,13 @@ async def run_dynamic_validation(
         dup_check = result_data["dup_check"]
 
         if not _has_candidate_ready_iteration(iterations, target.detector):
-            wrong_path = _has_crash_without_candidate_site(iterations)
             return dynamic_result(
                 candidate_id=selected_id,
-                status="wrong_path" if wrong_path else "invalid_submission",
+                status="invalid_submission",
                 reached_functions=reached,
                 reachability_evidence=reachability,
                 reason=(
-                    "the submitted crash PoC reproduced a sanitizer event, but the "
-                    "complete SymCC trace for that input did not hit the exact "
-                    "candidate target marker; a distance estimate or nearby basic "
-                    "block is not evidence of a hit"
-                    if wrong_path
-                    else "successful PoC requires a candidate_ready iteration with "
+                    "successful PoC requires a candidate_ready iteration with "
                     "machine-observable evidence for the candidate"
                 ),
             ), result, timings
@@ -649,7 +520,6 @@ async def _run_harness_managed_symcc(
     transcript_path: str | None,
     progress_prefix: str | None,
     symbolic_result_path: str | None,
-    phase_timeout_s: float | None = None,
 ) -> tuple[AgentResult, dict[str, float]]:
     """Run the host-owned SymCC/agent feedback loop.
 
@@ -660,25 +530,21 @@ async def _run_harness_managed_symcc(
     role in source understanding and hypothesis refinement.
     """
     started = time.time()
-    deadline = (
-        time.monotonic() + phase_timeout_s if phase_timeout_s is not None else None
-    )
+    deadline = time.monotonic() + 1800.0
     merged = AgentResult()
     feedback: dict | None = None
     rounds = 0
     time_to_site_reached: float | None = None
     # `max_turns` is deliberately not reduced for the planner.  The caller's
-    # default is 20,000; an optional wall-clock deadline is the real bound;
+    # default is 20,000 and the wall-clock deadline below is the real bound;
     # reducing the step cap here caused the model to stop while it was still
     # staging a real source slice.
     planner_max_turns = max_turns
 
     for round_id in range(1, iteration_limit + 1):
-        remaining = deadline - time.monotonic() if deadline is not None else None
-        if remaining is not None and remaining <= 15:
-            merged.error = (
-                f"agent/model_blocked: phase exceeded {phase_timeout_s:g}s"
-            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 15:
+            merged.error = "agent/model_blocked: phase exceeded 1800s"
             break
 
         prompt = build_symcc_planner_prompt(
@@ -694,12 +560,11 @@ async def _run_harness_managed_symcc(
             round_id=round_id,
         )
         # Give the semantic planner enough time to stage a real source slice.
-        # With no global deadline, do not invent a per-round wall-clock cap.
-        # Under a finite deadline, reserve time for SymCC and PoC validation.
-        agent_budget = (
-            min(600.0, max(90.0, remaining - 900.0))
-            if remaining is not None else None
-        )
+        # SymCC and the clean-target PoC phase still need a substantial part of
+        # the fixed 1800-second budget, so this is intentionally a single
+        # bounded planning turn in the normal case rather than eight short
+        # turns that repeatedly rediscover the same source facts.
+        agent_budget = min(600.0, max(90.0, remaining - 900.0))
         try:
             round_result = await asyncio.wait_for(
                 run_agent(
@@ -715,19 +580,12 @@ async def _run_harness_managed_symcc(
                     phase_timeout_s=agent_budget,
                     idle_timeout_s=agent_budget,
                 ),
-                timeout=(
-                    min(agent_budget + 30.0, max(15.0, remaining - 5.0))
-                    if agent_budget is not None and remaining is not None else None
-                ),
+                timeout=min(agent_budget + 30.0, max(15.0, remaining - 5.0)),
             )
         except asyncio.TimeoutError:
             _terminate_agent_processes(container)
             round_result = AgentResult(
-                error=(
-                    f"agent/model_blocked: round exceeded {agent_budget:.0f}s"
-                    if agent_budget is not None
-                    else "agent/model_blocked: agent request timed out"
-                )
+                error=f"agent/model_blocked: round exceeded {agent_budget:.0f}s"
             )
         if round_result.error and round_result.error.startswith("agent/"):
             _terminate_agent_processes(container)
@@ -808,14 +666,11 @@ async def _run_harness_managed_symcc(
         # `site_reached` here made the planner loop consume the whole phase and
         # discarded the most useful LLM-produced seed information.
         if symbolic_report.get("status") in {"completed", "failed", "unavailable", "invalid_plan"}:
-            remaining = deadline - time.monotonic() if deadline is not None else None
-            if remaining is not None and remaining <= 15:
+            remaining = deadline - time.monotonic()
+            if remaining <= 15:
                 merged.error = "agent/model_blocked: no time left after site reach"
                 break
-            handoff_budget = (
-                min(900.0, max(30.0, remaining - 15.0))
-                if remaining is not None else None
-            )
+            handoff_budget = min(900.0, max(30.0, remaining - 15.0))
             handoff_prompt = build_poc_generation_prompt(
                 candidate=candidate,
                 github_url=target.github_url,
@@ -848,21 +703,13 @@ async def _run_harness_managed_symcc(
                         tools=["Read", "Write", "Bash"],
                         phase_timeout_s=handoff_budget,
                         idle_timeout_s=handoff_budget,
-                        completion_predicate=_make_dynamic_completion_predicate(None),
                     ),
-                    timeout=(
-                        min(handoff_budget + 30.0, max(15.0, remaining - 5.0))
-                        if handoff_budget is not None and remaining is not None else None
-                    ),
+                    timeout=min(handoff_budget + 30.0, max(15.0, remaining - 5.0)),
                 )
             except asyncio.TimeoutError:
                 _terminate_agent_processes(container)
                 handoff_result = AgentResult(
-                    error=(
-                        f"agent/model_blocked: handoff exceeded {handoff_budget:.0f}s"
-                        if handoff_budget is not None
-                        else "agent/model_blocked: agent handoff timed out"
-                    )
+                    error=f"agent/model_blocked: handoff exceeded {handoff_budget:.0f}s"
                 )
             if handoff_result.error and handoff_result.error.startswith("agent/"):
                 _terminate_agent_processes(container)
@@ -873,10 +720,8 @@ async def _run_harness_managed_symcc(
         if crash_present:
             break
 
-        if deadline is not None and time.monotonic() >= deadline:
-            merged.error = (
-                f"agent/model_blocked: phase exceeded {phase_timeout_s:g}s"
-            )
+        if time.monotonic() >= deadline:
+            merged.error = "agent/model_blocked: phase exceeded 1800s"
             break
 
     merged.finished_at = time.time()
@@ -1377,60 +1222,8 @@ def _symcc_hidden_path(binary_path: str, role: str) -> str:
     return str(path.with_name(f".harness-{role}-{path.name}"))
 
 
-def _symcc_sidecar_name(target_name: str) -> str:
-    safe_target = re.sub(r"[^A-Za-z0-9_.-]", "-", target_name)[:20] or "target"
-    return f"symcc-fb-{safe_target}-{uuid.uuid4().hex[:12]}"[:63]
-
-
-def _hide_source_vcs_metadata(container: str, target: TargetConfig) -> None:
-    """Remove source-control metadata before dynamic exploration in every arm.
-
-    Commit history can disclose a fix or a reproducer and invalidate a blinded
-    comparison. This is enforced in the target view rather than left as a
-    prompt-only instruction.
-    """
-    vcs_path = f"{target.source_root.rstrip('/')}/.git"
-    rc, _out, err = docker_ops.exec_sh(
-        container,
-        f"if [ -e {shlex.quote(vcs_path)} ]; then "
-        f"rm -rf -- {shlex.quote(vcs_path)}; fi",
-        timeout=30,
-    )
-    if rc:
-        raise RuntimeError(f"cannot remove target VCS metadata: {err[-500:]}")
-
-
-def _symcc_sidecar_settings(config: dict[str, Any]) -> tuple[str, str, int]:
-    """Validate resource limits for the isolated SymCC worker container."""
-    memory_limit = config.get("memory_limit", "4g")
-    if (
-        not isinstance(memory_limit, str)
-        or not re.fullmatch(r"[1-9][0-9]*(?:[kmg])?", memory_limit.lower())
-    ):
-        raise ValueError("symbolic_execution.symcc.memory_limit must look like 4g or 2048m")
-
-    raw_cpus = config.get("cpus", 2)
-    if isinstance(raw_cpus, bool) or not isinstance(raw_cpus, (int, float, str)):
-        raise ValueError("symbolic_execution.symcc.cpus must be a positive Docker CPU quota")
-    cpus = str(raw_cpus)
-    try:
-        cpu_count = float(cpus)
-    except ValueError as exc:
-        raise ValueError("symbolic_execution.symcc.cpus must be numeric") from exc
-    if not 0 < cpu_count <= 64:
-        raise ValueError("symbolic_execution.symcc.cpus must be between 0 and 64")
-
-    max_concurrent = config.get("max_concurrent_jobs", 1)
-    if isinstance(max_concurrent, bool) or not isinstance(max_concurrent, int):
-        raise ValueError("symbolic_execution.symcc.max_concurrent_jobs must be an integer")
-    if not 1 <= max_concurrent <= 4:
-        raise ValueError("symbolic_execution.symcc.max_concurrent_jobs must be between 1 and 4")
-    return memory_limit.lower(), cpus, max_concurrent
-
-
 def _prepare_prebuilt_symcc_protocol(
-    container: str, target: TargetConfig, candidate: StaticFinding | None = None,
-    *, max_requests: int = _DEFAULT_MAX_ITERATIONS,
+    container: str, target: TargetConfig
 ) -> dict[str, Any]:
     """Validate prebuilt executables and expose the request/response client."""
     config = target.symcc_runtime or {}
@@ -1449,9 +1242,6 @@ def _prepare_prebuilt_symcc_protocol(
         raise ValueError("prebuilt execution binary paths must not contain arguments")
     if clean_parts[0] == symcc_parts[0]:
         raise ValueError("clean and SymCC binary_path values must be different")
-    memory_limit, sidecar_cpus, max_concurrent_symcc_jobs = _symcc_sidecar_settings(
-        config
-    )
 
     symcc_args = config.get("program_args") or ["{input_file}"]
     if (
@@ -1472,7 +1262,6 @@ def _prepare_prebuilt_symcc_protocol(
         RESPONSE_ROOT,
         PROCESSED_ROOT,
         "/work/validation/symcc-results",
-        "/work/validation/symcc-feedback",
         str(Path(binary_clean_hidden).parent),
         str(Path(binary_symcc_hidden).parent),
     ]
@@ -1510,6 +1299,16 @@ def _prepare_prebuilt_symcc_protocol(
         if rc:
             raise RuntimeError(f"cannot install {label} execution guard: {err[-300:]}")
 
+    vcs_path = f"{target.source_root.rstrip('/')}/.git"
+    rc, _out, err = docker_ops.exec_sh(
+        container,
+        f"if [ -e {shlex.quote(vcs_path)} ]; then "
+        f"rm -rf -- {shlex.quote(vcs_path)}; fi",
+        timeout=30,
+    )
+    if rc:
+        raise RuntimeError(f"cannot remove target VCS metadata from dynamic view: {err[-500:]}")
+
     docker_ops.write_file(container, RUNNER_PATH, protocol_runner_script())
     rc, _out, err = docker_ops.exec_sh(
         container, f"chmod 0555 -- {shlex.quote(RUNNER_PATH)}", timeout=15
@@ -1535,192 +1334,6 @@ def _prepare_prebuilt_symcc_protocol(
     }
 
 
-def _candidate_target_anchors(candidate: StaticFinding) -> list[dict[str, Any]]:
-    """Normalize static-report observability anchors without inventing locations."""
-    def from_parts(
-        *,
-        file_name: Any = None,
-        function: Any = None,
-        line: Any = None,
-    ) -> dict[str, Any] | None:
-        if file_name is not None and not isinstance(file_name, str):
-            return None
-        if function is not None and not isinstance(function, str):
-            return None
-        if isinstance(line, bool) or (line is not None and not isinstance(line, int)):
-            return None
-        if (file_name is None) != (line is None):
-            return None
-        if not file_name and not function:
-            return None
-        anchor: dict[str, Any] = {}
-        if file_name:
-            anchor["source_file"] = file_name
-            anchor["line"] = line
-        if function:
-            anchor["function"] = function
-        return anchor
-
-    anchors: list[dict[str, Any]] = []
-    for raw in candidate.observability_targets:
-        operation = raw.get("target_operation")
-        if isinstance(operation, dict):
-            anchor = from_parts(
-                file_name=operation.get("source_file", operation.get("file")),
-                function=operation.get("function"),
-                line=operation.get("line"),
-            )
-            if anchor is not None:
-                anchor["anchor_role"] = "operation"
-                anchors.append(anchor)
-                continue
-
-        anchor = from_parts(
-            file_name=raw.get("source_file", raw.get("file")),
-            function=raw.get("function"),
-            line=raw.get("line"),
-        )
-        if anchor is not None:
-            anchor["anchor_role"] = "legacy_location"
-            anchors.append(anchor)
-            continue
-
-        target_function = raw.get("target_function")
-        anchor = from_parts(function=target_function)
-        if anchor is None:
-            continue
-        anchor.setdefault("anchor_role", "coarse_function")
-        anchors.append(anchor)
-    if anchors:
-        return anchors[:50]
-
-    # Legacy static reports encode the primary site as e.g.
-    # "src/parser.c:123, function parse". Parse only explicit syntax; if it
-    # does not match, leave target reachability unknown instead of guessing.
-    location = candidate.location.strip()
-    match = re.search(r"([^\s,]+):(\d+)", location)
-    function_match = re.search(r"\bfunction\s+([A-Za-z_~][A-Za-z0-9_:~.$<>]*)", location)
-    if match:
-        anchor = {"source_file": match.group(1), "line": int(match.group(2))}
-        if function_match:
-            anchor["function"] = function_match.group(1)
-        return [anchor]
-    if function_match:
-        return [{"function": function_match.group(1)}]
-    return []
-
-
-def _load_symcc_feedback_runtime(
-    *, container: str, target: TargetConfig, candidate: StaticFinding | None
-) -> dict[str, Any]:
-    """Load and version-check the prebuilt binary's source/CFG feedback map."""
-    config = target.symcc_runtime or {}
-    map_path = config.get("feedback_map_path")
-    base: dict[str, Any] = {
-        "status": "unavailable",
-        "map_path": map_path,
-        "source_commit": target.commit,
-        "goal": {"targets": _candidate_target_anchors(candidate) if candidate else []},
-        "marker_ids": [],
-        "target_block_ids": [],
-    }
-    if not isinstance(map_path, str) or not map_path.startswith("/"):
-        base["reason"] = "SymCC image config has no absolute feedback_map_path"
-        return base
-
-    quoted = shlex.quote(map_path)
-    dir_rc, _out, _err = docker_ops.exec_sh(
-        container, f"test -d {quoted}", timeout=15
-    )
-    if dir_rc == 0:
-        rc, listing, err = docker_ops.exec_sh(
-            container,
-            f"find {quoted} -maxdepth 1 -type f -name '*.jsonl' -print | sort",
-            timeout=30,
-        )
-        if rc:
-            base["reason"] = f"cannot enumerate feedback map directory: {err[-500:]}"
-            return base
-        paths = [line.strip() for line in listing.splitlines() if line.strip()]
-    else:
-        rc, _out, err = docker_ops.exec_sh(
-            container, f"test -f {quoted}", timeout=15
-        )
-        if rc:
-            base["reason"] = f"feedback map file/directory is missing: {err[-300:]}"
-            return base
-        paths = [map_path]
-    if not paths:
-        base["reason"] = "feedback map directory contains no JSONL files"
-        return base
-
-    contents: list[bytes] = []
-    total_size = 0
-    try:
-        for path in paths[:20_000]:
-            if not path.startswith(map_path.rstrip("/") + "/") and path != map_path:
-                raise ValueError(f"map path escaped configured directory: {path}")
-            _rc, size_text, _err = docker_ops.exec_sh(
-                container, f"stat -c %s -- {shlex.quote(path)}", timeout=15
-            )
-            size = int(size_text.strip())
-            total_size += size
-            if size < 0 or total_size > 128 * 1024 * 1024:
-                raise ValueError("feedback maps exceed the 128 MiB read limit")
-            contents.append(docker_ops.read_file(container, path))
-    except Exception as exc:
-        base["reason"] = f"cannot read feedback maps: {type(exc).__name__}: {exc}"
-        return base
-
-    try:
-        graph = load_json_map_files(contents)
-    except FeedbackMapError as exc:
-        base["reason"] = f"feedback map validation failed: {exc}"
-        return base
-    if graph["map_records_missing_commit"]:
-        base["reason"] = (
-            f"{graph['map_records_missing_commit']} feedback-map records do not declare "
-            "their source commit"
-        )
-        base["map_status"] = "version_unverified"
-        return base
-    if graph["source_commits"] != [target.commit]:
-        base["reason"] = (
-            f"feedback-map commits {graph['source_commits']!r} do not match target "
-            f"commit {target.commit!r}"
-        )
-        base["map_status"] = "version_mismatch"
-        return base
-
-    anchors = base["goal"]["targets"]
-    base["map_status"] = "ready"
-    base["map_record_count"] = graph["map_record_count"]
-    base["node_count"] = len(graph["nodes"])
-    base["source_location_count"] = len(graph["locations"])
-    if not anchors:
-        base["status"] = "goal_unresolved"
-        base["reason"] = "static finding has no structured or parseable target anchor"
-        base["graph"] = graph
-        return base
-    try:
-        marker_ids, target_block_ids = resolve_target_ids(
-            graph, base["goal"], source_root=target.source_root
-        )
-    except FeedbackMapError as exc:
-        base["status"] = "goal_unresolved"
-        base["reason"] = str(exc)
-        base["graph"] = graph
-        return base
-    base.update({
-        "status": "ready",
-        "marker_ids": marker_ids,
-        "target_block_ids": target_block_ids,
-        "target_marker_count": len(marker_ids),
-        "graph": graph,
-    })
-    return base
-
-
 def _protocol_sanitizer_event(output: str) -> bool:
     return bool(re.search(
         r"AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:|LeakSanitizer",
@@ -1732,14 +1345,11 @@ def _protocol_sanitizer_event(output: str) -> bool:
 def _run_protocol_binary(
     *, container: str, binary: str, request: ExecutionRequest, input_path: str,
     symcc_output: str | None = None,
-    extra_env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     argv = target_argv(binary, request.program_args, input_path)
     env = dict(request.env)
     if symcc_output is not None:
         env.update({"SYMCC_INPUT_FILE": input_path, "SYMCC_OUTPUT_DIR": symcc_output})
-    if extra_env:
-        env.update(extra_env)
     env_prefix = " ".join(
         f"{shlex.quote(key)}={shlex.quote(value)}" for key, value in env.items()
     )
@@ -1753,19 +1363,11 @@ def _run_protocol_binary(
         rc, stdout, stderr = docker_ops.exec_sh(
             container, command, timeout=request.timeout_s + 15
         )
-        duration = time.time() - started
-        timed_out = (
-            rc in {124, 137}
-            and duration >= max(0, request.timeout_s - 1)
-        )
         output = ((stdout or "") + "\n" + (stderr or ""))[-12_000:]
         return {
-            "status": (
-                "completed" if rc == 0 else "timed_out" if timed_out else "failed"
-            ),
+            "status": "completed" if rc == 0 else "failed",
             "exit_code": rc,
-            "duration_s": round(duration, 3),
-            "timed_out": timed_out,
+            "duration_s": round(time.time() - started, 3),
             "stdout": (stdout or "")[-12_000:],
             "stderr": (stderr or "")[-12_000:],
             "output_tail": output,
@@ -1782,449 +1384,6 @@ def _run_protocol_binary(
             "sanitizer_event": False,
             "error": f"{type(exc).__name__}: {exc}",
         }
-
-
-def _prepare_prebuilt_protocol_request(
-    *, container: str, target: TargetConfig, raw: bytes, filename: str,
-    round_id: int,
-) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    try:
-        request = parse_request(raw, filename=filename)
-    except (ExecutionRequestError, UnicodeDecodeError) as exc:
-        return {"schema_version": 1, "status": "invalid_request", "errors": [str(exc)]}, None
-    try:
-        rc, resolved_input, err = docker_ops.exec_sh(
-            container,
-            f"readlink -f -- {shlex.quote(request.input_path)}",
-            timeout=15,
-        )
-        resolved_input = resolved_input.strip()
-        if rc or not resolved_input.startswith(INPUT_ROOT + "/"):
-            raise ValueError(
-                f"input must resolve to a regular file below {INPUT_ROOT}: {err[-300:]}"
-            )
-        rc, _out, err = docker_ops.exec_sh(
-            container, f"test -f {shlex.quote(resolved_input)}", timeout=15
-        )
-        if rc:
-            raise ValueError(f"input is not a regular file: {request.input_path}: {err[-300:]}")
-        rc, size_text, err = docker_ops.exec_sh(
-            container,
-            f"stat -c %s -- {shlex.quote(resolved_input)}",
-            timeout=15,
-        )
-        if rc:
-            raise ValueError(f"input file does not exist: {request.input_path}")
-        try:
-            input_size = int(size_text.strip())
-        except ValueError as exc:
-            raise ValueError(f"cannot determine input size: {err[-300:]}") from exc
-        if input_size > 16 * 1024 * 1024:
-            raise ValueError("input exceeds the 16 MiB execution-protocol limit")
-        input_bytes = docker_ops.read_file(container, resolved_input)
-        if len(input_bytes) != input_size:
-            raise ValueError("input read was incomplete")
-    except Exception as exc:
-        return {
-            "schema_version": 1, "status": "invalid_request",
-            "request_id": request.request_id, "errors": [str(exc)],
-        }, None
-    digest = hashlib.sha256(input_bytes).hexdigest()
-    snapshot_path = f"{SNAPSHOT_ROOT}/{request.request_id}.bin"
-    try:
-        rc, _out, err = docker_ops.exec_sh(
-            container,
-            f"mkdir -p -- {shlex.quote(SNAPSHOT_ROOT)} && "
-            f"test ! -e {shlex.quote(snapshot_path)}",
-            timeout=15,
-        )
-        if rc:
-            raise RuntimeError(f"cannot reserve request snapshot: {err[-300:]}")
-        docker_ops.write_file(container, snapshot_path, input_bytes)
-        rc, _out, err = docker_ops.exec_sh(
-            container, f"chmod 0444 -- {shlex.quote(snapshot_path)}", timeout=15
-        )
-        if rc:
-            raise RuntimeError(f"cannot protect request snapshot: {err[-300:]}")
-    except Exception as exc:
-        return {
-            "schema_version": 1,
-            "protocol": "dynamic-execution",
-            "status": "execution_error",
-            "request_id": request.request_id,
-            "input_sha256": digest,
-            "errors": [f"{type(exc).__name__}: {exc}"],
-        }, None
-    clean_binary = _symcc_hidden_path(target.binary_path, "clean")
-    clean = _run_protocol_binary(
-        container=container, binary=clean_binary, request=request,
-        input_path=snapshot_path,
-    )
-
-    immediate = {
-        "schema_version": 1,
-        "protocol": "dynamic-execution",
-        "status": "submitted",
-        "request_id": request.request_id,
-        "job_id": f"symcc-{request.request_id}",
-        "input_id": digest,
-        "parent_input_id": request.parent_input_id,
-        "target_commit": target.commit,
-        "round_id": round_id,
-        "input_path": request.input_path,
-        "snapshot_path": snapshot_path,
-        "input_size": len(input_bytes),
-        "input_sha256": digest,
-        "clean": clean,
-        "symcc": {"status": "queued", "feedback_path": f"{FEEDBACK_ROOT}/{request.request_id}.json"},
-        "generated_replays": [],
-        "site_reached": None,
-        "site_reachability_note": (
-            "The clean target was run synchronously. SymCC execution and generated-input "
-            "replays are queued asynchronously; no source-site reachability is inferred."
-        ),
-    }
-    job = {
-        "request": request,
-        "round_id": round_id,
-        "input_size": len(input_bytes),
-        "input_sha256": digest,
-        "input_id": digest,
-        "input_bytes": input_bytes,
-        "snapshot_path": snapshot_path,
-        "clean": clean,
-        "sidecar_name": _symcc_sidecar_name(target.name),
-        "cancel_event": threading.Event(),
-    }
-    return immediate, job
-
-
-def _execute_prebuilt_protocol_symcc_request(
-    *, container: str, target: TargetConfig, job: dict[str, Any],
-    feedback_runtime: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Run concrete tracing and symbolic exploration in an isolated sidecar.
-
-    The agent container is never used for SymCC execution. Each job receives a
-    separate no-network container with an explicit memory/CPU budget and only
-    a request-scoped input/output bind mount. This prevents a solver OOM from
-    killing the PoC agent that is using the same target.
-    """
-    request: ExecutionRequest = job["request"]
-    round_id = int(job["round_id"])
-    symcc_cfg = target.symcc_runtime or {}
-    memory_limit, sidecar_cpus, _max_concurrent = _symcc_sidecar_settings(symcc_cfg)
-    clean_binary = shlex.split(target.binary_path)[0]
-    symcc_binary = shlex.split(str(symcc_cfg["binary_path"]))[0]
-    snapshot_path = str(job.get("snapshot_path") or request.input_path)
-    input_bytes = job.get("input_bytes")
-    if not isinstance(input_bytes, bytes):
-        input_bytes = docker_ops.read_file(container, snapshot_path)
-    if len(input_bytes) != int(job["input_size"]):
-        raise RuntimeError("request snapshot bytes are unavailable or incomplete")
-
-    sidecar_root = "/symcc-job"
-    sidecar_input = f"{sidecar_root}/input.bin"
-    out_dir = f"{sidecar_root}/symcc-results"
-    trace_dir = f"{sidecar_root}/traces"
-    with tempfile.TemporaryDirectory(prefix="harness-symcc-feedback-") as temporary:
-        host_root = Path(temporary)
-        (host_root / "traces").mkdir()
-        (host_root / "symcc-results").mkdir()
-        (host_root / "input.bin").write_bytes(input_bytes)
-        sidecar_name = str(job.get("sidecar_name") or _symcc_sidecar_name(target.name))
-        cancel_event = job.get("cancel_event")
-        run_params = DockerRunParams(
-            network="none",
-            memory=memory_limit,
-            cpus=sidecar_cpus,
-            mounts=(DockerMount(str(host_root), sidecar_root, read_only=False),),
-            entrypoint=("/bin/sh",),
-            command=("-c", "while :; do sleep 3600; done"),
-        )
-        started_sidecar = False
-        try:
-            docker_ops.run(
-                target.runtime_image_tag,
-                sidecar_name,
-                network="none",
-                memory=memory_limit,
-                shell="/bin/sh",
-                run_params=run_params,
-            )
-            started_sidecar = True
-            if isinstance(cancel_event, threading.Event) and cancel_event.is_set():
-                raise InterruptedError("SymCC feedback job cancelled during sidecar startup")
-            target_ids = (feedback_runtime or {}).get("marker_ids", [])
-            symcc_args = tuple(symcc_cfg.get("program_args") or request.program_args)
-            concrete_request = ExecutionRequest(
-                request.request_id, sidecar_input,
-                symcc_args, request.timeout_s, request.env,
-            )
-            trace_env = {
-                "SYMCC_FEEDBACK_TRACE": f"{trace_dir}/input.trace",
-                "SYMCC_FEEDBACK_CAPACITY": str(
-                    symcc_cfg.get("feedback_capacity") or 1_000_000
-                ),
-                "SYMCC_NO_SYMBOLIC_INPUT": "1",
-            }
-            if target_ids:
-                trace_env["SYMCC_FEEDBACK_TARGET_IDS"] = ",".join(
-                    str(site_id) for site_id in target_ids
-                )
-            input_trace_execution = _run_protocol_binary(
-                container=sidecar_name, binary=symcc_binary,
-                request=concrete_request, input_path=sidecar_input,
-                symcc_output=f"{out_dir}/concrete-input", extra_env=trace_env,
-            )
-            initial_observation = _summarize_symcc_trace_bytes(
-                _read_container_trace(sidecar_name, f"{trace_dir}/input.trace"),
-                feedback_runtime,
-            )
-
-            symcc_request = ExecutionRequest(
-                request.request_id, sidecar_input,
-                symcc_args, request.timeout_s, request.env,
-            )
-            symcc = _run_protocol_binary(
-                container=sidecar_name, binary=symcc_binary,
-                request=symcc_request, input_path=sidecar_input,
-                symcc_output=out_dir,
-            )
-            oom_kills = _symcc_sidecar_oom_kills(sidecar_name)
-            symcc["worker"] = {
-                "isolated": True,
-                "network": "none",
-                "memory_limit": memory_limit,
-                "cpus": sidecar_cpus,
-                "oom_kill_count": oom_kills,
-            }
-            if oom_kills and symcc.get("exit_code") == 137:
-                symcc["status"] = "resource_exhausted"
-                symcc.setdefault("errors", []).append(
-                    "isolated SymCC worker was OOM-killed; the agent container was unaffected"
-                )
-
-            seed_paths = sorted(
-                (path for path in (host_root / "symcc-results").iterdir()
-                 if path.is_file()),
-                key=lambda path: path.name,
-            )[:8]
-            generated: list[dict[str, Any]] = []
-            total_seed_bytes = 0
-            for index, seed_path in enumerate(seed_paths):
-                size = seed_path.stat().st_size
-                if size <= 0 or size > 1024 * 1024 or total_seed_bytes + size > 16 * 1024 * 1024:
-                    continue
-                data = seed_path.read_bytes()
-                if len(data) != size:
-                    continue
-                total_seed_bytes += size
-                sidecar_seed = f"{out_dir}/{seed_path.name}"
-                replay_path = f"{INPUT_ROOT}/symcc-{request.request_id}-{index:03d}.bin"
-                docker_ops.write_file(container, replay_path, data)
-                replay_request = ExecutionRequest(
-                    request.request_id, sidecar_seed,
-                    request.program_args, min(request.timeout_s, 10), request.env,
-                )
-                replay = _run_protocol_binary(
-                    container=sidecar_name, binary=clean_binary,
-                    request=replay_request, input_path=sidecar_seed,
-                )
-                candidate_symcc_request = ExecutionRequest(
-                    request.request_id, sidecar_seed,
-                    symcc_args, min(request.timeout_s, 10), request.env,
-                )
-                candidate_trace_run = _run_protocol_binary(
-                    container=sidecar_name, binary=symcc_binary,
-                    request=candidate_symcc_request,
-                    input_path=sidecar_seed,
-                    symcc_output=f"{out_dir}/concrete-{index:03d}",
-                    extra_env={
-                        "SYMCC_FEEDBACK_CAPACITY": str(
-                            symcc_cfg.get("feedback_capacity") or 1_000_000
-                        ),
-                        **({
-                            "SYMCC_FEEDBACK_TARGET_IDS": ",".join(
-                                str(site_id) for site_id in target_ids
-                            )
-                        } if target_ids else {}),
-                        "SYMCC_NO_SYMBOLIC_INPUT": "1",
-                        "SYMCC_FEEDBACK_TRACE": f"{trace_dir}/generated-{index:03d}.trace",
-                    },
-                )
-                site_feedback = _summarize_symcc_trace_bytes(
-                    _read_container_trace(
-                        sidecar_name, f"{trace_dir}/generated-{index:03d}.trace"
-                    ),
-                    feedback_runtime,
-                )
-                generated.append({
-                    "path": replay_path,
-                    "size": size,
-                    "sha256": hashlib.sha256(data).hexdigest(),
-                    "replay": replay,
-                    "symcc_execution": candidate_trace_run,
-                    "symcc_observation": site_feedback,
-                })
-            symcc.update({
-                "testcase_count": len(generated),
-                "testcases": [
-                    {key: item[key] for key in ("path", "size", "sha256")}
-                    for item in generated
-                ],
-            })
-            replays = generated
-        finally:
-            if started_sidecar:
-                docker_ops.rm(sidecar_name)
-
-    return {
-        "schema_version": 1,
-        "protocol": "dynamic-execution",
-        "status": "completed",
-        "request_id": request.request_id,
-        "round_id": round_id,
-        "input_path": request.input_path,
-        "snapshot_path": snapshot_path,
-        "input_size": job["input_size"],
-        "job_id": f"symcc-{request.request_id}",
-        "input_id": job["input_id"],
-        "parent_input_id": request.parent_input_id,
-        "target_commit": target.commit,
-        "input_sha256": job["input_sha256"],
-        "clean": job["clean"],
-        "input_trace_execution": input_trace_execution,
-        "symcc": symcc,
-        "symcc_observation": initial_observation,
-        "generated_replays": replays,
-        "site_reached": initial_observation.get(
-            "exact_target_reached",
-            initial_observation.get("target_reached"),
-        ),
-        "site_reachability_note": (
-            "site_reached describes the original submitted input's instrumented execution. "
-            "Generated testcase observations are reported separately. A negative is exact "
-            "only for a complete trace or a complete trace with a valid runtime target marker."
-        ),
-    }
-
-
-def _read_container_trace(container: str, path: str) -> bytes:
-    """Read private SymCC traces inside the worker container.
-
-    SymCC creates trace files with mode 0600. The worker container commonly
-    runs as root, so its files are not readable by the unprivileged host user
-    through the bind mount. `docker exec cat` reads them without weakening the
-    file permissions on the shared workspace.
-    """
-    try:
-        return docker_ops.read_file(container, path)
-    except Exception:
-        return b""
-
-
-def _symcc_sidecar_oom_kills(container: str) -> int | None:
-    rc, output, _err = docker_ops.exec_sh(
-        container, "cat /sys/fs/cgroup/memory.events", timeout=5
-    )
-    if rc:
-        return None
-    for line in output.splitlines():
-        key, _, value = line.partition(" ")
-        if key == "oom_kill":
-            try:
-                return int(value)
-            except ValueError:
-                return None
-    return None
-
-
-def _summarize_symcc_trace_bytes(
-    raw: bytes, feedback_runtime: dict[str, Any] | None
-) -> dict[str, Any]:
-    trace = parse_trace(raw) if raw else None
-    if trace is None:
-        return {
-            "feedback_schema_version": 2,
-            "status": "missing",
-            "exact_target_reached": None,
-            "target_operation_reached": None,
-            "target_function_entered": None,
-            "target_block_entered": None,
-            "target_reached": None,
-            "target_block_reached": None,
-            "target_reachability": "unknown",
-            "allowed_conclusion": "target reach is unknown because the runtime trace file is missing",
-            "reason": "runtime trace file is missing",
-        }
-    if feedback_runtime is None:
-        return {
-            "feedback_schema_version": 2,
-            "status": "map_unavailable",
-            "trace_status": trace.status,
-            "exact_target_reached": None,
-            "target_operation_reached": None,
-            "target_function_entered": None,
-            "target_block_entered": None,
-            "target_reached": None,
-            "target_block_reached": None,
-            "target_reachability": "unknown",
-            "allowed_conclusion": "target reach is unknown because source/CFG feedback context is unavailable",
-            "reason": "source/CFG feedback runtime context is unavailable",
-        }
-    map_status = feedback_runtime.get("status")
-    graph = feedback_runtime.get("graph")
-    marker_ids = feedback_runtime.get("marker_ids", [])
-    target_block_ids = feedback_runtime.get("target_block_ids", [])
-    if graph is None or not marker_ids:
-        return {
-            "feedback_schema_version": 2,
-            "status": map_status or "unavailable",
-            "trace_status": trace.status,
-            "exact_target_reached": None,
-            "target_operation_reached": None,
-            "target_function_entered": None,
-            "target_block_entered": None,
-            "target_reached": None,
-            "target_block_reached": None,
-            "target_reachability": "unknown",
-            "observed_event_count": len(trace.events),
-            "allowed_conclusion": "target reach is unknown because target anchors could not be resolved",
-            "reason": feedback_runtime.get("reason")
-            or "target anchors could not be resolved through the versioned map",
-        }
-    result = summarize_trace(
-        graph, trace, marker_ids=marker_ids, target_block_ids=target_block_ids
-    )
-    result["status"] = "ready" if trace.status in {"completed", "interrupted"} else trace.status
-    result["map_status"] = map_status
-    result["map_commit"] = feedback_runtime.get("source_commit")
-    result["goal"] = feedback_runtime.get("goal")
-    return result
-
-
-def _read_symcc_trace_feedback(
-    *, container: str, path: str, feedback_runtime: dict[str, Any] | None
-) -> dict[str, Any]:
-    """Read one bounded execution trace and join it with its versioned map."""
-    try:
-        raw = docker_ops.read_file(container, path)
-    except Exception as exc:
-        return {
-            "feedback_schema_version": 2,
-            "status": "read_error",
-            "exact_target_reached": None,
-            "target_operation_reached": None,
-            "target_function_entered": None,
-            "target_block_entered": None,
-            "target_reached": None,
-            "target_block_reached": None,
-            "target_reachability": "unknown",
-            "allowed_conclusion": "target reach is unknown because the runtime trace could not be read",
-            "reason": f"{type(exc).__name__}: {exc}",
-        }
-    return _summarize_symcc_trace_bytes(raw, feedback_runtime)
 
 
 def _execute_prebuilt_protocol_request(
@@ -2469,17 +1628,7 @@ async def _run_prebuilt_symcc_agent(
     max_turns: int, system_prompt: str | None, max_resume_attempts: int,
     transcript_path: str | None, progress_prefix: str | None,
     result_path: str | None,
-    phase_timeout_s: float | None = None,
-    supervisor_nudge=None,
 ) -> tuple[AgentResult, dict[str, float], dict[str, Any]]:
-    """Run the prebuilt-SymCC execution-protocol agent (2026-09-23 behavior).
-
-    Rolled back from the target-site feedback design: the worker executes each
-    request synchronously and returns the neutral per-round record, and the
-    agent session runs to its natural end.  There is no feedback runtime, no
-    completion predicate, and no feedback-driven nudge; only the optional
-    supervisor progress nudge remains.
-    """
     started = time.time()
     stop = asyncio.Event()
     worker = asyncio.create_task(_prebuilt_protocol_worker(
@@ -2490,10 +1639,8 @@ async def _run_prebuilt_symcc_agent(
             prompt=prompt, max_turns=max_turns, model=model, container=container,
             transcript_path=transcript_path, progress_prefix=progress_prefix,
             system_prompt=system_prompt, max_resume_attempts=max_resume_attempts,
-            tools=["Read", "Write", "Bash"],
-            phase_timeout_s=phase_timeout_s,
-            idle_timeout_s=phase_timeout_s,
-            progress_nudge=supervisor_nudge,
+            tools=["Read", "Write", "Bash"], phase_timeout_s=1800.0,
+            idle_timeout_s=1800.0,
         )
     finally:
         stop.set()
@@ -2509,17 +1656,6 @@ async def _run_prebuilt_symcc_agent(
                 "schema_version": 1, "provider": "symcc-prebuilt", "status": "incomplete",
                 "errors": ["execution protocol worker did not stop cleanly"],
             }
-    _annotate_first_request_policy(summary, result)
-    if result_path:
-        output = Path(result_path)
-        output.mkdir(parents=True, exist_ok=True)
-        (output / "summary.json").write_text(
-            json.dumps(summary, indent=2, ensure_ascii=False) + "\n"
-        )
-        records = summary.get("records") or []
-        with (output / "requests.jsonl").open("w") as stream:
-            for record in records:
-                stream.write(json.dumps(record, ensure_ascii=False) + "\n")
     return result, {
         "dynamic_validation": time.time() - started,
         "execution_protocol_requests": float(summary.get("requests", 0)),
@@ -2527,515 +1663,6 @@ async def _run_prebuilt_symcc_agent(
         "execution_protocol_errors": float(summary.get("errors", 0)),
         "symbolic_execution_session": float(summary.get("symcc_execution_s", 0)),
     }, summary
-
-
-def _generic_dynamic_evidence_ledger(
-    result: DynamicValidationResult,
-) -> list[dict[str, Any]]:
-    """Build a provider-neutral ledger from persisted dynamic evidence.
-
-    The prebuilt SymCC protocol writes a richer machine-owned ledger directly
-    from request/feedback records.  Non-SymCC arms still need a comparable
-    audit trail so experiment summaries do not reduce them to only the legacy
-    status string.  This generic ledger is intentionally conservative: it only
-    records bounded iteration records, additional crash submissions, accepted
-    final PoC artifacts, and the final status breakdown.
-    """
-
-    events: list[dict[str, Any]] = []
-
-    def add(event: dict[str, Any]) -> None:
-        event = {key: value for key, value in event.items() if value is not None}
-        events.append(event)
-
-    for record in result.iterations:
-        if not isinstance(record, dict):
-            continue
-        observations = (
-            record.get("observations")
-            if isinstance(record.get("observations"), dict)
-            else {}
-        )
-        machine = (
-            record.get("machine_evidence")
-            if isinstance(record.get("machine_evidence"), dict)
-            else {}
-        )
-        add({
-            "event": "iteration_recorded",
-            "round_id": record.get("round_id"),
-            "candidate_id": record.get("candidate_id"),
-            "request_id": record.get("request_id"),
-            "input_id": record.get("input_id"),
-            "decision": record.get("decision"),
-            "site_reached": observations.get("site_reached"),
-            "sanitizer_event": observations.get("sanitizer_event"),
-            "bad_state_observed": observations.get("bad_state_observed"),
-            "bad_effect_observed": observations.get("bad_effect_observed"),
-            "matched_candidate": observations.get("matched_candidate"),
-            "machine_provider": machine.get("provider"),
-            "exact_target_reached": machine.get("exact_target_reached"),
-            "target_operation_reached": machine.get("target_operation_reached"),
-        })
-
-    for item in result.additional_crashes:
-        add({
-            "event": "additional_crash_recorded",
-            "candidate_id": result.candidate_id,
-            "finding_id": item.finding_id,
-            "summary": item.summary[:500],
-            "poc_path": item.crash.poc_path,
-            "poc_kind": item.crash.poc_kind,
-            "crash_type": item.crash.crash_type,
-            "exit_code": item.crash.exit_code,
-        })
-
-    if result.crash is not None:
-        add({
-            "event": "validated_crash_poc_submitted",
-            "candidate_id": result.candidate_id,
-            "poc_path": result.crash.poc_path,
-            "poc_kind": result.crash.poc_kind,
-            "crash_type": result.crash.crash_type,
-            "exit_code": result.crash.exit_code,
-        })
-    if result.logic is not None:
-        add({
-            "event": "validated_logic_poc_submitted",
-            "candidate_id": result.candidate_id,
-            "poc_path": result.logic.poc_path,
-            "poc_kind": result.logic.poc_kind,
-            "logic_type": result.logic.logic_type,
-            "exit_code": result.logic.exit_code,
-        })
-
-    add({
-        "event": "dynamic_result_finalized",
-        "candidate_id": result.candidate_id,
-        "status": result.status,
-        "target_site_status": result.status_breakdown.get("target_site_status"),
-        "poc_status": result.status_breakdown.get("poc_status"),
-        "grade_status": result.status_breakdown.get("grade_status"),
-        "additional_findings_status": result.status_breakdown.get(
-            "additional_findings_status"
-        ),
-        "feedback_quality_status": result.status_breakdown.get(
-            "feedback_quality_status"
-        ),
-    })
-
-    for index, event in enumerate(events, start=1):
-        event["seq"] = index
-    return events
-
-
-
-def _persist_generic_dynamic_evidence_ledger(
-    result_path: str | None,
-    result: DynamicValidationResult,
-) -> None:
-    """Persist a minimal evidence ledger for non-SymCC dynamic arms."""
-    if not result_path:
-        return
-    output = Path(result_path)
-    root = output.parent if output.name == "symbolic_execution" else output
-    try:
-        root.mkdir(parents=True, exist_ok=True)
-        ledger = _generic_dynamic_evidence_ledger(result)
-        (root / "evidence_ledger.jsonl").write_text(
-            "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in ledger)
-        )
-    except OSError:
-        return
-
-
-
-def _dynamic_completion_predicate(result: AgentResult) -> bool:
-    """Stop dynamic agents after a complete final status message is visible.
-
-    Some backends keep auto-continuing after emitting valid final XML tags,
-    which can turn a completed validation into a later watchdog error.  This
-    predicate is intentionally conservative: it only accepts assistant-authored
-    status messages with enough surrounding fields to be parseable by the
-    dynamic result contract.
-    """
-    text = result.find_tagged_message("dynamic_status")
-    status = (parse_xml_tag(text, "dynamic_status") or "").strip()
-    if status not in (_DYNAMIC_STATUSES | {"validated"}):
-        return False
-    if parse_xml_tag(text, "candidate_id") is None:
-        return False
-    if status == "validated":
-        return parse_xml_tag(text, "poc_path") is not None
-    return parse_xml_tag(text, "reason") is not None
-
-
-
-def _make_dynamic_completion_predicate(
-    supervisor: SearchPolicySupervisor | None,
-):
-    """Build the dynamic completion predicate, optionally guarded by supervisor.
-
-    After a supervisor correction, a final status is not accepted until the
-    worker performs at least one more tool action.  This keeps corrections from
-    becoming an immediate no-PoC exit path.
-    """
-
-    def _predicate(result: AgentResult) -> bool:
-        if not _dynamic_completion_predicate(result):
-            return False
-        if supervisor is not None and not supervisor.final_status_allowed(
-            result.messages
-        ):
-            return False
-        return True
-
-    return _predicate
-
-
-
-def _make_validation_supervisor(
-    mode: str | None,
-    *,
-    supervisor_result_path: str | None,
-    transcript_path: str | None,
-) -> SearchPolicySupervisor | None:
-    mode = (mode or "rules").strip().lower()
-    if mode == "off":
-        return None
-    if mode != "rules":
-        raise ValueError(f"unsupported supervisor mode: {mode}")
-    event_path = supervisor_result_path
-    if event_path is None and transcript_path:
-        event_path = str(Path(transcript_path).with_name("supervisor_events.jsonl"))
-    return SearchPolicySupervisor(mode=mode, event_path=event_path)
-
-
-
-def _supervisor_decision_handler(container: str, target: TargetConfig):
-    """Return a side-effect hook for supervisor interventions."""
-
-    def _handle(decision) -> None:
-        if decision.violation_type == "background_worker_sprawl":
-            _terminate_target_search_processes(container, target)
-
-    return _handle
-
-
-
-def _terminate_target_search_processes(container: str, target: TargetConfig) -> None:
-    """Best-effort cleanup for target/fuzzer workers spawned by the agent.
-
-    This is not a safety sandbox. It prevents low-value background searches
-    from consuming the experiment budget after the supervisor has corrected the
-    worker's strategy.
-    """
-    target_name = Path(target.binary_path).name if target.binary_path else ""
-    target_q = shlex.quote(target_name)
-    try:
-        docker_ops.exec_sh(
-            container,
-            "target=" + target_q + "; "
-            "pids=$(ps -eo pid=,comm= | awk -v target=\"$target\" "
-            "'$2 != \"opencode\" && ("
-            "(target != \"\" && $2 == target) || "
-            "$2 ~ /fuzzer$/ || $2 ~ /_fuzzer$/"
-            ") {print $1}'); "
-            "[ -z \"$pids\" ] || kill -TERM $pids; sleep 1; "
-            "pids=$(ps -eo pid=,comm= | awk -v target=\"$target\" "
-            "'$2 != \"opencode\" && ("
-            "(target != \"\" && $2 == target) || "
-            "$2 ~ /fuzzer$/ || $2 ~ /_fuzzer$/"
-            ") {print $1}'); "
-            "[ -z \"$pids\" ] || kill -KILL $pids",
-            timeout=5,
-        )
-    except Exception:
-        return
-
-
-
-
-def _annotate_first_request_policy(
-    summary: dict[str, Any], result: AgentResult
-) -> None:
-    """Add an auditable first-input deadline check to protocol summaries.
-
-    The prompt requires the first runnable input before both five minutes and
-    25 meaningful tool calls.  The worker can measure wall time, while the
-    transcript provides tool-call timestamps.  This post-process keeps the
-    policy observable without interrupting exploration.
-    """
-    first_request_s = summary.get("time_to_first_request_s")
-    worker_started_s = summary.get("worker_started_wall_time_s")
-    policy: dict[str, Any] = {
-        "time_limit_s": _FIRST_INPUT_DEADLINE_S,
-        "tool_call_limit": _FIRST_INPUT_TOOL_CALL_LIMIT,
-        "status": "unknown",
-        "satisfied": None,
-        "time_ok": None,
-        "tool_call_ok": None,
-        "first_request_tool_calls": None,
-    }
-    warnings = summary.get("warnings")
-    if not isinstance(warnings, list):
-        warnings = []
-
-    if isinstance(first_request_s, (int, float)) and not isinstance(first_request_s, bool):
-        first_request_s = float(first_request_s)
-        policy["time_ok"] = first_request_s <= _FIRST_INPUT_DEADLINE_S
-        policy["status"] = "evaluated"
-    else:
-        policy["status"] = "missing_first_request"
-        warnings.append("no execution-protocol request was submitted")
-
-    if (
-        isinstance(first_request_s, (int, float))
-        and not isinstance(first_request_s, bool)
-        and isinstance(worker_started_s, (int, float))
-        and not isinstance(worker_started_s, bool)
-    ):
-        cutoff_ms = int(round((float(worker_started_s) + float(first_request_s)) * 1000))
-        tool_calls = _agent_tool_calls_before_timestamp_ms(result, cutoff_ms)
-        policy["first_request_tool_calls"] = tool_calls
-        policy["tool_call_ok"] = tool_calls <= _FIRST_INPUT_TOOL_CALL_LIMIT
-
-    if policy["time_ok"] is not None and policy["tool_call_ok"] is not None:
-        policy["satisfied"] = bool(policy["time_ok"] and policy["tool_call_ok"])
-        if not policy["satisfied"]:
-            warnings.append(
-                "first executable input missed the prompt-level deadline "
-                f"(time_ok={policy['time_ok']}, "
-                f"tool_call_ok={policy['tool_call_ok']})"
-            )
-    elif policy["status"] == "evaluated":
-        warnings.append(
-            "first executable input time was measured, but transcript timestamps "
-            "were insufficient to evaluate the tool-call deadline"
-        )
-
-    summary["first_request_policy"] = policy
-    if warnings:
-        summary["warnings"] = warnings
-
-
-def _prebuilt_first_request_nudge(container: str):
-    state = {"nudged": False, "request_seen": False}
-
-    def nudge(result: AgentResult) -> str | None:
-        if state["nudged"] or state["request_seen"]:
-            return None
-        if result.tool_call_count < _FIRST_INPUT_NUDGE_TOOL_CALLS:
-            return None
-        if _execution_protocol_has_request(container):
-            state["request_seen"] = True
-            return None
-        state["nudged"] = True
-        return (
-            "You are at the first-input tool-call deadline and have not yet "
-            "submitted any executable input through the Harness execution "
-            "protocol. Stop further source reconnaissance now. Your next tool "
-            "call must create and run the best runnable "
-            "target-format baseline or candidate input you can, write a fresh "
-            "request JSON under /work/validation/execution/requests, execute it "
-            "with /work/validation/run-input, and record its request_id/input_id. "
-            "After that, continue source analysis using the measured result and "
-            "any asynchronous SymCC feedback. Do not answer or summarize before "
-            "submitting this first request."
-        )
-
-    return nudge
-
-
-def _prebuilt_feedback_ready_nudge(container: str):
-    state = {
-        "nudged": False,
-        "followup_seen": False,
-        "first_request_seen_at_tool_call": None,
-    }
-
-    def nudge(result: AgentResult) -> str | None:
-        if state["nudged"] or state["followup_seen"]:
-            return None
-
-        request_ids = _execution_protocol_request_ids(container)
-        if len(request_ids) == 0:
-            return None
-        if len(request_ids) > 1:
-            state["followup_seen"] = True
-            return None
-        if state["first_request_seen_at_tool_call"] is None:
-            state["first_request_seen_at_tool_call"] = result.tool_call_count
-
-        min_tool_calls = max(
-            _FIRST_INPUT_TOOL_CALL_LIMIT,
-            int(state["first_request_seen_at_tool_call"])
-            + _FEEDBACK_READY_NUDGE_GRACE_TOOL_CALLS,
-        )
-        if result.tool_call_count < min_tool_calls:
-            return None
-
-        ready_ids = [
-            request_id for request_id in _ready_feedback_request_ids(container)
-            if request_id in set(request_ids)
-        ]
-        if not ready_ids:
-            return None
-
-        request_id = ready_ids[0]
-        state["nudged"] = True
-        return (
-            f"SymCC feedback is now ready for request_id={request_id}, but no "
-            "follow-up execution-protocol request has been submitted yet. Stop "
-            "open-ended source reconnaissance. Your next tool call must run "
-            f"`/work/validation/read-feedback {request_id}` and preserve the "
-            "machine fields exactly: exact_target_reached, "
-            "target_operation_reached, target_function_entered, "
-            "allowed_conclusion, best_actual_locations, and any generated "
-            "replay inputs. Then immediately decide one of two actions: submit "
-            "the next improved input through /work/validation/run-input, or "
-            "finalize only if the machine evidence plus a replayable PoC justifies "
-            "that conclusion. Do not keep testing target inputs by invoking the "
-            "target binary directly outside the execution protocol."
-        )
-
-    return nudge
-
-
-def _prebuilt_feedback_followup_nudge(container: str):
-    state = {
-        "nudged": False,
-        "followup_seen": False,
-        "ready_read_seen_at_tool_call": None,
-    }
-
-    def nudge(result: AgentResult) -> str | None:
-        if state["nudged"] or state["followup_seen"]:
-            return None
-
-        request_ids = _execution_protocol_request_ids(container)
-        if len(request_ids) == 0:
-            return None
-        if len(request_ids) > 1:
-            state["followup_seen"] = True
-            return None
-
-        ready_read_ids = {
-            str(event["request_id"])
-            for event in _read_feedback_read_events(container)
-            if event.get("status") == "ready"
-        }
-        actionable_ids = sorted(ready_read_ids.intersection(request_ids))
-        if not actionable_ids:
-            return None
-
-        if state["ready_read_seen_at_tool_call"] is None:
-            state["ready_read_seen_at_tool_call"] = result.tool_call_count
-            return None
-
-        min_tool_calls = (
-            int(state["ready_read_seen_at_tool_call"])
-            + _FEEDBACK_READ_FOLLOWUP_NUDGE_GRACE_TOOL_CALLS
-        )
-        if result.tool_call_count < min_tool_calls:
-            return None
-
-        request_id = actionable_ids[0]
-        state["nudged"] = True
-        return (
-            f"You have already consumed ready SymCC feedback for request_id={request_id}, "
-            "and no follow-up execution-protocol request has been submitted. Stop "
-            "additional source/map reconnaissance now. Your next tool call must "
-            "take one of these bounded actions: either create and run a fresh "
-            "round-002 request through /work/validation/run-input using the best "
-            "current hypothesis or a selected generated replay, or write the "
-            "iteration record and emit final inline dynamic_status tags if you "
-            "can justify stopping with the machine evidence. Do not read more "
-            "source files or inspect more feedback-map entries before taking one "
-            "of those actions."
-        )
-
-    return nudge
-
-
-def _prebuilt_progress_nudge(container: str):
-    first_request_nudge = _prebuilt_first_request_nudge(container)
-    feedback_ready_nudge = _prebuilt_feedback_ready_nudge(container)
-    feedback_followup_nudge = _prebuilt_feedback_followup_nudge(container)
-
-    def nudge(result: AgentResult) -> str | None:
-        message = first_request_nudge(result)
-        if message:
-            return message
-        message = feedback_ready_nudge(result)
-        if message:
-            return message
-        return feedback_followup_nudge(result)
-
-    return nudge
-
-
-def _execution_protocol_request_ids(container: str) -> list[str]:
-    roots = " ".join(
-        shlex.quote(path) for path in (PENDING_ROOT, PROCESSED_ROOT, RESPONSE_ROOT)
-    )
-    rc, out, _err = docker_ops.exec_sh(
-        container,
-        f"find {roots} -maxdepth 1 -type f -name '*.json' -print 2>/dev/null",
-        timeout=10,
-    )
-    if rc != 0:
-        return []
-    request_ids: set[str] = set()
-    for line in out.splitlines():
-        name = Path(line.strip()).name
-        if name.endswith(".json"):
-            request_ids.add(name[:-5])
-    return sorted(request_ids)
-
-
-def _execution_protocol_has_request(container: str) -> bool:
-    return bool(_execution_protocol_request_ids(container))
-
-
-def _ready_feedback_request_ids(container: str) -> list[str]:
-    rc, out, _err = docker_ops.exec_sh(
-        container,
-        (
-            f"find {shlex.quote(FEEDBACK_ROOT)} -maxdepth 1 -type f "
-            "-name '*.json' -print 2>/dev/null"
-        ),
-        timeout=10,
-    )
-    if rc != 0:
-        return []
-    request_ids: set[str] = set()
-    for line in out.splitlines():
-        name = Path(line.strip()).name
-        if name.endswith(".json"):
-            request_ids.add(name[:-5])
-    return sorted(request_ids)
-
-
-def _agent_tool_calls_before_timestamp_ms(
-    result: AgentResult, cutoff_timestamp_ms: int
-) -> int:
-    """Count transcript tool events at or before an epoch-millisecond cutoff."""
-    count = 0
-    for event in result.messages:
-        if not isinstance(event, dict):
-            continue
-        timestamp = event.get("timestamp")
-        if isinstance(timestamp, str) and timestamp.isdigit():
-            timestamp = int(timestamp)
-        if not isinstance(timestamp, (int, float)) or isinstance(timestamp, bool):
-            continue
-        if int(timestamp) > cutoff_timestamp_ms:
-            continue
-        part = event.get("part") if isinstance(event.get("part"), dict) else {}
-        if event.get("type") == "tool" or event.get("type") == "tool_use" or part.get("type") == "tool":
-            count += 1
-    return count
 
 
 @contextmanager
@@ -3114,164 +1741,6 @@ def _parse_exit_code(value: str | None) -> int:
     return int(value) if value.lstrip("-").isdigit() else -1
 
 
-def _collect_additional_crashes(
-    container: str, detector: str
-) -> tuple[list[AdditionalCrashSubmission], list[str]]:
-    """Read bounded, separately submitted crash findings without affecting the primary one."""
-    try:
-        exists_rc, _out, _err = docker_ops.exec_sh(
-            container, f"test -f {_ADDITIONAL_CRASHES_PATH}", timeout=15
-        )
-    except Exception as exc:
-        return [], [f"additional-crash manifest unavailable: {exc}"]
-    if exists_rc:
-        return [], []
-    try:
-        symlink_rc, _out, _err = docker_ops.exec_sh(
-            container, f"test ! -L {_ADDITIONAL_CRASHES_PATH}", timeout=15
-        )
-    except Exception as exc:
-        return [], [f"cannot validate additional-crash manifest: {exc}"]
-    if symlink_rc:
-        return [], ["additional-crash manifest must not be a symlink"]
-    try:
-        size_text = docker_ops.exec_sh(
-            container, f"stat -c %s {_ADDITIONAL_CRASHES_PATH}", timeout=15
-        )[1].strip()
-        manifest_size = int(size_text)
-    except Exception as exc:
-        return [], [f"cannot size additional-crash manifest: {exc}"]
-    if manifest_size < 0 or manifest_size > 1_000_000:
-        return [], ["additional-crash manifest exceeds 1000000 bytes"]
-    try:
-        raw = docker_ops.read_file(container, _ADDITIONAL_CRASHES_PATH)
-    except Exception as exc:
-        return [], [f"cannot read additional-crash manifest: {exc}"]
-    if len(raw) != manifest_size:
-        return [], ["additional-crash manifest changed while being read"]
-
-    findings: list[AdditionalCrashSubmission] = []
-    errors: list[str] = []
-    seen: set[str] = set()
-    total_poc_bytes = 0
-    for line_number, line in enumerate(raw.splitlines(), start=1):
-        if not line.strip():
-            continue
-        if len(findings) >= _MAX_ADDITIONAL_CRASHES:
-            errors.append(f"line {line_number}: maximum of {_MAX_ADDITIONAL_CRASHES} submissions exceeded")
-            break
-        try:
-            entry = json.loads(line)
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            errors.append(f"line {line_number}: invalid JSON: {exc}")
-            continue
-        if not isinstance(entry, dict):
-            errors.append(f"line {line_number}: submission must be a JSON object")
-            continue
-        required = {
-            "finding_id", "summary", "poc_path", "reproduction_command",
-            "crash_type", "exit_code", "crash_output", "dup_check",
-        }
-        allowed = required | {"poc_kind"}
-        missing = sorted(required - entry.keys())
-        unexpected = sorted(entry.keys() - allowed)
-        if missing or unexpected:
-            detail = []
-            if missing:
-                detail.append("missing " + ", ".join(missing))
-            if unexpected:
-                detail.append("unexpected " + ", ".join(unexpected))
-            errors.append(
-                f"line {line_number}: fields do not match the "
-                f"additional-crash schema ({'; '.join(detail)}); expected "
-                f"{', '.join(sorted(allowed))}"
-            )
-            continue
-        finding_id = entry.get("finding_id")
-        if not isinstance(finding_id, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", finding_id):
-            errors.append(f"line {line_number}: invalid finding_id")
-            continue
-        if finding_id in seen:
-            errors.append(f"line {line_number}: duplicate finding_id {finding_id!r}")
-            continue
-        expected_path = f"{_ADDITIONAL_CRASH_ROOT}/{finding_id}/poc.bin"
-        if entry.get("poc_path") != expected_path:
-            errors.append(f"line {line_number}: poc_path must be {expected_path!r}")
-            continue
-        command = entry.get("reproduction_command")
-        if not isinstance(command, str) or expected_path not in command or len(command) > 4096:
-            errors.append(f"line {line_number}: reproduction_command must include the exact PoC path")
-            continue
-        summary = entry.get("summary")
-        crash_type = entry.get("crash_type")
-        crash_output = entry.get("crash_output")
-        dup_check = entry.get("dup_check")
-        if not all(isinstance(value, str) and value.strip() for value in (
-            summary, crash_type, crash_output, dup_check
-        )):
-            errors.append(f"line {line_number}: summary, crash fields, and dup_check are required")
-            continue
-        if len(summary) > 2000 or len(crash_type) > 200 or len(crash_output) > 10_000 or len(dup_check) > 4000:
-            errors.append(f"line {line_number}: text field exceeds its size limit")
-            continue
-        exit_code = entry.get("exit_code")
-        if isinstance(exit_code, bool) or not isinstance(exit_code, int):
-            errors.append(f"line {line_number}: exit_code must be an integer")
-            continue
-        poc_kind_value = entry.get("poc_kind", "file")
-        if not isinstance(poc_kind_value, str):
-            errors.append(f"line {line_number}: poc_kind must be a string")
-            continue
-        poc_kind = _normalize_poc_kind(poc_kind_value, detector)
-        if poc_kind not in POC_KINDS:
-            errors.append(f"line {line_number}: unsupported poc_kind {poc_kind!r}")
-            continue
-        try:
-            safe_file_rc, _out, _err = docker_ops.exec_sh(
-                container,
-                f"test -d {shlex.quote(_ADDITIONAL_CRASH_ROOT)} && "
-                f"test ! -L {shlex.quote(_ADDITIONAL_CRASH_ROOT)} && "
-                f"test -d {shlex.quote(f'{_ADDITIONAL_CRASH_ROOT}/{finding_id}')} && "
-                f"test ! -L {shlex.quote(f'{_ADDITIONAL_CRASH_ROOT}/{finding_id}')} && "
-                f"test -f {shlex.quote(expected_path)} && "
-                f"test ! -L {shlex.quote(expected_path)}",
-                timeout=15,
-            )
-            if safe_file_rc:
-                errors.append(f"line {line_number}: PoC must be a regular file, not a symlink")
-                continue
-            file_size = int(docker_ops.exec_sh(
-                container, f"stat -c %s {shlex.quote(expected_path)}", timeout=15
-            )[1].strip())
-            if file_size <= 0 or total_poc_bytes + file_size > _MAX_ADDITIONAL_CRASH_BYTES:
-                errors.append(f"line {line_number}: empty PoC or total PoC size exceeds 10 MiB")
-                continue
-            poc_bytes = docker_ops.read_file(container, expected_path)
-        except Exception as exc:
-            errors.append(f"line {line_number}: cannot read PoC: {exc}")
-            continue
-        if len(poc_bytes) != file_size:
-            errors.append(f"line {line_number}: PoC changed while being read")
-            continue
-        seen.add(finding_id)
-        total_poc_bytes += file_size
-        findings.append(AdditionalCrashSubmission(
-            finding_id=finding_id,
-            summary=summary.strip(),
-            crash=CrashArtifact(
-                poc_path=expected_path,
-                poc_bytes=poc_bytes,
-                reproduction_command=command,
-                crash_type=crash_type.strip(),
-                crash_output=crash_output,
-                exit_code=exit_code,
-                dup_check=dup_check.strip(),
-                poc_kind=poc_kind,
-            ),
-        ))
-    return findings, errors
-
-
 def _crash_result_xml_template(candidate_id: str) -> bytes:
     """Return the fixed crash-submission skeleton written to the container."""
     safe_id = xml_escape(candidate_id)
@@ -3348,37 +1817,21 @@ def _normalize_poc_kind(value: str, detector: str) -> str:
     Some agents use ``crash`` to mean "this is a crash PoC", although the
     field describes the input artifact's format. At this boundary, the PoC
     has already been materialized as one file at ``poc_path``; for crash
-    detectors, interpret that label as the default file artifact. A source
-    language label such as ``ruby`` also describes file content, not a distinct
-    transport kind. Keep logic submissions strict, since they may represent
-    non-file service requests.
+    detectors, interpret that label as the default file artifact. Keep logic
+    submissions strict, since they may represent non-file service requests.
     """
     kind = value.strip().lower()
-    # Models sometimes describe the contents and how the target consumes
-    # them (for example, "ruby-source-fuzzer-input") instead of the artifact
-    # transport kind. Normalize separators before recognizing these generic
-    # file-input descriptions. Do not apply this relaxation to logic findings:
-    # their request/program/bundle distinction is semantically significant.
-    normalized = re.sub(r"[-\s]+", "_", kind)
-    if detector != "logic":
-        tokens = set(normalized.split("_"))
-        source_file_label = (
-            "fuzzer" in tokens
-            and bool(tokens & {"input", "seed"})
-            and bool(tokens & {"source", "script", "binary"})
-        )
-        if (
-            normalized.endswith("_source")
-            or normalized.endswith("_script")
-            or "_source_via_" in normalized
-            or normalized in {"raw_binary", "binary", "raw_file"}
-            or normalized in {
-                "crash", "input", "raw_input", "ruby_source", "python_source",
-                "ruby", "python", "shell", "shell_script", "script",
-            }
-            or source_file_label
-        ):
-            return "file"
+    if detector != "logic" and (
+        kind.endswith("_source")
+        or kind.endswith("_script")
+        or "_source_via_" in kind
+        or kind in {"raw-binary", "raw_binary", "binary", "raw_file"}
+        or kind in {
+            "crash", "input", "raw_input", "ruby_source", "python_source",
+            "shell_script", "script",
+        }
+    ):
+        return "file"
     return kind
 
 
@@ -3420,182 +1873,6 @@ def _status_for_missing_poc_submission(
     return status, reason
 
 
-def _status_for_symcc_missing_poc_submission(
-    *, status: str, reason: str, iterations: list[dict]
-) -> tuple[str, str]:
-    """Do not let model-only reachability claims outrank SymCC evidence."""
-    if status not in {"reached_no_crash", "reached_no_effect"}:
-        return status, reason
-    if _has_exact_target_reach_iteration(iterations):
-        return status, reason
-    detail = (
-        "SymCC machine evidence did not confirm an exact target-operation hit; "
-        "a model reachability claim, function entry, nearby block, or pending "
-        "trace is not enough to mark the candidate path reached."
-    )
-    return "iteration_exhausted", f"{reason}\n{detail}".strip()
-
-
-def _dynamic_status_breakdown(
-    *,
-    status: str,
-    detector: str,
-    iterations: list[dict],
-    symbolic_result: dict[str, Any] | None,
-    additional_crashes: list[AdditionalCrashSubmission],
-) -> dict[str, Any]:
-    """Split the dynamic result into audit-friendly dimensions.
-
-    The top-level ``status`` remains the legacy workflow state.  This breakdown
-    lets experiment analysis distinguish target-site approach, PoC materializing,
-    feedback quality, and extra findings without overloading one boolean.
-    """
-
-    observations = _machine_observations_for_status(iterations, symbolic_result)
-    saw_exact = any(
-        item.get("exact_target_reached") is True
-        or item.get("target_operation_reached") is True
-        for item in observations
-    )
-    saw_block = any(
-        item.get("target_block_entered") is True
-        or item.get("target_block_reached") is True
-        for item in observations
-    )
-    saw_function = any(
-        item.get("target_function_entered") is True for item in observations
-    )
-    saw_miss = any(
-        item.get("exact_target_reached") is False
-        or item.get("target_operation_reached") is False
-        or item.get("target_reachability") == "this_execution_missed"
-        for item in observations
-    )
-    saw_invalid_feedback = any(
-        str(item.get("status") or "") in {
-            "map_unavailable", "unavailable", "read_error", "missing",
-        }
-        for item in observations
-    )
-
-    if saw_exact:
-        target_site_status = "exact_reached"
-    elif saw_block:
-        target_site_status = "block_only"
-    elif saw_function:
-        target_site_status = "function_only"
-    elif saw_miss:
-        target_site_status = "missed"
-    elif saw_invalid_feedback:
-        target_site_status = "invalid_feedback"
-    else:
-        target_site_status = "unknown"
-
-    if status == "validated":
-        poc_status = "valid_poc"
-    elif status in {"agent_blocked", "agent_failed"}:
-        poc_status = status
-    elif status == "invalid_submission":
-        poc_status = "invalid_submission"
-    elif status == "wrong_path" or _has_crash_without_candidate_site(iterations):
-        poc_status = "crash_observed_not_submitted"
-    else:
-        poc_status = "no_poc"
-
-    additional_findings_status = "found_ungraded" if additional_crashes else "none"
-
-    feedback_quality_status = "unavailable"
-    if isinstance(symbolic_result, dict) and symbolic_result:
-        ready = _safe_int(symbolic_result.get("feedback_ready"))
-        ready_unconsumed = _safe_int(symbolic_result.get("feedback_ready_unconsumed"))
-        manually_read = _safe_int(symbolic_result.get("feedback_ready_manually_read"))
-        auto_delivered = _safe_int(symbolic_result.get("feedback_auto_delivered"))
-        metrics = symbolic_result.get("metrics")
-        if not isinstance(metrics, dict):
-            metrics = {}
-        exact_hits = _safe_int(metrics.get("exact_target_hit_records"))
-        generated_exact_hits = _safe_int(metrics.get("generated_replay_exact_hits"))
-        if ready_unconsumed > 0:
-            feedback_quality_status = "ready_unconsumed"
-        elif exact_hits > 0 or generated_exact_hits > 0:
-            feedback_quality_status = "useful"
-        elif ready > 0 and (manually_read > 0 or auto_delivered > 0):
-            feedback_quality_status = "consumed_no_improvement"
-        elif ready > 0:
-            feedback_quality_status = "ready_unconsumed"
-        else:
-            feedback_quality_status = "unavailable"
-
-    return {
-        "target_site_status": target_site_status,
-        "poc_status": poc_status,
-        "grade_status": "not_run",
-        "additional_findings_status": additional_findings_status,
-        "feedback_quality_status": feedback_quality_status,
-        "detector": detector,
-    }
-
-
-def _machine_observations_for_status(
-    iterations: list[dict], symbolic_result: dict[str, Any] | None
-) -> list[dict[str, Any]]:
-    observations: list[dict[str, Any]] = []
-    for record in iterations:
-        if not isinstance(record, dict):
-            continue
-        machine = record.get("machine_evidence")
-        if isinstance(machine, dict):
-            observations.append(machine)
-            continue
-        iteration_observation = record.get("symcc_observation")
-        if isinstance(iteration_observation, dict):
-            observations.append(iteration_observation)
-    if isinstance(symbolic_result, dict):
-        records = symbolic_result.get("records")
-        if isinstance(records, list):
-            for record in records:
-                if not isinstance(record, dict):
-                    continue
-                observation = record.get("symcc_observation")
-                if isinstance(observation, dict):
-                    observations.append(observation)
-                generated = record.get("generated_replays")
-                if isinstance(generated, list):
-                    for item in generated:
-                        if not isinstance(item, dict):
-                            continue
-                        seed_observation = item.get("symcc_observation")
-                        if isinstance(seed_observation, dict):
-                            observations.append(seed_observation)
-    return observations
-
-
-def _safe_int(value: Any) -> int:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return 0
-    if not math.isfinite(float(value)):
-        return 0
-    return max(0, int(value))
-
-
-def _has_exact_target_reach_iteration(iterations: list[dict]) -> bool:
-    for record in iterations:
-        if not isinstance(record, dict):
-            continue
-        machine = record.get("machine_evidence")
-        if isinstance(machine, dict):
-            if (
-                machine.get("exact_target_reached") is True
-                or machine.get("target_operation_reached") is True
-            ):
-                return True
-            continue
-        observations = record.get("observations")
-        if isinstance(observations, dict) and observations.get("site_reached") is True:
-            return True
-    return False
-
-
 def _persist_instrumentation(
     report: InstrumentationReport | None,
     result_path: str | None,
@@ -3623,8 +1900,7 @@ def _prepare_iteration_workspace(
     try:
         rc, _out, _err = docker_ops.exec_sh(
             container,
-            "mkdir -p /work/validation/iterations "
-            "/work/validation/additional-crashes",
+            "mkdir -p /work/validation/iterations",
             timeout=15,
         )
         if rc:
@@ -3644,8 +1920,6 @@ def _prepare_iteration_workspace(
             "record_example": {
                 "schema_version": 1,
                 "round_id": 1,
-                "request_id": "round-001",
-                "input_id": "copy the input_id from run-input response",
                 "candidate_id": candidate.candidate_id,
                 "hypothesis": {
                     "entry_point": "external input entry",
@@ -3653,10 +1927,7 @@ def _prepare_iteration_workspace(
                     "trigger_condition": "current trigger hypothesis",
                 },
                 "observations": {
-                    # The host replaces these two values from the request's
-                    # concrete execution record; the model must not infer a
-                    # hit from location proximity or distance.
-                    "site_reached": None,
+                    "site_reached": False,
                     "sanitizer_event": False,
                     "bad_state_observed": False,
                     "bad_effect_observed": False,
@@ -3686,31 +1957,14 @@ def _prepare_iteration_workspace(
             "# Dynamic validation iterations\n\n"
             "Write one JSON record per validation round as "
             "`/work/validation/iterations/round-NNN.json`.\n"
-            "For SymCC protocol runs, copy both `request_id` and `input_id` "
-            "from the exact `run-input` response into the record.\n"
-            "Use `round_id` (not `round`) and put the evidence fields inside "
-            "the `observations` object. Four fields are boolean; `site_reached` "
-            "is tri-state. In SymCC mode, the Harness overwrites `site_reached` "
-            "and `sanitizer_event` using the request-correlated machine result; "
-            "do not infer target reach from `distance`, `closest_observed_location`, "
-            "a stack trace, or a nearby basic block. A false exact result on a "
-            "complete trace is a miss; unavailable or incomplete trace evidence "
-            "is null/unknown. For this " + candidate_kind +
+            "Use `round_id` (not `round`) and put the five boolean evidence "
+            "fields inside the `observations` object. For this " + candidate_kind +
             " candidate, a successful record must set `decision` to "
-            "`candidate_ready` and set the required semantic evidence based on "
-            "source and command output. The Harness determines exact site reach "
-            "and requires it to be true. The exact "
+            "`candidate_ready` and set " + readiness +
+            " to true based on command output. The exact "
             "machine-readable template is in `iteration-contract.json`. "
             "The record does not replace the final PoC XML contract. Do not "
             "put secrets or unbounded command output in it.\n"
-            "Incidental independent target crashes, if found during this work, "
-            "have a separate submission file at "
-            "`/work/validation/additional-crashes.jsonl`; see the prompt section. "
-            "They do not replace this candidate's result. Use "
-            "`/work/validation/additional-crash-template.json` as the exact "
-            "JSONL object template, copy the crashing input to "
-            "`/work/validation/additional-crashes/<finding_id>/poc.bin`, and "
-            "keep `finding_id` consistent between the directory and JSON.\n"
         )
         docker_ops.write_file(
             container,
@@ -3727,32 +1981,12 @@ def _prepare_iteration_workspace(
             "`/work/validation/crash-result.xml` and fill its existing element "
             "text. Keep the root, field names, order, and attributes unchanged. "
             "This file is not needed for no-crash or unreachable outcomes; "
-            "report those with the normal dynamic-status tags.\n\n"
-            "For a no-crash or no-PoC conclusion, your final assistant message "
-            "must contain these inline XML tags exactly once:\n\n"
-            "<dynamic_status>iteration_exhausted</dynamic_status>\n"
-            f"<candidate_id>{candidate.candidate_id}</candidate_id>\n"
-            "<reached_functions>comma-separated functions actually reached, "
-            "or empty</reached_functions>\n"
-            "<reachability_evidence>bounded commands, feedback request ids, "
-            "and machine evidence</reachability_evidence>\n"
-            "<reason>evidence-based conclusion</reason>\n\n"
-            "Allowed dynamic_status values are: not_reached, reached_no_crash, "
-            "reached_no_effect, wrong_behavior, wrong_path, "
-            "environment_blocked, invalid_submission, agent_failed, "
-            "agent_blocked, false_positive, and iteration_exhausted. When the "
-            "iteration budget is consumed without a validated PoC, prefer "
-            "`iteration_exhausted` over a narrative-only answer.\n"
+            "report those with the normal dynamic-status tags.\n"
         )
         docker_ops.write_file(
             container,
             _CRASH_RESULT_TEMPLATE_PATH,
             _crash_result_xml_template(candidate.candidate_id),
-        )
-        docker_ops.write_file(
-            container,
-            _ADDITIONAL_CRASH_TEMPLATE_PATH,
-            _additional_crash_template_json(candidate.candidate_id),
         )
         docker_ops.write_file(
             container, "/work/validation/README.md",
@@ -3817,268 +2051,11 @@ def _collect_iteration_records(
     return records, errors
 
 
-def _reconcile_symcc_iterations(
-    agent_iterations: list[dict],
-    symbolic_result: dict,
-    *,
-    candidate_id: str,
-    detector: str,
-) -> tuple[list[dict], list[str]]:
-    """Replace model-authored SymCC facts with request-correlated observations.
-
-    The agent may explain what an execution means, but it cannot promote a
-    nearby block or a distance estimate into an exact target hit. The
-    request-scoped concrete trace is authoritative for ``site_reached``; a
-    model iteration is associated with it only when request and input IDs
-    agree. Missing/incomplete trace evidence remains unknown.
-    """
-    protocol_records = symbolic_result.get("records")
-    if not isinstance(protocol_records, list):
-        protocol_records = []
-
-    agents_by_round: dict[int, list[dict]] = {}
-    for agent_record in agent_iterations:
-        try:
-            round_id = int(agent_record.get("round_id", 0))
-        except (TypeError, ValueError):
-            round_id = 0
-        agents_by_round.setdefault(round_id, []).append(agent_record)
-
-    used_agent_ids: set[int] = set()
-    reconciled: list[dict] = []
-    errors: list[str] = []
-    seen_rounds: set[int] = set()
-
-    for protocol_record in protocol_records:
-        if not isinstance(protocol_record, dict):
-            continue
-        try:
-            round_id = int(protocol_record.get("round_id", 0))
-        except (TypeError, ValueError):
-            round_id = 0
-        if round_id <= 0:
-            errors.append("ignored SymCC protocol record without a valid round_id")
-            continue
-        if round_id in seen_rounds:
-            errors.append(f"duplicate SymCC protocol round_id: {round_id}")
-            continue
-        seen_rounds.add(round_id)
-
-        request_id = str(protocol_record.get("request_id") or "")
-        input_id = str(protocol_record.get("input_id") or "")
-        round_agents = agents_by_round.get(round_id, [])
-        agent_record = round_agents[0] if round_agents else None
-        if agent_record is not None:
-            used_agent_ids.add(id(agent_record))
-
-        agent_observations = (
-            agent_record.get("observations")
-            if isinstance(agent_record, dict)
-            and isinstance(agent_record.get("observations"), dict)
-            else {}
-        )
-        agent_request_id = str((agent_record or {}).get("request_id") or "")
-        agent_input_id = str((agent_record or {}).get("input_id") or "")
-        identity_matches = bool(
-            agent_record is not None
-            and request_id
-            and input_id
-            and agent_request_id == request_id
-            and agent_input_id == input_id
-        )
-        if agent_record is not None and not identity_matches:
-            errors.append(
-                f"round {round_id} agent iteration lacks matching request_id/input_id; "
-                "its semantic claims are retained but cannot authorize candidate readiness"
-            )
-
-        observation = protocol_record.get("symcc_observation")
-        if not isinstance(observation, dict):
-            observation = {}
-        target_ids_valid = (
-            observation.get("target_ids_configured") is True
-            and observation.get("target_ids_valid") is True
-        )
-        raw_reached = observation.get(
-            "exact_target_reached",
-            observation.get("target_operation_reached", observation.get("target_reached")),
-        )
-        if target_ids_valid and raw_reached is True:
-            site_reached: bool | None = True
-        elif (
-            target_ids_valid
-            and raw_reached is False
-            and observation.get("trace_complete") is True
-            and observation.get("trace_truncated") is False
-        ):
-            site_reached = False
-        else:
-            site_reached = None
-
-        clean = protocol_record.get("clean")
-        if not isinstance(clean, dict):
-            clean = {}
-        sanitizer_event = clean.get("sanitizer_event")
-        if not isinstance(sanitizer_event, bool):
-            sanitizer_event = None
-
-        agent_claims = {
-            key: agent_observations.get(key)
-            for key in (
-                "site_reached", "sanitizer_event", "bad_state_observed",
-                "bad_effect_observed", "matched_candidate",
-            )
-            if key in agent_observations
-        }
-        linked_claim = identity_matches
-        bad_state = (
-            agent_observations.get("bad_state_observed") is True
-            if linked_claim else False
-        )
-        bad_effect = (
-            agent_observations.get("bad_effect_observed") is True
-            if linked_claim else False
-        )
-        agent_matched = (
-            agent_observations.get("matched_candidate") is True
-            if linked_claim else False
-        )
-        if detector == "logic":
-            matched_candidate = bool(
-                site_reached is True and bad_state and bad_effect and agent_matched
-            )
-        else:
-            matched_candidate = bool(
-                site_reached is True
-                and sanitizer_event is True
-                and agent_matched
-            )
-
-        machine_evidence = {
-            "provider": "symcc-prebuilt",
-            "request_id": request_id or None,
-            "input_id": input_id or None,
-            "parent_input_id": protocol_record.get("parent_input_id"),
-            "target_commit": protocol_record.get("target_commit"),
-            "feedback_status": protocol_record.get("feedback_status"),
-            "trace_status": observation.get("trace_status"),
-            "trace_complete": observation.get("trace_complete"),
-            "trace_truncated": observation.get("trace_truncated"),
-            "target_ids_configured": observation.get("target_ids_configured"),
-            "target_ids_valid": observation.get("target_ids_valid"),
-            "exact_target_reached": observation.get("exact_target_reached"),
-            "target_operation_reached": observation.get("target_operation_reached"),
-            "target_function_entered": observation.get("target_function_entered"),
-            "target_block_entered": observation.get("target_block_entered"),
-            "target_reached": observation.get("target_reached"),
-            "target_block_reached": observation.get("target_block_reached"),
-            "target_anchor_granularity": observation.get("target_anchor_granularity"),
-            "allowed_conclusion": observation.get("allowed_conclusion"),
-            "closest_observed_location": observation.get("closest_observed_location"),
-            "distance": observation.get("distance"),
-            "distance_kind": observation.get("distance_kind"),
-            "distance_is_heuristic": observation.get("distance_is_heuristic"),
-            "symcc_status": (protocol_record.get("symcc") or {}).get("status"),
-            "clean_status": clean.get("status"),
-            "sanitizer_event": sanitizer_event,
-        }
-        record = {
-            "schema_version": 1,
-            "round_id": round_id,
-            "candidate_id": candidate_id,
-            "request_id": request_id or None,
-            "input_id": input_id or None,
-            "parent_input_id": protocol_record.get("parent_input_id"),
-            "target_commit": protocol_record.get("target_commit"),
-            "hypothesis": (
-                agent_record.get("hypothesis")
-                if isinstance(agent_record, dict)
-                and isinstance(agent_record.get("hypothesis"), dict)
-                else {}
-            ),
-            "agent_claims": agent_claims,
-            "association": "request_and_input_id" if identity_matches else (
-                "round_only" if agent_record is not None else "no_agent_record"
-            ),
-            "machine_evidence": machine_evidence,
-            "observations": {
-                "site_reached": site_reached,
-                "sanitizer_event": sanitizer_event,
-                "bad_state_observed": bad_state,
-                "bad_effect_observed": bad_effect,
-                "matched_candidate": matched_candidate,
-            },
-            "decision": "candidate_ready" if matched_candidate else "continue",
-            "reason": str((agent_record or {}).get("reason") or "")[:4_000],
-        }
-        if site_reached is False and agent_claims.get("site_reached") is True:
-            record["reason"] = (
-                record["reason"] + "\nHarness correction: the complete concrete "
-                "SymCC trace did not hit the exact target marker; a nearby block "
-                "or distance estimate is not an exact hit."
-            ).strip()[:4_000]
-        reconciled.append(_bound_iteration(record))
-
-    # Preserve unmatched model records for audit, but strip all authority from
-    # their runtime claims. They cannot satisfy the successful-PoC gate.
-    for agent_record in agent_iterations:
-        if id(agent_record) in used_agent_ids:
-            continue
-        value = dict(agent_record)
-        claims = value.get("observations")
-        if not isinstance(claims, dict):
-            claims = {}
-        value["agent_claims"] = {
-            key: claims[key]
-            for key in (
-                "site_reached", "sanitizer_event", "bad_state_observed",
-                "bad_effect_observed", "matched_candidate",
-            )
-            if key in claims
-        }
-        value["association"] = "unmatched"
-        value["machine_evidence"] = {"provider": "symcc-prebuilt", "status": "missing"}
-        value["observations"] = {
-            "site_reached": None,
-            "sanitizer_event": None,
-            "bad_state_observed": False,
-            "bad_effect_observed": False,
-            "matched_candidate": False,
-        }
-        value["decision"] = "continue"
-        reconciled.append(_bound_iteration(value))
-        errors.append(
-            f"agent iteration round {value.get('round_id', 0)} has no matching "
-            "request-scoped SymCC execution record"
-        )
-
-    reconciled.sort(key=lambda item: (int(item.get("round_id", 0)), str(item)))
-    return reconciled, errors
-
-
-def _has_crash_without_candidate_site(iterations: list[dict]) -> bool:
-    """Detect a sanitizer crash paired with an exact, complete site miss."""
-    for record in iterations:
-        machine = record.get("machine_evidence")
-        observations = record.get("observations")
-        if not isinstance(machine, dict) or not isinstance(observations, dict):
-            continue
-        if (
-            machine.get("provider") == "symcc-prebuilt"
-            and observations.get("site_reached") is False
-            and observations.get("sanitizer_event") is True
-        ):
-            return True
-    return False
-
-
 def _bound_iteration(value: dict) -> dict:
     """Keep model-authored iteration evidence safe to persist and inspect."""
     allowed = {
         "schema_version", "round_id", "candidate_id", "hypothesis",
-        "observations", "decision", "reason", "request_id", "input_id",
-        "parent_input_id", "target_commit", "agent_claims", "machine_evidence",
-        "association",
+        "observations", "decision", "reason",
     }
     bounded = {key: value.get(key) for key in allowed if key in value}
     # Early dynamic agents emitted the same fields with a shorter schema:
@@ -4120,18 +2097,13 @@ def _bound_iteration(value: dict) -> dict:
             fallback_reason = "; ".join(str(item) for item in fallback_reason[:20])
         if fallback_reason:
             bounded["reason"] = str(fallback_reason)[:4_000]
-    for key in (
-        "hypothesis", "observations", "agent_claims", "machine_evidence",
-    ):
+    for key in ("hypothesis", "observations"):
         if isinstance(bounded.get(key), dict):
             bounded[key] = {
                 str(k)[:100]: _bound_json_value(v)
                 for k, v in list(bounded[key].items())[:50]
             }
-    for key in (
-        "reason", "decision", "request_id", "input_id", "parent_input_id",
-        "target_commit", "association",
-    ):
+    for key in ("reason", "decision"):
         if key in bounded:
             bounded[key] = str(bounded[key])[:4_000]
     try:

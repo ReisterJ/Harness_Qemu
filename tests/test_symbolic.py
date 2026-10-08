@@ -121,8 +121,7 @@ def test_ready_symbolic_context_teaches_the_tool_contract_not_the_answer():
     assert "your next tool action must submit" in prompt
     assert "Do not inspect VCS history" in prompt
     assert "at most 300 seconds per invocation" in prompt
-    assert "Do not assume a default 1800-second phase limit" in prompt
-    assert "If an overall deadline was supplied, reserve time" in prompt
+    assert "reserve at least 300 seconds" in prompt
     assert "Write each record immediately" in prompt
     assert prompt.index("Required first-step symbolic-execution probe") < prompt.index(
         "You are conducting authorized security research"

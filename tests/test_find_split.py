@@ -5,26 +5,14 @@ import asyncio
 import json
 from pathlib import Path
 
-import pytest
-
 from harness.agent import AgentResult
-from harness.artifacts import (
-    AdditionalCrashSubmission,
-    CrashArtifact,
-    DynamicValidationResult,
-    LogicArtifact,
-    StaticFinding,
-)
+from harness.artifacts import CrashArtifact, DynamicValidationResult, LogicArtifact, StaticFinding
 from harness.config import TargetConfig
 from harness.find import FindPhaseResult, run_find
 from harness.dynamic_validation import (
     _bound_iteration,
-    _candidate_target_anchors,
-    _dynamic_status_breakdown,
-    _generic_dynamic_evidence_ledger,
     _has_candidate_ready_iteration,
     _normalize_poc_kind,
-    _persist_generic_dynamic_evidence_ledger,
     _status_for_missing_poc_submission,
     _status_without_iteration_records,
     run_dynamic_validation,
@@ -58,54 +46,13 @@ def _finding() -> StaticFinding:
     )
 
 
-def test_candidate_target_anchors_prefer_exact_operation_marker():
-    finding = _finding()
-    finding.observability_targets = [{
-        "target_function": "parse",
-        "target_region": {
-            "source_file": "src/parser.c",
-            "start_line": 10,
-            "end_line": 20,
-        },
-        "target_operation": {
-            "source_file": "src/parser.c",
-            "function": "parse",
-            "line": 17,
-        },
-    }]
-
-    assert _candidate_target_anchors(finding) == [{
-        "source_file": "src/parser.c",
-        "line": 17,
-        "function": "parse",
-        "anchor_role": "operation",
-    }]
-
-
-def test_candidate_target_anchors_do_not_promote_region_start_to_exact_marker():
-    finding = _finding()
-    finding.observability_targets = [{
-        "target_function": "parse",
-        "target_region": {
-            "source_file": "src/parser.c",
-            "start_line": 10,
-            "end_line": 20,
-        },
-    }]
-
-    assert _candidate_target_anchors(finding) == [{
-        "function": "parse",
-        "anchor_role": "coarse_function",
-    }]
-
-
 def _crash_result_xml() -> bytes:
     return b'''<?xml version="1.0" encoding="UTF-8"?>
 <crash_result schema_version="1">
   <candidate_id>candidate_001</candidate_id>
   <poc_path>/work/poc.rb</poc_path>
   <reproduction_command>/out/mruby_fuzzer /work/poc.rb</reproduction_command>
-  <poc_kind>ruby</poc_kind>
+  <poc_kind>crash</poc_kind>
   <crash_type>heap-use-after-free</crash_type>
   <exit_code>1</exit_code>
   <crash_output>AddressSanitizer: heap-use-after-free</crash_output>
@@ -144,38 +91,16 @@ def test_dynamic_prompt_contains_candidate_and_no_static_result_is_grade_input()
     assert "## Final response schema — mandatory machine interface" in prompt
     assert "<reproduction_command>exact command containing that path" in prompt
     assert "do not substitute aliases" in prompt.lower()
-    assert "Do not assume a default 1800-second phase limit" in prompt
-
-
-def test_dynamic_prompt_mentions_only_an_explicit_overall_timeout():
-    prompt = build_dynamic_validation_prompt(
-        candidate=_finding(),
-        github_url="https://example.test/project",
-        commit="abc",
-        source_root="/src",
-        binary_path="/bin/target",
-        phase_timeout_s=47.5,
-    )
-    assert "deadline of 47.5 seconds" in prompt
-    assert "Do not assume a default 1800-second phase limit" not in prompt
 
 
 def test_crash_poc_kind_aliases_are_normalized_to_file():
-    assert _normalize_poc_kind("ruby", "asan") == "file"
-    assert _normalize_poc_kind("python", "asan") == "file"
-    assert _normalize_poc_kind("crash", "asan") == "file"
     assert _normalize_poc_kind("ruby_source", "asan") == "file"
     assert _normalize_poc_kind("ruby_source_via_mrb_load_string", "asan") == "file"
-    assert _normalize_poc_kind("ruby-source-fuzzer-input", "asan") == "file"
-    assert _normalize_poc_kind("c-source-fuzzer-seed", "asan") == "file"
     assert _normalize_poc_kind("shell_script", "asan") == "file"
     assert _normalize_poc_kind("raw-binary", "asan") == "file"
     assert _normalize_poc_kind("program", "asan") == "program"
     assert _normalize_poc_kind("ruby_source", "logic") == "ruby_source"
-    assert _normalize_poc_kind("ruby", "logic") == "ruby"
     assert _normalize_poc_kind("ruby_source_via_mrb_load_string", "logic") == "ruby_source_via_mrb_load_string"
-    assert _normalize_poc_kind("ruby-source-fuzzer-input", "logic") == "ruby-source-fuzzer-input"
-    assert _normalize_poc_kind("unknown-kind", "asan") == "unknown-kind"
 
 
 def test_logic_dynamic_prompt_uses_semantic_oracle_contract():
@@ -305,107 +230,6 @@ def test_candidate_ready_without_final_poc_is_invalid_submission_not_no_crash():
     assert status == "invalid_submission"
     assert "omitted the required" in reason
 
-
-def test_dynamic_status_breakdown_separates_protocol_failure_from_feedback_progress():
-    iterations = [{
-        "schema_version": 1,
-        "round_id": 1,
-        "candidate_id": "candidate_001",
-        "machine_evidence": {
-            "exact_target_reached": False,
-            "target_operation_reached": False,
-            "target_function_entered": True,
-            "target_block_entered": False,
-            "target_reachability": "this_execution_missed",
-        },
-        "observations": {"sanitizer_event": False},
-        "decision": "iteration_exhausted",
-    }]
-    symbolic_result = {
-        "feedback_ready": 1,
-        "feedback_ready_manually_read": 1,
-        "feedback_ready_unconsumed": 0,
-        "metrics": {
-            "exact_target_hit_records": 0,
-            "generated_replay_exact_hits": 0,
-        },
-    }
-
-    breakdown = _dynamic_status_breakdown(
-        status="invalid_submission",
-        detector="asan",
-        iterations=iterations,
-        symbolic_result=symbolic_result,
-        additional_crashes=[],
-    )
-
-    assert breakdown["target_site_status"] == "function_only"
-    assert breakdown["poc_status"] == "invalid_submission"
-    assert breakdown["feedback_quality_status"] == "consumed_no_improvement"
-    assert breakdown["additional_findings_status"] == "none"
-    assert breakdown["grade_status"] == "not_run"
-
-
-def test_generic_dynamic_evidence_ledger_records_off_arm_events(tmp_path):
-    crash = CrashArtifact(
-        poc_path="/work/validation/additional-crashes/crash.bin",
-        poc_bytes=b"boom",
-        reproduction_command="/target < crash.bin",
-        crash_type="heap-use-after-free",
-        crash_output="asan",
-        exit_code=1,
-    )
-    result = DynamicValidationResult(
-        candidate_id="candidate_001",
-        status="iteration_exhausted",
-        reason="budget exhausted",
-        iterations=[{
-            "round_id": 1,
-            "candidate_id": "candidate_001",
-            "decision": "continue",
-            "observations": {
-                "site_reached": False,
-                "sanitizer_event": False,
-                "matched_candidate": False,
-            },
-        }],
-        additional_crashes=[
-            AdditionalCrashSubmission(
-                finding_id="additional-001",
-                summary="separate ASan crash",
-                crash=crash,
-            )
-        ],
-        status_breakdown={
-            "target_site_status": "unknown",
-            "poc_status": "no_poc",
-            "grade_status": "not_run",
-            "additional_findings_status": "candidate",
-            "feedback_quality_status": "unavailable",
-        },
-    )
-
-    ledger = _generic_dynamic_evidence_ledger(result)
-
-    assert [event["event"] for event in ledger] == [
-        "iteration_recorded",
-        "additional_crash_recorded",
-        "dynamic_result_finalized",
-    ]
-    assert ledger[0]["site_reached"] is False
-    assert ledger[1]["finding_id"] == "additional-001"
-    assert ledger[2]["status"] == "iteration_exhausted"
-    assert ledger[2]["additional_findings_status"] == "candidate"
-
-    _persist_generic_dynamic_evidence_ledger(
-        str(tmp_path / "run" / "symbolic_execution"),
-        result,
-    )
-    persisted = (tmp_path / "run" / "evidence_ledger.jsonl").read_text()
-    assert '"event": "iteration_recorded"' in persisted
-    assert '"event": "additional_crash_recorded"' in persisted
-
-
 def test_logic_static_prompt_requires_semantic_oracle():
     prompt = build_static_analysis_prompt(
         github_url="https://example.test/project",
@@ -460,7 +284,6 @@ def test_run_find_orchestrates_static_then_dynamic_and_writes_artifacts(tmp_path
         assert kwargs["candidate"] == _finding()
         assert kwargs["instrumentation"] == "llvm"
         assert kwargs["instrumentation_result_path"] == str(tmp_path / "instrumentation")
-        assert kwargs["phase_timeout_s"] == 73.0
         return dynamic, dynamic_agent, {"dynamic_validation": 2.0}
 
     monkeypatch.setattr("harness.find.run_static_analysis", fake_static)
@@ -477,7 +300,6 @@ def test_run_find_orchestrates_static_then_dynamic_and_writes_artifacts(tmp_path
         dynamic_result_path=str(dynamic_path),
         instrumentation="llvm",
         instrumentation_result_path=str(tmp_path / "instrumentation"),
-        phase_timeout_s=73.0,
     ))
 
     assert outcome.crash == crash
@@ -524,8 +346,7 @@ def test_run_find_propagates_logic_artifact(monkeypatch):
     assert outcome.dynamic_result.logic == logic
 
 
-@pytest.mark.parametrize("phase_timeout_s", [None, 47.5])
-def test_dynamic_validation_parses_logic_submission(monkeypatch, phase_timeout_s):
+def test_dynamic_validation_parses_logic_submission(monkeypatch):
     target = TargetConfig.load(Path(__file__).resolve().parents[1] / "targets" / "libxml2")
     candidate = _finding()
     message = """<dynamic_status>validated</dynamic_status>
@@ -555,10 +376,7 @@ def test_dynamic_validation_parses_logic_submission(monkeypatch, phase_timeout_s
         "harness.dynamic_validation.open_runtime_session",
         lambda *args, **kwargs: FakeSession(),
     )
-    agent_kwargs = {}
-
     async def fake_agent(**kwargs):
-        agent_kwargs.update(kwargs)
         return _fake_agent_result(message)
 
     monkeypatch.setattr("harness.dynamic_validation.run_agent", fake_agent)
@@ -587,8 +405,7 @@ def test_dynamic_validation_parses_logic_submission(monkeypatch, phase_timeout_s
     )
     outcome, _agent, _timings = asyncio.run(
         run_dynamic_validation(
-            target, candidate, model="m", max_turns=3, instrumentation="off",
-            phase_timeout_s=phase_timeout_s,
+            target, candidate, model="m", max_turns=3, instrumentation="off"
         )
     )
     assert outcome.status == "validated"
@@ -596,86 +413,6 @@ def test_dynamic_validation_parses_logic_submission(monkeypatch, phase_timeout_s
     assert outcome.logic is not None
     assert outcome.logic.logic_type == "integer-truncation"
     assert outcome.logic.exit_code == 0
-    assert agent_kwargs["phase_timeout_s"] == phase_timeout_s
-    assert agent_kwargs["idle_timeout_s"] == phase_timeout_s
-
-
-def test_dynamic_validation_preserves_final_status_tags_despite_agent_error(monkeypatch):
-    target = TargetConfig(
-        name="sample",
-        dockerfile_dir="/tmp/sample",
-        image_tag="sample:latest",
-        github_url="https://example.test/repo",
-        commit="a" * 40,
-        binary_path="/out/target",
-        source_root="/src/sample",
-        detector="asan",
-    )
-    candidate = _finding()
-    message = """Both rounds are complete.
-<dynamic_status>iteration_exhausted</dynamic_status>
-<candidate_id>candidate_001</candidate_id>
-<reached_functions>parse</reached_functions>
-<reachability_evidence>round-001 and round-002 missed exact target</reachability_evidence>
-<reason>iteration budget exhausted without a validated PoC</reason>"""
-
-    class FakeSession:
-        container = "fake-container"
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-    monkeypatch.setattr(
-        "harness.dynamic_validation.open_runtime_session",
-        lambda *args, **kwargs: FakeSession(),
-    )
-
-    async def fake_agent(**_kwargs):
-        result = _fake_agent_result(message)
-        result.error = "agent/model_blocked: phase exceeded 600s"
-        return result
-
-    def fake_exec(_container, command, **_kwargs):
-        if command.startswith("test -f"):
-            return 1, "", ""
-        return 0, "", ""
-
-    monkeypatch.setattr("harness.dynamic_validation.run_agent", fake_agent)
-    monkeypatch.setattr("harness.dynamic_validation.docker_ops.exec_sh", fake_exec)
-    monkeypatch.setattr(
-        "harness.dynamic_validation._collect_additional_crashes",
-        lambda *_args: ([], []),
-    )
-    monkeypatch.setattr(
-        "harness.dynamic_validation._collect_iteration_records",
-        lambda *_args: ([{
-            "schema_version": 1,
-            "round_id": 1,
-            "candidate_id": "candidate_001",
-            "observations": {
-                "site_reached": False,
-                "sanitizer_event": False,
-                "bad_state_observed": False,
-                "bad_effect_observed": False,
-                "matched_candidate": False,
-            },
-            "decision": "continue",
-        }], []),
-    )
-
-    outcome, agent, _timings = asyncio.run(
-        run_dynamic_validation(
-            target, candidate, model="m", max_turns=3, instrumentation="off"
-        )
-    )
-
-    assert agent.error == "agent/model_blocked: phase exceeded 600s"
-    assert outcome.status == "iteration_exhausted"
-    assert outcome.reason == "iteration budget exhausted without a validated PoC"
-    assert outcome.reached_functions == ["parse"]
 
 
 def test_dynamic_validation_normalizes_crash_label_to_file_poc(monkeypatch):
@@ -695,10 +432,9 @@ def test_dynamic_validation_normalizes_crash_label_to_file_poc(monkeypatch):
     )
     message = """<dynamic_status>validated</dynamic_status>
 <candidate_id>candidate_001</candidate_id>
-<reached_functions>quoted prompt text, not runtime evidence</reached_functions>
 <poc_path>/work/poc.rb</poc_path>
 <reproduction_command>/out/mruby_fuzzer /work/poc.rb</reproduction_command>
-<poc_kind>ruby</poc_kind>
+<poc_kind>crash</poc_kind>
 <crash_type>heap-use-after-free</crash_type>
 <exit_code>1</exit_code>
 <crash_output>AddressSanitizer: heap-use-after-free</crash_output>
@@ -756,7 +492,6 @@ def test_dynamic_validation_normalizes_crash_label_to_file_poc(monkeypatch):
     assert outcome.crash is not None
     assert outcome.crash.poc_kind == "file"
     assert outcome.crash.poc_bytes == b"puts 'trigger'\n"
-    assert outcome.reached_functions == []
 
 
 def _fake_agent_result(message: str) -> AgentResult:

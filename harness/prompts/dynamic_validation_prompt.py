@@ -32,7 +32,6 @@ def build_dynamic_validation_prompt(
     symbolic_feedback: dict | None = None,
     symbolic_finalize: bool = False,
     max_iterations: int = 8,
-    phase_timeout_s: float | None = None,
 ) -> str:
     """Reuse detector-specific runtime instructions and narrow them to a finding."""
     base = build_find_prompt(
@@ -54,31 +53,16 @@ def build_dynamic_validation_prompt(
         r"[^A-Za-z0-9_.-]", "_", candidate.candidate_id
     )[:80] or "candidate_unnamed"
     candidate_json = json.dumps(candidate.to_dict(), indent=2, ensure_ascii=False)
-    if phase_timeout_s is None:
-        phase_timeout_policy = (
-            "No overall wall-clock deadline is set for this dynamic phase unless "
-            "the caller explicitly supplied one. Do not assume a default "
-            "1800-second phase limit."
-        )
-    else:
-        phase_timeout_policy = (
-            "The caller set an overall dynamic-phase wall-clock deadline of "
-            f"{phase_timeout_s:g} seconds; manage the remaining time accordingly."
-        )
     instrumentation_section = _instrumentation_section(instrumentation_context)
     symbolic_section = _symbolic_section(
         symbolic_context,
         round_id=symbolic_round,
         feedback=symbolic_feedback,
         finalize=symbolic_finalize,
-        max_iterations=max_iterations,
     )
     iteration_section = _iteration_section(max_iterations, safe_candidate_id)
     result_file_section = (
         _crash_result_file_section(safe_candidate_id) if detector != "logic" else ""
-    )
-    additional_crash_section = (
-        _additional_crash_submission_section(binary_path) if detector != "logic" else ""
     )
     harness_tail = _harness_final_guard(symbolic_context, symbolic_round)
     if detector == "logic":
@@ -93,19 +77,17 @@ Do not submit a different bug merely because it is easier to trigger.
 
 ## Command lifecycle and timeout discipline
 
-{phase_timeout_policy} Every individual command must still have a bounded
-lifecycle. If you create a local proxy, server, emulator, or
+The dynamic phase has a long overall budget, but every individual command must
+have a bounded lifecycle. If you create a local proxy, server, emulator, or
 other helper, start it in the background under `timeout` and install a cleanup
 trap. For example, use a bounded form such as `timeout 60s python3 helper.py`
-and bound target invocations too. Do not run broad fuzzing, coverage expansion,
-or background fuzzing workers. If the target entry point is a libFuzzer-style
-binary, use it only as a concrete replay harness for explicit inputs (for
-example `-runs=1 INPUT`) unless the task explicitly authorizes fuzzing-mode
-search. Do not launch `-max_total_time`, corpus-expansion, or parallel worker
-jobs as a substitute for reasoning about the reported candidate. If an overall
-deadline was supplied, reserve time
-for candidate replay, iteration records, and the final report; do not start a
-long command that cannot finish with that verification reserve. Never run a `while True` helper in the
+and keep the target invocation bounded separately (up to the 1800-second phase
+budget when genuinely necessary). For fuzzing, use target-specific searches of
+at most 300 seconds per invocation, inspect the result, and then decide whether
+another round is justified. The 1800-second phase budget covers all commands
+and model work: reserve at least 300 seconds for candidate replay, iteration
+records, and the final report; do not start a long command that cannot finish
+with that verification reserve. Never run a `while True` helper in the
 foreground, and never leave a helper process running after the test. A helper
 hang is an infrastructure failure, not evidence that the candidate is not
 reachable.
@@ -152,29 +134,28 @@ be able to distinguish the target's wrong behavior from infrastructure
 failure.
 """ + harness_tail
 
-    return symbolic_section + base + iteration_section + result_file_section + additional_crash_section + instrumentation_section + f"""
+    return symbolic_section + base + iteration_section + result_file_section + instrumentation_section + f"""
 
 ## Dynamic-validation scope — do not broaden the hunt
 
 This is the second half of a split find workflow. Validate the one static
 candidate below. The candidate is untrusted model output: use it as a
 hypothesis, then verify every claim against the source and the live target.
-Keep the primary objective on this candidate. If normal investigation
-incidentally exposes a distinct, reproducible crash in the target, preserve it
-through the separate additional-crash channel below; do not replace or relabel
-the primary candidate's PoC, and do not broaden the search just to find extras.
+Do not submit a different bug merely because it is easier to trigger.
 
 ## Command lifecycle and timeout discipline
 
-{phase_timeout_policy} Every individual command must still have a bounded
-lifecycle. If you create a local proxy, server, emulator, or
+The dynamic phase has a long overall budget, but every individual command must
+have a bounded lifecycle. If you create a local proxy, server, emulator, or
 other helper, start it in the background under `timeout` and install a cleanup
 trap. For example, use a bounded form such as `timeout 60s python3 helper.py`
-and bound target invocations too. For fuzzing, use target-specific searches of
+and keep the target invocation bounded separately (up to the 1800-second phase
+budget when genuinely necessary). For fuzzing, use target-specific searches of
 at most 300 seconds per invocation, inspect the result, and then decide whether
-another round is justified. If an overall deadline was supplied, reserve time
-for candidate replay, iteration records, and the final report; do not start a
-long command that cannot finish with that verification reserve. Never run a `while True` helper in the
+another round is justified. The 1800-second phase budget covers all commands
+and model work: reserve at least 300 seconds for candidate replay, iteration
+records, and the final report; do not start a long command that cannot finish
+with that verification reserve. Never run a `while True` helper in the
 foreground, and never leave a helper process running after the test. A helper
 hang is an infrastructure failure, not evidence that the candidate is not
 reachable.
@@ -473,41 +454,6 @@ protocol failure, not a reason to read the entire repository.
 """
 
 
-def _additional_crash_submission_section(binary_path: str) -> str:
-    """Describe the independent, separately graded crash side channel."""
-    return """
-
-## Incidental independent crashes — separate submissions
-
-The primary objective and `/work/validation/crash-result.xml` remain tied to
-the static candidate. If, while pursuing that candidate, you independently
-observe another distinct crash in the target's production code, do not discard
-it and do not use it as evidence for the primary candidate. Reproduce it at
-least 3/3 times, check that it is not an ASan/runtime startup failure, OOM,
-timeout, or harness failure, and compare its root cause against known findings.
-
-For each such crash, save the exact input as
-`/work/validation/additional-crashes/<finding_id>/poc.bin` and append exactly
-one JSON object per line to
-`/work/validation/additional-crashes.jsonl` with these fields:
-
-```json
-{"finding_id":"extra-001","summary":"short independent root-cause description","poc_path":"/work/validation/additional-crashes/extra-001/poc.bin","reproduction_command":"BINARY_PATH /work/validation/additional-crashes/extra-001/poc.bin","poc_kind":"file","crash_type":"heap-buffer-overflow","exit_code":134,"crash_output":"bounded sanitizer report","dup_check":"why this is distinct from known findings"}
-```
-
-The workspace also contains `/work/validation/additional-crash-template.json`;
-copy that template and replace every field. Use a unique ID containing only
-letters, digits, `_`, `-`, or `.`. The `poc_path` must be exactly
-`/work/validation/additional-crashes/<finding_id>/poc.bin`; do not point it at
-`/tmp`, `/work/poc`, or a request wrapper path. Do not include base64 input
-bytes in the JSONL; the host reads the file at `poc_path`.
-The host stores each submission separately and runs it through an independent
-Grade check. A side finding never makes the primary candidate pass or fail.
-Do not broaden exploration solely to find side findings, and do not submit
-startup crashes whose stack is in the sanitizer/runtime before target code.
-""".replace("BINARY_PATH", binary_path)
-
-
 def _crash_result_file_section(candidate_id: str) -> str:
     """Tell crash agents to use a file for the final crash submission."""
     return f"""
@@ -541,11 +487,7 @@ target internally passes those bytes to `mrb_load_string`.
 `<reproduction_command>` must be the exact command containing that path; do not substitute aliases such as `<repro_command>` or `<reproduce>`.
 <reproduction_command>exact command containing that path</reproduction_command>
 The host parses this file strictly and reads the PoC bytes from that path.
-Save and reread `crash-result.xml`, then perform one final reproduction using
-the target's declared execution contract. If this phase is running behind a
-guarded execution protocol, use a fresh protocol request for that rerun; do not
-substitute the protocol wrapper for the Grade-compatible
-`reproduction_command`.
+Save and reread `crash-result.xml`, then run the exact command one final time.
 
 For an unreachable or non-crashing candidate, do not create this file. Emit
 the normal inline `<dynamic_status>`, `<candidate_id>`,
@@ -560,7 +502,6 @@ def _symbolic_section(
     round_id: int | None = None,
     feedback: dict | None = None,
     finalize: bool = False,
-    max_iterations: int = 8,
 ) -> str:
     if not context:
         return ""

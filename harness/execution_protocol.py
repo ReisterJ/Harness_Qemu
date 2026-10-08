@@ -15,12 +15,8 @@ INPUT_ROOT = "/work/validation/inputs"
 REQUEST_ROOT = f"{PROTOCOL_ROOT}/requests"
 PENDING_ROOT = f"{PROTOCOL_ROOT}/pending"
 RESPONSE_ROOT = f"{PROTOCOL_ROOT}/responses"
-FEEDBACK_ROOT = f"{PROTOCOL_ROOT}/feedback"
-FEEDBACK_READ_LOG = f"{PROTOCOL_ROOT}/feedback-reads.jsonl"
 PROCESSED_ROOT = f"{PROTOCOL_ROOT}/processed"
-SNAPSHOT_ROOT = f"{PROTOCOL_ROOT}/snapshots"
 RUNNER_PATH = "/work/validation/run-input"
-FEEDBACK_READER_PATH = "/work/validation/read-feedback"
 REQUEST_TEMPLATE_PATH = f"{PROTOCOL_ROOT}/request-template.json"
 README_PATH = f"{PROTOCOL_ROOT}/README.md"
 
@@ -39,7 +35,6 @@ class ExecutionRequest:
     program_args: tuple[str, ...]
     timeout_s: int
     env: dict[str, str]
-    parent_input_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -49,7 +44,6 @@ class ExecutionRequest:
             "program_args": list(self.program_args),
             "timeout_s": self.timeout_s,
             "env": dict(self.env),
-            "parent_input_id": self.parent_input_id,
         }
 
 
@@ -118,20 +112,7 @@ def parse_request(raw: bytes | str, *, filename: str | None = None,
         if len(normalized) > 4096:
             raise ExecutionRequestError(f"environment value for {key!r} is too long")
         env[key] = normalized
-    parent_input_id = value.get("parent_input_id")
-    if parent_input_id is not None and (
-        not isinstance(parent_input_id, str)
-        or not (
-            _SAFE_ID.fullmatch(parent_input_id)
-            or re.fullmatch(r"[0-9a-fA-F]{64}", parent_input_id)
-        )
-    ):
-        raise ExecutionRequestError(
-            "parent_input_id must be a request identifier or SHA-256 digest"
-        )
-    return ExecutionRequest(
-        request_id, input_path, tuple(args), timeout_s, env, parent_input_id
-    )
+    return ExecutionRequest(request_id, input_path, tuple(args), timeout_s, env)
 
 
 def target_argv(binary_path: str, program_args: tuple[str, ...],
@@ -179,27 +160,6 @@ exit 124
 '''
 
 
-def protocol_feedback_reader_script() -> bytes:
-    return b'''#!/bin/sh
-set -eu
-[ "$#" -eq 1 ] || { echo "usage: /work/validation/read-feedback REQUEST_ID" >&2; exit 2; }
-id=$1
-case "$id" in [A-Za-z0-9]*) ;; *) echo "unsafe request id" >&2; exit 2;; esac
-case "$id" in *[!A-Za-z0-9_.-]*) echo "unsafe request id" >&2; exit 2;; esac
-[ "${#id}" -le 80 ] || { echo "request id is too long" >&2; exit 2; }
-feedback="/work/validation/execution/feedback/$id.json"
-read_log="/work/validation/execution/feedback-reads.jsonl"
-now=$(date +%s 2>/dev/null || echo 0)
-if [ -f "$feedback" ]; then
-  printf '{"request_id":"%s","status":"ready","wall_time_s":%s}\\n' "$id" "$now" >> "$read_log" 2>/dev/null || true
-  cat -- "$feedback"
-else
-  printf '{"request_id":"%s","status":"pending","wall_time_s":%s}\\n' "$id" "$now" >> "$read_log" 2>/dev/null || true
-  printf '{"schema_version":1,"status":"pending","request_id":"%s"}\\n' "$id"
-fi
-'''
-
-
 def protocol_template(default_args: list[str] | None = None) -> bytes:
     return (json.dumps({
         "schema_version": 1,
@@ -208,30 +168,14 @@ def protocol_template(default_args: list[str] | None = None) -> bytes:
         "program_args": default_args or ["{input_file}"],
         "timeout_s": 120,
         "env": {},
-        "parent_input_id": None,
     }, indent=2, ensure_ascii=False) + "\n").encode()
 
 
-def protocol_readme(
-    *, symbolic_enabled: bool, max_requests: int = 8,
-    max_concurrent_symcc_jobs: int = 1,
-) -> bytes:
-    """Container-side README for the execution protocol.
-
-    Rolled back (2026-10-08) to the 2026-09-23 text: no feedback reader, no
-    auto-delivered `ready_feedback`.  The round cap stays documented because
-    the prompt still states a per-phase request budget.
-    """
+def protocol_readme(*, symbolic_enabled: bool) -> bytes:
     symbolic = (
         "The Harness also runs this same input through the configured prebuilt SymCC binary, "
         "then replays generated inputs on the ordinary target. Treat those results as feedback, not proof."
         if symbolic_enabled else "Only the ordinary target is run."
-    )
-    limit_note = (
-        f"The Harness accepts at most {max(1, int(max_requests))} input requests in this "
-        "phase; requests beyond the limit receive `iteration_limit_reached` and are not "
-        "executed."
-        if symbolic_enabled else ""
     )
     return f'''# Dynamic execution protocol
 
@@ -241,17 +185,8 @@ Put each candidate below `{INPUT_ROOT}/`, create a JSON request below
     {RUNNER_PATH} {REQUEST_ROOT}/round-001.json
 
 The request uses `schema_version`, a fresh unique `request_id`, `input_path`,
-`program_args` (with `{{input_file}}` exactly once), `timeout_s`/`env`, and an
-optional `parent_input_id` (the originating request id or input SHA-256).
+`program_args` (with `{{input_file}}` exactly once), and optional `timeout_s`/`env`.
 The Harness owns the executable selection and execution. {symbolic}
-{limit_note}
 Request ids are single-use; use a fresh id for every candidate. Reproduce the final PoC through the
-ordinary target and satisfy the normal crash-result contract. The `run-input`
-wrapper is only for exploration and confirmation inside this guarded phase.
-In `crash-result.xml`, `reproduction_command` must be the ordinary target
-invocation from the runtime contract with the literal PoC path; do not put the
-`run-input` wrapper or a request JSON path there because Grade runs in a fresh
-container and receives only the PoC bytes. For the final in-container
-confirmation, submit a fresh request for the saved PoC and run that request
-through `run-input`.
+ordinary target and satisfy the normal crash-result contract.
 '''.encode()

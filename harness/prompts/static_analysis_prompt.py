@@ -83,14 +83,8 @@ Each candidate must contain these keys:
   "root_cause": "why validation or lifetime handling is insufficient",
   "verification_plan": "concrete dynamic steps the next agent should try",
   "observability_targets": [
-    {{
-      "target_function": "parse_chunk",
-      "target_region": {{"source_file": "src/parser.c", "start_line": 118, "end_line": 130}},
-      "target_operation": {{"source_file": "src/parser.c", "function": "parse_chunk", "line": 123}},
-      "target_condition": {{"source_file": "src/parser.c", "function": "parse_chunk", "line": 121,
-       "why": "branch that controls whether the vulnerable operation executes"}},
-      "why": "operation marker that dynamic feedback should treat as the exact candidate site"
-    }}
+    {{"file": "src/parser.c", "function": "parse_chunk", "line": 123,
+     "why": "candidate sink or reachability checkpoint"}}
   ],
   "confidence": 0.0,
   "related_candidates": []
@@ -100,11 +94,6 @@ Each candidate must contain these keys:
 The confidence must be a number from 0.0 to 1.0. Do not emit `<poc_path>`,
 `<reproduction_command>`, `<crash_output>`, or any claim that the issue was
 already dynamically reproduced.
-
-For `observability_targets`, prefer a precise `target_operation` over a function
-entry. A function-only target is allowed when the exact operation is unknown, but
-it must be treated as coarse: it can guide dynamic exploration, not prove that
-the vulnerable operation has executed.
 """
 
 

@@ -21,7 +21,6 @@ from harness.target_builder import (
     tree_sha256,
     validate_generated_context,
 )
-from harness.prompts.build_prompt import build_plan_prompt
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -42,20 +41,6 @@ def _local_repo(tmp_path: Path) -> tuple[Path, str]:
     _git(repo, "commit", "-qm", "initial")
     commit = _git(repo, "rev-parse", "HEAD")
     return repo, commit
-
-
-def test_build_prompt_scopes_non_pie_policy_to_userspace_asan():
-    prompt = build_plan_prompt(
-        repo="https://example.test/repo",
-        branch="main",
-        commit="a" * 40,
-        kind="cli",
-        image_tag="target:test",
-    )
-    assert "compile the target objects with `-fno-pie`" in prompt
-    assert "link each runnable target/fuzzer executable with `-no-pie`" in prompt
-    assert "Type: EXEC" in prompt
-    assert "Do not apply this policy to kernel/QEMU guest images" in prompt
 
 
 def _generated_context(tmp_path: Path, repo: str, commit: str) -> Path:

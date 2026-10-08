@@ -103,30 +103,6 @@ class LogicArtifact:
         )
 
 
-@dataclass(frozen=True)
-class AdditionalCrashSubmission:
-    """A separately discovered crash that must not replace the main finding."""
-
-    finding_id: str
-    summary: str
-    crash: CrashArtifact
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "finding_id": self.finding_id,
-            "summary": self.summary,
-            "crash": self.crash.to_dict(),
-        }
-
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> AdditionalCrashSubmission:
-        return cls(
-            finding_id=str(d.get("finding_id") or ""),
-            summary=str(d.get("summary") or ""),
-            crash=CrashArtifact.from_dict(d["crash"]),
-        )
-
-
 @dataclass
 class StaticFinding:
     """A source-level hypothesis produced by the static find phase.
@@ -204,8 +180,7 @@ class DynamicValidationResult:
     candidate_id: str
     status: str  # validated, not_reached, reached_no_crash, reached_no_effect,
                  # wrong_path, environment_blocked, invalid_submission,
-                 # agent_failed, iteration_exhausted; false_positive is
-                 # rejected because the static candidate is trusted
+                 # agent_failed, false_positive, iteration_exhausted
     reached_functions: list[str] = field(default_factory=list)
     reachability_evidence: str = ""
     reason: str = ""
@@ -215,15 +190,11 @@ class DynamicValidationResult:
     symbolic_execution: dict[str, Any] | None = None
     iterations: list[dict[str, Any]] = field(default_factory=list)
     iteration_errors: list[str] = field(default_factory=list)
-    additional_crashes: list[AdditionalCrashSubmission] = field(default_factory=list)
-    additional_crash_errors: list[str] = field(default_factory=list)
-    status_breakdown: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["crash"] = self.crash.to_dict() if self.crash else None
         d["logic"] = self.logic.to_dict() if self.logic else None
-        d["additional_crashes"] = [item.to_dict() for item in self.additional_crashes]
         return d
 
     @classmethod
@@ -251,25 +222,6 @@ class DynamicValidationResult:
                 if isinstance(d.get("iteration_errors", []), list)
                 else []
             ),
-            additional_crashes=(
-                [
-                    AdditionalCrashSubmission.from_dict(item)
-                    for item in d.get("additional_crashes", [])
-                    if isinstance(item, dict) and isinstance(item.get("crash"), dict)
-                ]
-                if isinstance(d.get("additional_crashes", []), list)
-                else []
-            ),
-            additional_crash_errors=(
-                [str(item) for item in d.get("additional_crash_errors", [])]
-                if isinstance(d.get("additional_crash_errors", []), list)
-                else []
-            ),
-            status_breakdown=(
-                d.get("status_breakdown")
-                if isinstance(d.get("status_breakdown"), dict)
-                else {}
-            ),
         )
 
 
@@ -291,49 +243,6 @@ class GraderVerdict:
             score=d["score"],
             criteria=d["criteria"],
             evidence=d["evidence"],
-        )
-
-
-@dataclass
-class AdditionalFindingResult:
-    """Grade result for a crash discovered outside the primary candidate."""
-
-    finding_id: str
-    summary: str
-    crash: CrashArtifact
-    status: str
-    verdict: GraderVerdict | None = None
-    grade_transcript: list[dict[str, Any]] = field(default_factory=list)
-    elapsed_s: float = 0.0
-    error: str | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "finding_id": self.finding_id,
-            "summary": self.summary,
-            "crash": self.crash.to_dict(),
-            "status": self.status,
-            "verdict": self.verdict.to_dict() if self.verdict else None,
-            "grade_transcript": self.grade_transcript,
-            "elapsed_s": self.elapsed_s,
-            "error": self.error,
-        }
-
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> AdditionalFindingResult:
-        return cls(
-            finding_id=str(d.get("finding_id") or ""),
-            summary=str(d.get("summary") or ""),
-            crash=CrashArtifact.from_dict(d["crash"]),
-            status=str(d.get("status") or "unknown"),
-            verdict=GraderVerdict.from_dict(d["verdict"]) if d.get("verdict") else None,
-            grade_transcript=(
-                [item for item in d.get("grade_transcript", []) if isinstance(item, dict)]
-                if isinstance(d.get("grade_transcript", []), list)
-                else []
-            ),
-            elapsed_s=float(d.get("elapsed_s") or 0.0),
-            error=d.get("error"),
         )
 
 
@@ -438,7 +347,6 @@ class RunResult:
     error: str | None = None
     instrumentation: dict[str, Any] | None = None
     symbolic_execution: dict[str, Any] | None = None
-    additional_findings: list[AdditionalFindingResult] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -453,7 +361,6 @@ class RunResult:
             "error": self.error,
             "instrumentation": self.instrumentation,
             "symbolic_execution": self.symbolic_execution,
-            "additional_findings": [item.to_dict() for item in self.additional_findings],
         }
 
     @classmethod
@@ -470,15 +377,6 @@ class RunResult:
             error=d.get("error"),
             instrumentation=d.get("instrumentation"),
             symbolic_execution=d.get("symbolic_execution"),
-            additional_findings=(
-                [
-                    AdditionalFindingResult.from_dict(item)
-                    for item in d.get("additional_findings", [])
-                    if isinstance(item, dict) and isinstance(item.get("crash"), dict)
-                ]
-                if isinstance(d.get("additional_findings", []), list)
-                else []
-            ),
         )
 
     def to_json(self) -> str:
