@@ -1,5 +1,14 @@
 # SymCC 反馈稳定化实验目标矩阵
 
+> ⚠️ 本清单反映 2026-09-24 状态；2026-10-09 的盘点与重测可行性见
+> [`symcc-targets-inventory-20261009.md`](symcc-targets-inventory-20261009.md)（含镜像检查结果与重建计划）。
+>
+> ⚠️ 表中 mruby-57672 的静态报告路径已变更：`targets/mruby-arvo-feedback/static-report-57672-v2.json`
+> 于 2026-10-08 随目录删除；10-08 分支会话最后使用的是
+> `results/experiments/mruby-async-paired-20260923/static_analysis.json`（原描述 + `location` 锚点）。
+> 各版本内容与使用波次见
+> [`experiment-records/2026-10-09-mruby-57672-static-report-versions.md`](experiment-records/2026-10-09-mruby-57672-static-report-versions.md)。
+
 这份清单用于下一阶段的 `dynamic-pairs` 对比实验。目标是扩大样本规模，同时避免把构建问题、手工命令差异和静态报告差异混进实验变量。
 
 机器可读版本见：
@@ -21,7 +30,7 @@ docs/research/symcc-feedback-experiment-targets.json
 
 | ID | Target path | Static report | 目的 |
 | --- | --- | --- | --- |
-| `mruby-57672` | `targets/mruby-arvo-feedback` | `targets/mruby-arvo-feedback/static-report-57672-v2.json` | 复杂对象生命周期和 GC 状态；验证反馈是否减少错误搜索空间 |
+| `mruby-57672` | `targets/mruby-arvo-feedback`（已随 2026-10-08 回滚删除，见下注） | **最后使用版**：`results/experiments/mruby-async-paired-20260923/static_analysis.json`（原描述 + `location` 锚点）；历史版 `targets/mruby-arvo-feedback/static-report-57672-v2.json`（已删） | 复杂对象生命周期和 GC 状态；验证反馈是否减少错误搜索空间 |
 | `arvo-62290` | `targets/arvo-62290-experiment` | `results/experiments/symcc-target-site-feedback-20260924/shared/arvo-62290-static-report.json` | 曾暴露 target-anchor、PIE/noise、额外 crash 问题；检验 failure category 和 additional finding |
 | `arvo-38283` | `results/experiments/cybergym-symcc-followup-20260928/targets/arvo-38283` | `results/experiments/cybergym-symcc-followup-20260928/targets/arvo-38283/static_analysis.json` | 协议解析类结构化输入，扩大到 FreeRADIUS TACACS |
 | `arvo-55020` | `results/experiments/cybergym-symcc-followup-20260928/targets/arvo-55020` | `results/experiments/cybergym-symcc-followup-20260928/targets/arvo-55020/static_analysis.json` | 二进制格式/重定位处理，扩大到 binutils |

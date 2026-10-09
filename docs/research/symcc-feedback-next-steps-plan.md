@@ -314,6 +314,8 @@ results/<target>/<run>/evidence_ledger.jsonl
 
 ### 4.2 冒烟测试
 
+> 2026-10-09 注：`targets/mruby-arvo-feedback/` 及 `static-report-57672-v2.json` 已于 2026-10-08 删除（提交 `a1bb97d6e`），下面命令保留的是当时的事实。各版本内容、使用波次与最后使用版见 [`experiment-records/2026-10-09-mruby-57672-static-report-versions.md`](experiment-records/2026-10-09-mruby-57672-static-report-versions.md)。
+
 先做 MRuby 57672 的单组 feedback 冒烟：
 
 ```sh

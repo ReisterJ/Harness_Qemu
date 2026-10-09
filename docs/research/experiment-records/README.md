@@ -58,12 +58,18 @@ YYYY-MM-DD-<target>-<experiment-topic>.md
 | 2026-10-04 | [MRuby 57672 supervisor ablation](2026-10-04-mruby-57672-supervisor-ablation.md) | supervisor 是否减少无意义搜索 | 否 | 是 | supervisor 显著减少 broad fuzzing 时间；未复现目标 UAF，但发现稳定 bignum ASan crash |
 | 2026-10-05 | [MRuby 57672 supervisor postfix rerun](2026-10-05-mruby-57672-supervisor-postfix-rerun.md) | 修复后 supervisor 是否按预期纠偏 | 否 | 否 | supervisor 成功拦截后台 fuzz / broad fuzzing；但 off 组暴露 SymCC 产物，不能作为干净对照 |
 | 2026-10-06 | [MRuby 57672 clean off / supervisor ablation](2026-10-06-mruby-57672-clean-supervisor-ablation.md) | 干净 off 条件下 supervisor 是否改变已知漏洞复现过程 | 否 | 未确认 | 两组均未产出目标 UAF PoC；rules 组有未验收的逻辑异常线索，时间差约 100 秒，单次实验不足以支持效果结论 |
+| 2026-10-09 | [MRuby 57672 静态报告版本对照](2026-10-09-mruby-57672-static-report-versions.md) | 同一目标用过哪些静态报告、各波次分别用哪份 | — | — | 共 6 种内容；`targets/mruby-arvo-feedback/static-report-57672-v2.json` 已删；**10-08 分支会话最后使用的是 `results/experiments/mruby-async-paired-20260923/static_analysis.json`**（原描述 + `location` 锚点） |
+
+> **静态报告路径注记**：本目录 10-04～10-06 的记录里写的 `targets/mruby-arvo-feedback/static-report-57672-v2.json`
+> 已于 2026-10-08 删除（该路径在记录当时是正确的历史事实）。要复原当时用的那一版或确认"最后使用的是哪份"，
+> 见 [MRuby 57672 静态报告版本对照](2026-10-09-mruby-57672-static-report-versions.md)。
 
 ## 待回填
 
 已有部分历史实验散落在 `results/experiments/` 和 `docs/research/*` 中，后续如需写报告，可按优先级回填：
 
-- MRuby 57672 SymCC 多轮对比；
+- ~~MRuby 57672 SymCC 多轮对比~~ → 已完成：[MRuby 57672 SymCC 速度报告](../../../results/experiments/mruby-57672-symcc-speed-report-20261008.md)
+  与 [最终报告 §1](../../../results/experiments/mruby-57672-final-report-20261008.md)（报告版本对照见上面的 2026-10-09 记录）；
 - Ghostscript 51089 target-site feedback 实验；
 - arvo-62290 target anchor / PIE noise / additional crash 实验；
 - arvo-38283、arvo-55020 CyberGym follow-up 实验。

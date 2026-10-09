@@ -149,7 +149,7 @@ SymCC 本身不会理解静态报告中的漏洞语义，也不会计算“对�
 
 ### 8.2 mruby 57672 的具体例子
 
-实验静态报告将 `mrb_env_unshare` 的 `src/vm.c:397` 作为 `observability_targets`。该行是 `else if (p)` 条件；其后的代码为：
+实验静态报告将 `mrb_env_unshare` 的 `src/vm.c:397` 作为 `observability_targets`（该报告 = `results/experiments/symcc-target-site-feedback-20260924/shared/arvo-57672-static-report.json`；**它不是** 10-08 分支会话最后使用的版本，后者是 `results/experiments/mruby-async-paired-20260923/static_analysis.json`，见 [`experiment-records/2026-10-09-mruby-57672-static-report-versions.md`](experiment-records/2026-10-09-mruby-57672-static-report-versions.md)）。该行是 `else if (p)` 条件；其后的代码为：
 
 ```c
 else if (p) {                     // line 397: 条件

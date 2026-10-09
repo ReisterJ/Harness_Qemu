@@ -1,5 +1,10 @@
 # SymCC Feedback Stabilization Work Plan
 
+> 2026-10-09 注：本文（2026-10-02 计划）中的 `targets/mruby-arvo-feedback/` 及
+> `targets/mruby-arvo-feedback/static-report-57672-v2.json` 已于 2026-10-08 删除（提交 `a1bb97d6e`），
+> 文中命令保留的是当时的事实。mruby-57672 各版本静态报告的内容、使用波次与**最后使用版**
+> 见 [`experiment-records/2026-10-09-mruby-57672-static-report-versions.md`](experiment-records/2026-10-09-mruby-57672-static-report-versions.md)。
+
 ## 1. Objective
 
 This plan turns the current SymCC feedback prototype into a more reliable
@@ -429,6 +434,8 @@ Status as of 2026-10-01:
   `target_operation` for `src/vm.c:398` in `mrb_env_unshare` instead of the old
   coarse report. The map resolves this anchor to 5 source-location markers and
   1 target block in the local image.
+
+> 2026-10-09 注：`targets/mruby-arvo-feedback/` 及 `static-report-57672-v2.json` 已于 2026-10-08 删除（提交 `a1bb97d6e`），本文保留的是当时的事实。各版本内容、使用波次与最后使用版见 [`experiment-records/2026-10-09-mruby-57672-static-report-versions.md`](experiment-records/2026-10-09-mruby-57672-static-report-versions.md)。
 
 Verified commands:
 

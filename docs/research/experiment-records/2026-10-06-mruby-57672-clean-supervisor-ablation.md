@@ -17,6 +17,10 @@ primary_candidate: candidate_001, heap-use-after-free at src/vm.c:398
 
 本实验比较 supervisor 关闭和启用 rules 时，agent 对同一个已知 MRuby 候选的复现表现。两组均使用干净 off 镜像；该镜像内没有 SymCC binary、feedback map、runtime 或相关环境变量。
 
+> 静态报告注记：下面命令里的 `targets/mruby-arvo-feedback/static-report-57672-v2.json` 已于 2026-10-08 删除
+> （当时用的是其中的"行级锚点版"，location `src/vm.c:398`）。各版本内容与最后使用版见
+> [2026-10-09 MRuby 57672 静态报告版本对照](2026-10-09-mruby-57672-static-report-versions.md)。
+
 ## 命令
 
 ```sh

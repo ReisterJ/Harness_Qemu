@@ -42,7 +42,8 @@ rules supervisor 是否能减少 worker agent 的无意义搜索，尤其是 bro
 - 目标：`targets/mruby-arvo-feedback`
 - 目标镜像：`local/arvo-57672-site-feedback-nogit:20260924-sitefix1`
 - 源码 commit：`2de602b8696bc21e4cbc2c6e08e2fae27b1ad79b`
-- 静态报告：`targets/mruby-arvo-feedback/static-report-57672-v2.json`
+- 静态报告：`targets/mruby-arvo-feedback/static-report-57672-v2.json`（该路径已于 2026-10-08 删除；
+  当时用的是其中的"行级锚点版"，版本对照见 [2026-10-09 记录](2026-10-09-mruby-57672-static-report-versions.md)）
 - 普通执行入口：`/out/mruby_fuzzer <ruby-source-file>`
 - 检测器：ASan
 - 模型：`deepseek-flash`
