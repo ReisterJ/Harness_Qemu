@@ -1595,7 +1595,11 @@ def _collect_protocol_coverage(
         f"{shlex.quote(profdata_tool)} merge -sparse {shlex.quote(profraw)} "
         f"-o {shlex.quote(profdata)} && "
         f"{shlex.quote(cov_tool)} export -instr-profile={shlex.quote(profdata)} "
-        f"{shlex.quote(binary)} -format=lcov > {shlex.quote(lcov)}"
+        f"{shlex.quote(binary)}"
+        + "".join(
+            f" -object {shlex.quote(str(obj))}" for obj in (target.coverage_objects or ())
+        )
+        + f" -format=lcov > {shlex.quote(lcov)}"
     )
     try:
         rc, _out, err = docker_ops.exec_sh(container, merge, timeout=120)
@@ -1704,6 +1708,14 @@ def _prepare_prebuilt_symcc_protocol(
         )
         if rc:
             raise RuntimeError(f"cannot install {label} execution guard: {err[-300:]}")
+
+    for extra in target.coverage_objects or ():
+        check = f"test -f {shlex.quote(extra)} && test -r {shlex.quote(extra)}"
+        rc, _out, err = docker_ops.exec_sh(container, check, timeout=15)
+        if rc:
+            raise RuntimeError(
+                f"coverage object is missing or unreadable: {extra}: {err[-300:]}"
+            )
 
     vcs_path = f"{target.source_root.rstrip('/')}/.git"
     rc, _out, err = docker_ops.exec_sh(

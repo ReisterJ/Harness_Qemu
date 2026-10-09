@@ -71,6 +71,7 @@ class TargetConfig:
     memory_limit: str = "4g"          # docker --memory
     reattack_harness: str | None = None  # in-image script that runs every /poc/* and exits 1 on crash
     coverage_binary_path: str | None = None  # prebuilt coverage build used for per-input execution feedback
+    coverage_objects: list[str] | None = None  # extra instrumented objects (shared libraries) for the lcov export
     instrumentation: dict[str, Any] | None = field(default=None, repr=False)
     symbolic_execution: dict[str, Any] | None = field(default=None, repr=False)
     manifest: dict[str, Any] | None = field(default=None, repr=False)
@@ -195,6 +196,23 @@ class TargetConfig:
             raise ValueError(
                 "coverage_binary_path must be an absolute container path"
             )
+        coverage_objects_raw = cfg.get("coverage_objects")
+        coverage_objects: list[str] | None = None
+        if coverage_objects_raw is not None:
+            if not isinstance(coverage_objects_raw, list) or not coverage_objects_raw:
+                raise ValueError(
+                    "coverage_objects must be a non-empty list of absolute container paths"
+                )
+            for entry in coverage_objects_raw:
+                if (
+                    not isinstance(entry, str)
+                    or not entry.startswith("/")
+                    or "\x00" in entry
+                ):
+                    raise ValueError(
+                        "coverage_objects entries must be absolute container paths"
+                    )
+            coverage_objects = list(coverage_objects_raw)
 
         return cls(
             name=target_dir.name,
@@ -229,6 +247,7 @@ class TargetConfig:
             ),
             reattack_harness=cfg.get("reattack_harness"),
             coverage_binary_path=coverage_binary_path,
+            coverage_objects=coverage_objects,
             instrumentation=instrumentation,
             symbolic_execution=symbolic_execution,
             manifest=manifest,

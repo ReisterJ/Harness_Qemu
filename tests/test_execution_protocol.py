@@ -272,12 +272,13 @@ def test_prebuilt_symcc_agent_forwards_phase_timeout_and_no_deadline(monkeypatch
 # ── per-input execution coverage (agent seeds only) ───────────────────────────
 
 
-def _coverage_target():
+def _coverage_target(**overrides):
     target = _target()
     return TargetConfig(
         **{
             **target.__dict__,
             "coverage_binary_path": "/out/target-cov",
+            **overrides,
         }
     )
 
@@ -515,6 +516,78 @@ def test_target_config_rejects_relative_coverage_binary(tmp_path):
     )
     with pytest.raises(ValueError, match="coverage_binary_path"):
         TargetConfig.load(tmp_path)
+
+
+def test_target_config_rejects_relative_coverage_object(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "image_tag: sample:latest\n"
+        "github_url: local\n"
+        "commit: " + "a" * 40 + "\n"
+        "coverage_objects: [lib/freeradius.so]\n"
+    )
+    with pytest.raises(ValueError, match="coverage_objects"):
+        TargetConfig.load(tmp_path)
+
+
+def test_coverage_export_passes_declared_objects(monkeypatch):
+    target = _coverage_target(
+        coverage_objects=["/usr/local/lib/libfreeradius-tacacs.so"],
+    )
+    lcov = _lcov(
+        ("/src/freeradius/src/protocols/tacacs/decode.c", [(221, 5)], [("fr_tacacs_decode", 5)]),
+    )
+    commands = []
+
+    def fake_exec(container, command, timeout=0):
+        commands.append(command)
+        if command.startswith("command -v llvm-profdata"):
+            return 0, "/usr/bin/llvm-profdata-15\n", ""
+        if command.startswith("command -v llvm-cov"):
+            return 0, "/usr/bin/llvm-cov-15\n", ""
+        if command.startswith("readlink -f"):
+            return 0, f"{INPUT_ROOT}/candidate.bin\n", ""
+        if command.startswith("stat -c"):
+            return 0, "4\n", ""
+        return 0, "", ""
+
+    def fake_read(container, path):
+        if path.endswith("candidate.bin"):
+            return b"seed"
+        if path.endswith(".lcov"):
+            return lcov.encode()
+        return b""
+
+    monkeypatch.setattr(docker_ops, "exec_sh", fake_exec)
+    monkeypatch.setattr(docker_ops, "read_file", fake_read)
+    monkeypatch.setattr(docker_ops, "write_file", lambda *a, **k: None)
+
+    response = _execute_prebuilt_protocol_request(
+        container="target",
+        target=target,
+        raw=json.dumps(_request()).encode(),
+        filename="round-001.json",
+        round_id=1,
+    )
+
+    assert response["coverage"]["status"] == "completed"
+    export = [command for command in commands if "llvm-cov-15 export" in command]
+    assert export and "-object /usr/local/lib/libfreeradius-tacacs.so" in export[0]
+
+
+def test_prepare_rejects_missing_coverage_object(monkeypatch):
+    target = _coverage_target(coverage_objects=["/usr/local/lib/missing.so"])
+
+    def fake_exec(container, command, timeout=0):
+        if "test -f /usr/local/lib/missing.so" in command:
+            return 1, "", "missing"
+        return 0, "", ""
+
+    monkeypatch.setattr(docker_ops, "exec_sh", fake_exec)
+    monkeypatch.setattr(docker_ops, "write_file", lambda *a, **k: None)
+
+    with pytest.raises(RuntimeError, match="coverage object"):
+        _prepare_prebuilt_symcc_protocol("target", target)
 
 
 def test_focus_block_tracks_the_target_function_on_every_input():
