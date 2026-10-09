@@ -175,14 +175,45 @@ LLVMFuzzerTestOneInput
 primary candidate: not reproduced
 additional finding: stable ASan allocation-size-too-big
 reproduction: local image 3/3 stable
-upstream/latest: not checked
-deduplication: not checked
-security impact: not assessed
+upstream/latest: 已核实 — 4.0.0 起已修复（见 §8.1 / §8.2）
+deduplication: 与 candidate_001 无关；上游以独立 bugfix 修掉
+security impact: 内存安全缺陷（size_t 下溢导致的越界读 + 巨量分配请求），不止资源异常
 ```
 
-后续如果要正式报告该问题，需要进一步确认：
+### 8.1 上游状态核实（2026-10-09）
 
-- 是否存在于 upstream 最新版本；
-- 是否是已知 MRuby bignum 问题；
-- 是否能在非 fuzzing harness 的正常 MRuby CLI/API 中触发；
-- 是否属于可接受的资源异常、DoS，还是更严重的整数/大小计算缺陷。
+后续要正式报告该问题时列出的四个确认项现已全部回答：
+
+| 待确认项 | 结论 |
+|---|---|
+| 是否存在于 upstream 最新版本 | **否**。修复提交 `54fbf6c3e` "bigint.c: fix buffer overflow in mpz_div_2exp with large shift"（2025-12-30）；`git tag --contains 54fbf6c3e` → `4.0.0-rc`、`4.0.0`（2026-04-20 发布）及之后全部包含。即 **≥ 4.0.0 不受影响，≤ 3.x 受影响** |
+| 是否是已知 MRuby bignum 问题 | **是**。上游有明确、自述为 "buffer overflow" 的修复提交，不是未上报的新问题 |
+| 是否能在非 fuzzing 的正常 CLI/API 中触发 | **能**。旧 commit 上以普通 `mruby` CLI 直接复现（非 `mruby_fuzzer` 专有路径） |
+| 性质：资源异常 / DoS / 更严重 | **更严重**。根因是 `size_t` 下溢：`mpz_realloc(mrb, &y, x->sz - digs)` 与随后的拷贝循环条件 `i < x->sz - digs` 在同一表达式下同时下溢，前者表现为巨量分配（ASan 先拦成 `allocation-size-too-big`），后者是真正的越界读 |
+
+`mpz_div_2exp` 修复前/后（`mrbgems/mruby-bigint/core/bigint.c`）：
+
+```c
+/* before */
+size_t digs = e / DIG_SIZE;
+mpz_realloc(mrb, &y, x->sz - digs);            /* digs > x->sz → size_t 下溢 */
+for (size_t i = 0; i < x->sz - digs; i++) ...  /* 同样下溢 → 越界读 */
+
+/* after (54fbf6c3e) */
+if (digs >= x->sz) { zero(z); return; }        /* 移位量超过位宽时直接归零 */
+```
+
+### 8.2 A/B 验证（旧 commit vs. 最新 master）
+
+验证在 `/tmp/mrb-bignum-verify/` 内进行，未改动工作区。两份源码都用同一份 ASan 构建配置（`toolchain :clang`、`-fsanitize=address -g -O1 -fno-omit-frame-pointer`、`gembox "default"` 即含 `mruby-bigint`），在 `n132/arvo:57672-vul` 镜像内 `rake` 构建。
+
+| 用例 | 旧 `2de602b86`（2023-04-01，本实验目标 commit） | 最新 `f3542a6b9`（2026-10-09 master） |
+|---|---|---|
+| 本文 §3 的 72 字节 PoC（`mruby_fuzzer`，镜像自带二进制） | ✅ ASan `allocation-size-too-big`，3/3 | — |
+| 本文 §3 的 72 字节 PoC（**普通 `mruby` CLI**） | ✅ 同样 `allocation-size-too-big` | ❌ 不报错（`>>` 正常求值，脚本随后因 `Integer` 没有 `=~` 而退出） |
+| `p (1 << 200) >> 7777777`（最小化触发） | ✅ `allocation-size-too-big` | ❌ 输出 `0`，rc=0 |
+| `p 7777…7777 >> 7777777`（移位量 > 位宽） | ✅ `allocation-size-too-big` | ❌ 输出 `0`，rc=0 |
+| `p 1 << 777777777777`（兄弟用例） | ⚠️ ASan allocator OOM（先尝试 ~97GB 分配） | ✅ 干净 `RangeError: shift width too large` |
+| `p (1 << 200) >> <bignum>` | ✅ `RangeError: integer out of range` | ✅ `RangeError: integer out of range` |
+
+结论：本事件是 **2023 年版本上的真实缺陷，已由上游在 4.0.0 中修复**，之后的新 mruby 上无需再按 additional finding 跟踪；对老版本（≤ 3.x）仍可作为独立的 bignum 内存安全缺陷上报。左侧的 `1 << 777777777777` 行为（先巨量分配再失败 → 干净 `RangeError`）也是同一修复顺带改善的对照面。

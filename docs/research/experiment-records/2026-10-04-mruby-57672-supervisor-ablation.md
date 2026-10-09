@@ -156,6 +156,8 @@ stack does not contain mrb_env_unshare
 docs/research/mruby-bignum-allocation-size-too-big-asan.md
 ```
 
+> 后续核实（2026-10-09，见该文档 §8.1 / §8.2）：这是 2023 版本上的真实缺陷，上游已在 **4.0.0**（修复提交 `54fbf6c3e`）中修掉；旧 commit 上普通 CLI 亦可复现。因此本 finding 对当前 pinned 目标 commit 依然有效，但不再代表上游最新代码的问题。
+
 注意：agent 当时确实写入了 `/work/validation/additional-crashes.jsonl`，但格式不符合 harness schema，导致结果中只记录为：
 
 ```text
