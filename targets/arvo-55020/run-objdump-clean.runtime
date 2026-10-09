@@ -1,0 +1,41 @@
+#!/bin/sh
+# objdump file-driver wrapper.
+#
+# The target driver accepts exactly one argument (INPUT_FILE) and rejects
+# libFuzzer-style flags, but the dynamic-execution protocol may still hand it
+# such flags.  Accept them before and/or after the input file, warn about the
+# ones that are ignored, and always run the single input.
+#
+#   run-objdump-clean INPUT_FILE
+#   run-objdump-clean -runs=50000 -max_len=512 INPUT_FILE
+#   run-objdump-clean INPUT_FILE -runs=2000
+set -eu
+
+flags=""
+input=""
+for arg in "$@"; do
+    case "$arg" in
+        -*)
+            flags="$flags $arg"
+            ;;
+        *)
+            if [ -z "$input" ]; then
+                input="$arg"
+            else
+                flags="$flags $arg"
+            fi
+            ;;
+    esac
+done
+
+if [ -z "$input" ] || [ ! -f "$input" ]; then
+    echo "usage: run-objdump-clean INPUT_FILE" >&2
+    exit 2
+fi
+
+if [ -n "$flags" ]; then
+    echo "warning: run-objdump-clean ignores unsupported arguments:$flags" >&2
+fi
+
+export ASAN_OPTIONS="${ASAN_OPTIONS:+$ASAN_OPTIONS:}detect_leaks=0"
+exec /out/fuzz_objdump_safe "$input"

@@ -1,0 +1,50 @@
+#!/bin/sh
+# FreeRADIUS TACACS fuzzer driver (single-shot replay).
+#
+# The dynamic-execution protocol lets the agent choose libFuzzer arguments, so
+# accept fuzzer flags before and/or after the input file:
+#
+#   run-fuzzer-tacacs-clean INPUT_FILE
+#   run-fuzzer-tacacs-clean -runs=50000 -max_len=512 INPUT_FILE
+#   run-fuzzer-tacacs-clean INPUT_FILE -runs=2000
+#
+# Flags are forwarded to the fuzzer; without an explicit -runs the run stays
+# single-shot so a replay of one input cannot turn into a fuzzing campaign.
+set -eu
+
+flags=""
+input=""
+for arg in "$@"; do
+    case "$arg" in
+        -*)
+            flags="$flags $arg"
+            ;;
+        *)
+            if [ -f "$arg" ] && [ -z "$input" ]; then
+                input="$arg"
+            else
+                flags="$flags $arg"
+            fi
+            ;;
+    esac
+done
+
+if [ -z "$input" ]; then
+    echo "usage: run-fuzzer-tacacs-clean [FUZZER_ARGS...] INPUT_FILE [FUZZER_ARGS...]" >&2
+    exit 2
+fi
+
+corpus=$(mktemp -d /tmp/tacacs-input.XXXXXX)
+trap 'rm -rf "$corpus"' EXIT HUP INT TERM
+cp -- "$input" "$corpus/input"
+
+case " $flags " in
+    *" -runs"*)
+        # shellcheck disable=SC2086
+        exec /out/fuzzer_tacacs $flags "$corpus"
+        ;;
+    *)
+        # shellcheck disable=SC2086
+        exec /out/fuzzer_tacacs $flags -runs=1 "$corpus"
+        ;;
+esac

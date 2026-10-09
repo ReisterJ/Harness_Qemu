@@ -1,0 +1,12 @@
+#!/bin/sh
+# objdump fuzzer driver: keeps LeakSanitizer from reporting the driver's own
+# one-off allocation as a crash event.
+set -eu
+
+if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+    echo "usage: run-objdump-clean INPUT_FILE" >&2
+    exit 2
+fi
+
+export ASAN_OPTIONS="${ASAN_OPTIONS:+$ASAN_OPTIONS:}detect_leaks=0"
+exec /out/fuzz_objdump_safe "$1"

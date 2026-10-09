@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+
+export FR_LIBRARY_FUZZ_PROTOCOL=tacacs
+export FR_LIBRARY_PATH=/out/symcc-libs
+export LD_LIBRARY_PATH=/out/symcc-libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+exec /out/fuzzer_tacacs_symcc -D /src/freeradius-server/share/dictionary "$@"

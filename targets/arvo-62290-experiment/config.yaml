@@ -1,3 +1,8 @@
+# LEGACY (site-feedback era, 2026-09-24). The image below was deleted on
+# 2026-10-09 along with the other 62290 debris; `feedback_map_path`/`cpus`/
+# `max_concurrent_jobs` are ignored by the current harness. Rebuild the image
+# before reusing this config — or use `targets/arvo-62290/config.yaml`, which
+# points at the current image.
 # Controlled prebuilt image for rerunning the ARVO 62290 SymCC experiment.
 image_tag: local/arvo-62290-site-feedback-nogit:20260924-nopie-retest
 github_url: https://github.com/ittiam-systems/libavc
