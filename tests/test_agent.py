@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 from harness import docker_ops
 from harness.agent import (
+    _agent_cli_names,
+    _agent_watchdog,
     _build_agent_file,
     _is_unbounded_helper_process,
     _model_config,
@@ -196,7 +199,7 @@ def _fake_blocking_cli(monkeypatch):
 
 def test_watchdog_marks_model_blocked_when_stream_and_tools_stall(monkeypatch):
     _fake_blocking_cli(monkeypatch)
-    monkeypatch.setattr(docker_ops, "process_snapshot", lambda container: [])
+    monkeypatch.setattr(docker_ops, "process_snapshot", lambda container, **kw: [])
     result = asyncio.run(
         run_agent(
             "go",
@@ -217,7 +220,7 @@ def test_watchdog_marks_unbounded_helper_blocked(monkeypatch):
     monkeypatch.setattr(
         docker_ops,
         "process_snapshot",
-        lambda container: ["166 1 S python3 /tmp/socks5srv.py"],
+        lambda container, **kw: ["166 1 S python3 /tmp/socks5srv.py"],
     )
     result = asyncio.run(
         run_agent(
@@ -261,6 +264,83 @@ def test_watchdog_does_not_misclassify_timeout_wrapped_helper_children():
     assert _unbounded_helper_processes(processes) == [
         "103 1 S python3 unbounded_server.py"
     ]
+
+
+def test_agent_cli_names_are_matched_by_basename():
+    assert _agent_cli_names(("opencode",)) == ("opencode",)
+    assert _agent_cli_names(("/usr/local/bin/codex",)) == ("codex",)
+
+
+def test_process_snapshot_ignores_the_agent_cli_itself(monkeypatch):
+    """Regression: codex's argv carries the phase prompt, whose prose mentions
+    python/ruby/node helpers.  Left in the snapshot, the CLI looked like a
+    permanent unbounded helper and every run exceeded the 120s helper deadline
+    with agent/helper_blocked.
+    """
+
+    class _Top:
+        returncode = 0
+
+        def __init__(self, stdout: str):
+            self.stdout = stdout
+
+    cli_line = (
+        "100 1 Ss /usr/local/bin/codex exec --json -m gpt-6-luna "
+        "Available: gcc, python3, xxd; Python, Ruby and Node commands need timeout"
+    )
+    helper_line = "101 100 S python3 /tmp/unbounded_helper.py"
+    target_line = "102 1 S /out/mruby_fuzzer -max_total_time=1500 /tmp/corpus"
+    opencode_line = "103 1 Ss opencode run --format json --auto"
+
+    def fake_run(*_a, **_kw):
+        return _Top("\n".join([
+            "PID PPID STAT CMD", cli_line, helper_line, target_line,
+            opencode_line,
+        ]))
+
+    monkeypatch.setattr(docker_ops.subprocess, "run", fake_run)
+    # codex runs are probed with the codex binary; opencode's name is still
+    # filtered by the default.
+    assert docker_ops.process_snapshot(
+        "c", ignore_executables=("/usr/local/bin/codex",)
+    ) == [helper_line, target_line, opencode_line]
+    assert docker_ops.process_snapshot("c") == [cli_line, helper_line, target_line]
+
+
+def test_watchdog_probes_and_kills_by_cli_basename(monkeypatch):
+    probes: list[dict] = []
+    commands: list[str] = []
+
+    def snapshot(container, **kwargs):
+        probes.append(kwargs)
+        return ["166 1 S python3 /tmp/server.py"]
+
+    def exec_sh(container, command, timeout=0):
+        commands.append(command)
+        return 0, "", ""
+
+    monkeypatch.setattr(docker_ops, "process_snapshot", snapshot)
+    monkeypatch.setattr(docker_ops, "exec_sh", exec_sh)
+
+    proc = _BlockingProc()
+    state: dict[str, str | None] = {"error": None}
+    asyncio.run(
+        _agent_watchdog(
+            "c",
+            proc,
+            {"started": time.monotonic(), "last_event": time.monotonic()},
+            state,
+            phase_timeout_s=None,
+            idle_timeout_s=1.0,
+            helper_timeout_s=0.01,
+            interval_s=0.01,
+            process_names=("/usr/local/bin/codex",),
+        )
+    )
+    assert state["error"] and state["error"].startswith("agent/helper_blocked:")
+    assert probes[0]["ignore_executables"] == ("codex",)
+    # ps reports `comm`, never the path, so the sweep has to match the basename.
+    assert "^(codex)$" in commands[0]
 
 
 def test_agent_file_omits_step_cap_when_max_turns_is_none():

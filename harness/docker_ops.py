@@ -248,15 +248,25 @@ def read_file(container: str, path: str) -> bytes:
     return r.stdout if r.returncode == 0 else b""
 
 
-def process_snapshot(container: str) -> list[str]:
+def process_snapshot(
+    container: str, *, ignore_executables: tuple[str, ...] = ("opencode",)
+) -> list[str]:
     """Return process command lines currently running in ``container``.
 
     This is used only by the agent watchdog.  A model request normally leaves
-    only the shell and opencode process alive; a long-running Bash tool leaves
+    only the shell and agent CLI process alive; a long-running Bash tool leaves
     an additional child (for example a test server).  Keeping this probe
     separate from ``exec_sh`` avoids introducing another command into the
     agent's workspace or trusting agent-created files.
+
+    ``ignore_executables`` names the agent CLI binaries for the active backend
+    (matched on the executable's basename, so ``codex`` and
+    ``/usr/local/bin/codex`` both work).  The CLI itself is never a tool child,
+    and its command line carries the phase prompt — which mentions python/
+    ruby/node in prose and would otherwise look like a permanent ad-hoc helper
+    to the watchdog.
     """
+    ignored = {name.rsplit("/", 1)[-1] for name in ignore_executables if name}
     try:
         r = subprocess.run(
             ["docker", "top", container, "-eo", "pid,ppid,stat,cmd"],
@@ -270,8 +280,8 @@ def process_snapshot(container: str) -> list[str]:
     if r.returncode != 0:
         return []
     lines = r.stdout.splitlines()
-    # The first line is the header.  Filter the container's init shell and
-    # opencode itself; everything else represents an active tool command or
+    # The first line is the header.  Filter the container's init shell and the
+    # agent CLI itself; everything else represents an active tool command or
     # a process it started.
     result: list[str] = []
     for line in lines[1:]:
@@ -280,10 +290,11 @@ def process_snapshot(container: str) -> list[str]:
             continue
         fields = stripped.split(None, 3)
         command = fields[3] if len(fields) == 4 else stripped
+        executable = command.split(None, 1)[0].rsplit("/", 1)[-1]
         # The init shell is not a tool child.  Keep other shells (for example
         # ``bash -c make``) because they indicate that a Bash tool is still
         # active and should prevent the model-idle watchdog from firing.
-        if command in {"/bin/bash", "/bin/sh"} or "opencode" in command:
+        if command in {"/bin/bash", "/bin/sh"} or executable in ignored:
             continue
         result.append(stripped)
     return result

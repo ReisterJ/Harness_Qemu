@@ -16,12 +16,14 @@ from pathlib import Path
 import pytest
 
 from harness import docker_ops
-from harness.agent import agent_backend, run_agent
+from harness.agent import AgentResult, agent_backend, run_agent
 from harness.agent_codex import (
     codex_argv,
     codex_model,
+    continue_on_negative,
     normalize_codex_event,
     run_agent_codex,
+    should_continue_after_negative,
 )
 
 
@@ -407,3 +409,69 @@ def test_run_codex_policy_block_is_terminal(monkeypatch):
     result = asyncio.run(go())
     assert result.error and "policy_blocked" in result.error
     assert len(spawned) == 1, "a policy block must not be retried"
+
+
+def test_codex_reasoning_flag(monkeypatch):
+    monkeypatch.setenv("VULN_PIPELINE_CODEX_REASONING", "xhigh")
+    argv = codex_argv("c", "go", model="luna")
+    assert "model_reasoning_effort=xhigh" in argv
+
+
+def test_continue_on_negative_helper(monkeypatch):
+    monkeypatch.delenv("VULN_PIPELINE_CODEX_CONTINUE_ON_NEGATIVE", raising=False)
+    assert continue_on_negative() == 0
+    monkeypatch.setenv("VULN_PIPELINE_CODEX_CONTINUE_ON_NEGATIVE", "3")
+    assert continue_on_negative() == 3
+    monkeypatch.setenv("VULN_PIPELINE_CODEX_CONTINUE_ON_NEGATIVE", "junk")
+    assert continue_on_negative() == 0
+
+    result = AgentResult(messages=[{
+        "type": "text",
+        "part": {"type": "text", "text": "<dynamic_status>reached_no_crash</dynamic_status>"},
+    }])
+    assert should_continue_after_negative(
+        result, continuations=0, max_continuations=1,
+        elapsed_s=80, phase_timeout_s=3600,
+    )
+    assert not should_continue_after_negative(
+        result, continuations=1, max_continuations=1,
+        elapsed_s=80, phase_timeout_s=3600,
+    )
+    assert not should_continue_after_negative(
+        result, continuations=0, max_continuations=1,
+        elapsed_s=3500, phase_timeout_s=3600,
+    )
+    assert not should_continue_after_negative(
+        result, continuations=0, max_continuations=1,
+        elapsed_s=80, phase_timeout_s=None,
+    )
+    validated = AgentResult(messages=[{
+        "type": "text",
+        "part": {"type": "text", "text": "<dynamic_status>validated</dynamic_status>"},
+    }])
+    assert not should_continue_after_negative(
+        validated, continuations=0, max_continuations=1,
+        elapsed_s=80, phase_timeout_s=3600,
+    )
+
+
+def test_run_codex_nudges_premature_negative_status(monkeypatch):
+    negative = _message("<dynamic_status>reached_no_crash</dynamic_status>", iid="n1")
+    positive = _message("<dynamic_status>validated</dynamic_status>", iid="n2")
+    spawned = _fake_cli(monkeypatch, [
+        [THREAD, negative, TURN_OK],
+        [negative, positive, TURN_OK],
+    ])
+    monkeypatch.setenv("VULN_PIPELINE_CODEX_CONTINUE_ON_NEGATIVE", "1")
+
+    async def go():
+        return await run_agent_codex("go", container="c", max_turns=None,
+                                     model="luna", phase_timeout_s=3600)
+
+    result = asyncio.run(go())
+    assert len(spawned) == 2
+    assert "resume" in spawned[1]
+    assert spawned[1][spawned[1].index("resume") + 1] == "tid-1"
+    assert "premature" in spawned[1][-1]
+    assert result.error is None
+    assert "validated" in result.find_tagged_message("dynamic_status")

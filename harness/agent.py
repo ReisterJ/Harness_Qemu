@@ -233,6 +233,16 @@ def _is_unbounded_helper_process(line: str) -> bool:
     )
 
 
+def _agent_cli_names(process_names: tuple[str, ...]) -> tuple[str, ...]:
+    """Basenames of the backend CLI executables.
+
+    ``ps -eo comm`` and ``docker top`` report the executable name, never the
+    path, so ``/usr/local/bin/codex`` has to be matched as ``codex`` both in
+    the helper probe and in the kill sweep.
+    """
+    return tuple(name.rsplit("/", 1)[-1] for name in process_names if name)
+
+
 def _unbounded_helper_processes(processes: list[str]) -> list[str]:
     """Find helper processes not already bounded by a `timeout` ancestor.
 
@@ -287,7 +297,14 @@ async def _agent_watchdog(
     a quiet Bash command by probing the container process table.  Unbounded
     ad-hoc helper servers get a shorter dedicated deadline, while a bounded
     command can use the full phase budget (when one is configured).
+
+    ``process_names`` are the active backend's CLI executables (any path form;
+    basenames are used).  They are excluded from the helper probe — the CLI's
+    command line carries the phase prompt — and are the only processes the
+    kill sweep terminates.
     """
+
+    cli_names = _agent_cli_names(process_names) or ("opencode",)
     helper_since: float | None = None
     while proc.returncode is None:
         await asyncio.sleep(max(0.05, interval_s))
@@ -301,7 +318,9 @@ async def _agent_watchdog(
             # synchronous here: this runtime does not reliably deliver
             # ``asyncio.to_thread`` completions back to the event loop, which
             # would make the watchdog itself hang while the agent is blocked.
-            processes = docker_ops.process_snapshot(container)
+            processes = docker_ops.process_snapshot(
+                container, ignore_executables=cli_names
+            )
             helpers = _unbounded_helper_processes(processes)
             if helpers:
                 helper_since = helper_since or now
@@ -328,13 +347,13 @@ async def _agent_watchdog(
         if state["error"]:
             # Killing the host-side `docker exec` does not necessarily kill
             # the command it started inside the target container.  In
-            # particular, opencode can remain as PID 1's child while its
+            # particular, the agent CLI can remain as PID 1's child while its
             # stdout pipe keeps the outer coroutine alive.  Terminate only
-            # processes whose executable name is exactly opencode, preserving
-            # the target binary and any bounded probe the agent may have
-            # launched.
+            # processes whose executable name is exactly the agent CLI,
+            # preserving the target binary and any bounded probe the agent may
+            # have launched.
             pattern = "|".join(
-                re.escape(name) for name in process_names if name
+                re.escape(name) for name in cli_names if name
             ) or "opencode"
             awk = f'$2 ~ /^({pattern})$/'
             try:
