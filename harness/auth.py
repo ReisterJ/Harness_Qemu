@@ -97,6 +97,16 @@ def required_egress_hosts() -> list[str]:
     """host:port entries the configured provider needs on the proxy allowlist.
     Called from setup_sandbox.sh / vp-sandboxed via ``python3 -c``; exits
     non-zero on misconfig so the shell ``|| die`` fires."""
+    backend = (os.environ.get("VULN_PIPELINE_AGENT_BACKEND") or "opencode").strip().lower()
+    if backend == "codex":
+        explicit = os.environ.get("VULN_PIPELINE_CODEX_EGRESS")
+        if explicit:
+            return [h.strip() for h in explicit.split(",") if h.strip()]
+        if os.environ.get("OPENAI_API_KEY"):
+            return ["api.openai.com:443"]
+        if os.environ.get("DEEPSEEK_API_KEY"):
+            return ["api.deepseek.com:443"]
+        return ["api.openai.com:443"]
     if os.environ.get("DEEPSEEK_API_KEY"):
         return ["api.deepseek.com:443"]
     if os.environ.get("OPENAI_API_KEY"):

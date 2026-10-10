@@ -26,7 +26,10 @@ import textwrap
 from . import docker_ops
 
 OPENCODE_VERSION = "1.17.18"  # bump alongside the dev-env opencode pin
-BASE_TAG = f"vuln-pipeline-agent-base:{OPENCODE_VERSION}"
+CODEX_VERSION = "0.162.1"     # @openai/codex pin for the codex agent backend
+# Bump when the agent-image copy list changes so cached images are rebuilt.
+AGENT_IMAGE_REVISION = "r2"
+BASE_TAG = f"vuln-pipeline-agent-base:{OPENCODE_VERSION}-codex{CODEX_VERSION}-{AGENT_IMAGE_REVISION}"
 TARGET_ID_LABEL = "io.vuln-pipeline.target-image-id"
 _TAG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._/:-]*$")
 
@@ -34,7 +37,10 @@ _TAG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._/:-]*$")
 def agent_tag(target_tag: str) -> str:
     """Distinct agent-image tag per *full* target tag, so a committed
     ``<name>:patched-<uuid>`` snapshot doesn't collide with ``<name>:v1``."""
-    return f"{target_tag.replace(':', '-')}-agent:{OPENCODE_VERSION}"
+    return (
+        f"{target_tag.replace(':', '-')}-agent:"
+        f"{OPENCODE_VERSION}-codex{CODEX_VERSION}-{AGENT_IMAGE_REVISION}"
+    )
 
 
 def validate_tag(tag: str) -> None:
@@ -73,7 +79,7 @@ def ensure_base() -> str:
             RUN apt-get update && \\
                 apt-get install -y --no-install-recommends nodejs npm ca-certificates xxd gdb git && \\
                 rm -rf /var/lib/apt/lists/* && \\
-                npm install -g opencode-ai@{OPENCODE_VERSION}
+                npm install -g opencode-ai@{OPENCODE_VERSION} @openai/codex@{CODEX_VERSION}
             WORKDIR /work
         """),
         BASE_TAG,
@@ -104,6 +110,9 @@ def ensure(target_tag: str) -> str:
         f"""FROM {target_tag}
 LABEL {TARGET_ID_LABEL}="{target_id}"
 COPY --from={BASE_TAG} /usr/local/lib/node_modules/opencode-ai/bin/opencode.exe /usr/local/bin/opencode
+COPY --from={BASE_TAG} /usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex /usr/local/bin/codex
+COPY --from={BASE_TAG} /usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex-code-mode-host /usr/local/bin/codex-code-mode-host
+COPY --from={BASE_TAG} /usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path /usr/local/lib/codex-path
 COPY --from={BASE_TAG} /usr/bin/git /usr/bin/git
 COPY --from={BASE_TAG} /usr/lib/git-core /usr/lib/git-core
 COPY --from={BASE_TAG} /usr/share/git-core /usr/share/git-core

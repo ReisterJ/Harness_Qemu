@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import re
 import sys
 import time
@@ -277,6 +278,7 @@ async def _agent_watchdog(
     idle_timeout_s: float | None,
     helper_timeout_s: float,
     interval_s: float,
+    process_names: tuple[str, ...] = ("opencode",),
 ) -> None:
     """Kill an opencode attempt that can no longer make progress.
 
@@ -331,13 +333,17 @@ async def _agent_watchdog(
             # processes whose executable name is exactly opencode, preserving
             # the target binary and any bounded probe the agent may have
             # launched.
+            pattern = "|".join(
+                re.escape(name) for name in process_names if name
+            ) or "opencode"
+            awk = f'$2 ~ /^({pattern})$/'
             try:
                 docker_ops.exec_sh(
                     container,
-                    "pids=$(ps -eo pid=,comm= | awk '$2 == \"opencode\" {print $1}'); "
+                    f"pids=$(ps -eo pid=,comm= | awk '{awk} {{print $1}}'); "
                     "[ -z \"$pids\" ] || kill -TERM $pids; "
                     "sleep 1; "
-                    "pids=$(ps -eo pid=,comm= | awk '$2 == \"opencode\" {print $1}'); "
+                    f"pids=$(ps -eo pid=,comm= | awk '{awk} {{print $1}}'); "
                     "[ -z \"$pids\" ] || kill -KILL $pids",
                     timeout=5,
                 )
@@ -464,7 +470,92 @@ def _opencode_model(model: str) -> str:
     return "deepseek/deepseek-flash" if model == "deepseek-flash" else model
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Backend dispatch
+# ──────────────────────────────────────────────────────────────────────────────
+
+AGENT_BACKENDS = ("opencode", "codex")
+
+
+def agent_backend() -> str:
+    """Selected agent CLI backend (``VULN_PIPELINE_AGENT_BACKEND``).
+
+    ``opencode`` is the default and the only backend wired into the shipped
+    target images; ``codex`` runs the ``codex exec`` CLI and is selected
+    explicitly for experiments.
+    """
+    value = (os.environ.get("VULN_PIPELINE_AGENT_BACKEND") or "opencode").strip().lower()
+    if value not in AGENT_BACKENDS:
+        raise ValueError(
+            f"unknown agent backend {value!r}; expected one of "
+            f"{', '.join(AGENT_BACKENDS)}"
+        )
+    return value
+
+
 async def run_agent(
+    prompt: str,
+    *,
+    container: str,
+    max_turns: int | None,
+    model: str,
+    max_resume_attempts: int = 20,
+    transcript_path: str | None = None,
+    heartbeat_every: int = 25,
+    progress_prefix: str | None = None,
+    tools: list[str] | None = None,
+    system_prompt: str | None = None,
+    phase_timeout_s: float | None = 1800.0,
+    idle_timeout_s: float | None = 1800.0,
+    helper_timeout_s: float = 120.0,
+    watchdog_interval_s: float = 5.0,
+    backend: str | None = None,
+) -> AgentResult:
+    """Run an agent session with the selected CLI backend.
+
+    All backends share this signature and return an :class:`AgentResult`;
+    see ``_run_agent_opencode`` for the opencode contract and
+    ``harness.agent_codex`` for the codex one.
+    """
+    selected = backend or agent_backend()
+    if selected == "codex":
+        from .agent_codex import run_agent_codex
+
+        return await run_agent_codex(
+            prompt,
+            container=container,
+            max_turns=max_turns,
+            model=model,
+            max_resume_attempts=max_resume_attempts,
+            transcript_path=transcript_path,
+            heartbeat_every=heartbeat_every,
+            progress_prefix=progress_prefix,
+            tools=tools,
+            system_prompt=system_prompt,
+            phase_timeout_s=phase_timeout_s,
+            idle_timeout_s=idle_timeout_s,
+            helper_timeout_s=helper_timeout_s,
+            watchdog_interval_s=watchdog_interval_s,
+        )
+    return await _run_agent_opencode(
+        prompt,
+        container=container,
+        max_turns=max_turns,
+        model=model,
+        max_resume_attempts=max_resume_attempts,
+        transcript_path=transcript_path,
+        heartbeat_every=heartbeat_every,
+        progress_prefix=progress_prefix,
+        tools=tools,
+        system_prompt=system_prompt,
+        phase_timeout_s=phase_timeout_s,
+        idle_timeout_s=idle_timeout_s,
+        helper_timeout_s=helper_timeout_s,
+        watchdog_interval_s=watchdog_interval_s,
+    )
+
+
+async def _run_agent_opencode(
     prompt: str,
     *,
     container: str,
