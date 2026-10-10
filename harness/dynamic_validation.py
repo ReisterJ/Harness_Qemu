@@ -187,6 +187,7 @@ async def run_dynamic_validation(
                 instrumentation_context=instrumentation_context,
                 symbolic_context=symbolic_context,
                 max_iterations=iteration_limit,
+                phase_timeout_s=phase_timeout_s,
             )
             result, protocol_timings, symbolic_result = await _run_prebuilt_symcc_agent(
                 prompt=prompt,
@@ -221,6 +222,7 @@ async def run_dynamic_validation(
                 instrumentation_context=instrumentation_context,
                 symbolic_context=symbolic_context,
                 max_iterations=iteration_limit,
+                phase_timeout_s=phase_timeout_s,
             )
             result = await run_agent(
                 prompt=prompt,

@@ -11,6 +11,17 @@ from .find_prompt import build_find_prompt
 from .untrusted import make_nonce, untrusted_block
 
 
+def _phase_budget_phrase(phase_timeout_s: float | None) -> str:
+    """``"1800-second "``-style prefix for the phase-budget sentences.
+
+    The section must state the budget the caller enforces instead of a stale
+    constant; with no enforced deadline the sentences carry no number.
+    """
+    if phase_timeout_s and phase_timeout_s > 0:
+        return f"{int(phase_timeout_s)}-second "
+    return ""
+
+
 def build_dynamic_validation_prompt(
     *,
     candidate: StaticFinding,
@@ -32,6 +43,7 @@ def build_dynamic_validation_prompt(
     symbolic_feedback: dict | None = None,
     symbolic_finalize: bool = False,
     max_iterations: int | None = None,
+    phase_timeout_s: float | None = None,
 ) -> str:
     """Reuse detector-specific runtime instructions and narrow them to a finding."""
     base = build_find_prompt(
@@ -65,6 +77,7 @@ def build_dynamic_validation_prompt(
         _crash_result_file_section(safe_candidate_id) if detector != "logic" else ""
     )
     harness_tail = _harness_final_guard(symbolic_context, symbolic_round)
+    budget_phrase = _phase_budget_phrase(phase_timeout_s)
     if detector == "logic":
         return symbolic_section + base + iteration_section + result_file_section + instrumentation_section + f"""
 
@@ -81,10 +94,10 @@ The dynamic phase has a long overall budget, but every individual command must
 have a bounded lifecycle. If you create a local proxy, server, emulator, or
 other helper, start it in the background under `timeout` and install a cleanup
 trap. For example, use a bounded form such as `timeout 60s python3 helper.py`
-and keep the target invocation bounded separately (up to the 1800-second phase
+and keep the target invocation bounded separately (up to the {budget_phrase}phase
 budget when genuinely necessary). For fuzzing, use target-specific searches of
 at most 300 seconds per invocation, inspect the result, and then decide whether
-another round is justified. The 1800-second phase budget covers all commands
+another round is justified. The {budget_phrase}phase budget covers all commands
 and model work: reserve at least 300 seconds for candidate replay, iteration
 records, and the final report; do not start a long command that cannot finish
 with that verification reserve. Never run a `while True` helper in the
@@ -149,10 +162,10 @@ The dynamic phase has a long overall budget, but every individual command must
 have a bounded lifecycle. If you create a local proxy, server, emulator, or
 other helper, start it in the background under `timeout` and install a cleanup
 trap. For example, use a bounded form such as `timeout 60s python3 helper.py`
-and keep the target invocation bounded separately (up to the 1800-second phase
+and keep the target invocation bounded separately (up to the {budget_phrase}phase
 budget when genuinely necessary). For fuzzing, use target-specific searches of
 at most 300 seconds per invocation, inspect the result, and then decide whether
-another round is justified. The 1800-second phase budget covers all commands
+another round is justified. The {budget_phrase}phase budget covers all commands
 and model work: reserve at least 300 seconds for candidate replay, iteration
 records, and the final report; do not start a long command that cannot finish
 with that verification reserve. Never run a `while True` helper in the

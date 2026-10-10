@@ -498,6 +498,38 @@ def _fake_agent_result(message: str) -> AgentResult:
     return AgentResult(messages=[_assistant(message)], result_message=message)
 
 
+def test_dynamic_prompt_states_the_phase_budget_the_harness_enforces():
+    prompt = build_dynamic_validation_prompt(
+        candidate=_finding(),
+        github_url="https://example.test/project",
+        commit="abc",
+        source_root="/src",
+        binary_path="/bin/target",
+        phase_timeout_s=3600,
+    )
+    assert "up to the 3600-second phase" in prompt
+    assert "The 3600-second phase budget covers all commands" in prompt
+    # regression: the section used to hardcode 1800 regardless of the budget
+    assert "1800" not in prompt
+    # unchanged single-command policy
+    assert "at most 300 seconds per invocation" in prompt
+    assert "reserve at least 300 seconds" in prompt
+
+
+def test_dynamic_prompt_without_an_enforced_deadline_drops_the_number():
+    prompt = build_dynamic_validation_prompt(
+        candidate=_finding(),
+        github_url="https://example.test/project",
+        commit="abc",
+        source_root="/src",
+        binary_path="/bin/target",
+        phase_timeout_s=None,
+    )
+    assert "The phase budget covers all commands" in prompt
+    assert "1800" not in prompt
+    assert "at most 300 seconds per invocation" in prompt
+
+
 def test_dynamic_prompt_without_round_budget_states_no_fixed_budget():
     prompt = build_dynamic_validation_prompt(
         candidate=_finding(),
