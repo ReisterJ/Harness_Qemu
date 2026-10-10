@@ -33,7 +33,6 @@ Environment knobs (all read by `harness/agent_codex.py`):
 | `VULN_PIPELINE_CODEX_AUTH_FILE` | host `auth.json` copied into `$CODEX_HOME` (ChatGPT-plan auth) |
 | `VULN_PIPELINE_CODEX_EGRESS` | override the egress hosts `harness/auth.py` requires |
 | `VULN_PIPELINE_CODEX_REASONING` | `-c model_reasoning_effort=<low..max>` (luna defaults to `medium`) |
-| `VULN_PIPELINE_CODEX_CONTINUE_ON_NEGATIVE` | opt-in: max keep-working nudges when the agent stops with a premature negative status (default 0/off) |
 
 ### Model
 
@@ -73,12 +72,11 @@ authenticate through `env_key` skip the login probe.
   Provider policy blocks (cyber-risk classification) are terminal and are
   surfaced as `agent/policy_blocked` without retrying.
 - **Premature stops** — a small/fast model can return a terminal negative
-  status (`reached_no_crash` / `false_positive`) long before the phase
-  budget is spent; the harness honours it and the run ends. Set
-  `VULN_PIPELINE_CODEX_CONTINUE_ON_NEGATIVE=<n>` to resume the thread with a
-  keep-working nudge (up to n times) while meaningful budget remains — note
-  this is a behaved-changing intervention and must be recorded when comparing
-  arms. `VULN_PIPELINE_CODEX_REASONING=high|xhigh` is the cheaper first lever.
+  status (`reached_no_crash` / `false_positive`) long before the phase budget is
+  spent. The harness honours it and the run ends; it never nudges, resumes or
+  re-prompts the agent to keep working, because steering the agent would change
+  what the arm measures. The only lever is on the model side, before launch
+  (`VULN_PIPELINE_CODEX_REASONING=high|xhigh`).
 - **Sandbox** — codex's own Landlock/seccomp sandbox is bypassed with
   `--dangerously-bypass-approvals-and-sandbox`: the agent container (gVisor on
   the shipped path) is the trust boundary, which is exactly the use case the

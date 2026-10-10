@@ -30,6 +30,7 @@ Environment knobs:
   ``gpt-6-luna`` — the fast/affordable Codex model this pipeline uses for
   bulk runs; ``luna`` is accepted as an alias)
 * ``VULN_PIPELINE_CODEX_PROVIDER``       ``-c model_provider=<name>``
+* ``VULN_PIPELINE_CODEX_REASONING``      ``-c model_reasoning_effort=<low..max>``
 * ``VULN_PIPELINE_CODEX_CONFIG``         inline ``$CODEX_HOME/config.toml``
 * ``VULN_PIPELINE_CODEX_CONFIG_FILE``    config.toml content from a host file
 * ``VULN_PIPELINE_CODEX_AUTH_FILE``      host ``auth.json`` copied into
@@ -321,56 +322,6 @@ def normalize_codex_event(ev: object) -> dict:
 # Container preparation
 # ──────────────────────────────────────────────────────────────────────────────
 
-_NEGATIVE_STATUS = re.compile(
-    r"<dynamic_status>\s*(reached_no_crash|false_positive)\s*</dynamic_status>",
-    re.IGNORECASE,
-)
-
-
-def continue_on_negative() -> int:
-    """Max keep-working nudges for a premature terminal negative status."""
-    raw = (os.environ.get("VULN_PIPELINE_CODEX_CONTINUE_ON_NEGATIVE") or "").strip()
-    if not raw:
-        return 0
-    try:
-        return max(0, int(raw))
-    except ValueError:
-        return 0
-
-
-def should_continue_after_negative(
-    result: AgentResult, *, continuations: int, max_continuations: int,
-    elapsed_s: float, phase_timeout_s: float | None, min_remaining_s: float = 180.0,
-) -> bool:
-    """Whether a clean stop with a negative status deserves a nudge.
-
-    The phase prompts already require working until the deadline or a
-    validated PoC; a small/fast model can still stop early.  This is opt-in
-    (``VULN_PIPELINE_CODEX_CONTINUE_ON_NEGATIVE``) because it changes agent
-    behaviour and must be recorded as an intervention in experiments.
-    """
-    if max_continuations <= 0 or continuations >= max_continuations:
-        return False
-    if phase_timeout_s is None:
-        return False
-    if phase_timeout_s - elapsed_s < min_remaining_s:
-        return False
-    text = result.find_tagged_message("dynamic_status") or result.last_assistant_message
-    return bool(_NEGATIVE_STATUS.search(text or ""))
-
-
-def _continuation_prompt(elapsed_s: float, budget_s: float) -> str:
-    return (
-        f"Your previous response ended with a terminal negative dynamic status, "
-        f"but the phase is not over: {elapsed_s:.0f}s of {budget_s:.0f}s used. "
-        "That status is premature and violates the phase contract (keep working "
-        "until the deadline or a validated PoC). Do not resubmit the same input "
-        "and do not repeat your previous analysis: form a new hypothesis, run a "
-        "new experiment, and continue. Return a terminal status only when the "
-        "budget is exhausted or a crash is validated."
-    )
-
-
 def ensure_codex_auth(container: str) -> None:
     """Bootstrap API-key auth in the container, fail with a readable message.
 
@@ -472,22 +423,16 @@ async def run_agent_codex(
     transcript_file = open(transcript_path, "w") if transcript_path else None
 
     attempt = 0
-    continuations = 0
     tool_call_count = 0
     assistant_count = 0
     step_count = 0
     last_error: str | None = None
     loop_started = time.monotonic()
-    max_continuations = continue_on_negative()
     try:
         while True:
             spawned = codex_argv(
                 container, prompt, model=selected_model,
-                resume_thread=(
-                    result.session_id
-                    if (attempt > 0 or continuations > 0)
-                    else None
-                ),
+                resume_thread=result.session_id if attempt > 0 else None,
             )
             proc = await asyncio.create_subprocess_exec(
                 *spawned,
@@ -616,23 +561,6 @@ async def run_agent_codex(
                         f"codex exited rc={rc} without result: "
                         f"{stderr.decode(errors='replace')[:2000]}"
                     )
-                if should_continue_after_negative(
-                    result,
-                    continuations=continuations,
-                    max_continuations=max_continuations,
-                    elapsed_s=time.monotonic() - loop_started,
-                    phase_timeout_s=phase_timeout_s,
-                ):
-                    continuations += 1
-                    elapsed = time.monotonic() - loop_started
-                    prompt = _continuation_prompt(elapsed, phase_timeout_s)
-                    print(
-                        f"[agent] premature negative status after {elapsed:.0f}s; "
-                        f"nudging codex thread {result.session_id} "
-                        f"({continuations}/{max_continuations})",
-                        file=sys.stderr,
-                    )
-                    continue
                 return result
             except Exception as e:
                 if watchdog_state["error"]:
