@@ -188,6 +188,7 @@ class DynamicValidationResult:
     logic: LogicArtifact | None = None
     instrumentation: dict[str, Any] | None = None
     symbolic_execution: dict[str, Any] | None = None
+    goal: dict[str, Any] | None = None  # codex backend: persisted goal row, audit only
     iterations: list[dict[str, Any]] = field(default_factory=list)
     iteration_errors: list[str] = field(default_factory=list)
 
@@ -212,6 +213,7 @@ class DynamicValidationResult:
             logic=LogicArtifact.from_dict(d["logic"]) if d.get("logic") else None,
             instrumentation=d.get("instrumentation"),
             symbolic_execution=d.get("symbolic_execution"),
+            goal=d.get("goal") if isinstance(d.get("goal"), dict) else None,
             iterations=(
                 [item for item in d.get("iterations", []) if isinstance(item, dict)]
                 if isinstance(d.get("iterations", []), list)

@@ -77,6 +77,19 @@ authenticate through `env_key` skip the login probe.
   re-prompts the agent to keep working, because steering the agent would change
   what the arm measures. The only lever is on the model side, before launch
   (`VULN_PIPELINE_CODEX_REASONING=high|xhigh`).
+- **Goal tracking (audit only)** — the CLI exposes `tools.create_goal` /
+  `get_goal` / `update_goal` on a persisted thread (the `goals` feature is
+  `stable` and on by default; `--ephemeral` would forbid it). With the codex
+  backend the dynamic prompt asks for one goal whose objective states this
+  candidate's completion criterion, marked `complete` only for a reproduced
+  matching crash and `blocked` otherwise. `codex exec` **never auto-continues**
+  an active goal — continuation needs the app-server thread manager, so a goal
+  adds no turns and the phase still ends when the model stops. What it buys is
+  a machine-readable record: `read_goal_state()` reads
+  `$CODEX_HOME/goals_*.sqlite` after the phase (goal calls are *not* in the
+  `--json` stream) and the row lands in `dynamic_validation.json` as
+  `result.goal`. A run that reports a negative status while leaving the goal
+  `active` stopped short of its own declared criterion.
 - **Sandbox** — codex's own Landlock/seccomp sandbox is bypassed with
   `--dangerously-bypass-approvals-and-sandbox`: the agent container (gVisor on
   the shipped path) is the trust boundary, which is exactly the use case the
@@ -119,4 +132,4 @@ status: crash_found
 
 Unit coverage for the backend lives in `tests/test_agent_codex.py`
 (normalization, argv/model mapping, auth seeding, resume, step cap, policy
-block).
+block, goal-state read).

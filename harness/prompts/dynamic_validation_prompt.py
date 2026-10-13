@@ -22,6 +22,37 @@ def _phase_budget_phrase(phase_timeout_s: float | None) -> str:
     return ""
 
 
+def _goal_tracking_section() -> str:
+    """Codex-only: declare the completion contract as a persisted goal.
+
+    The codex CLI exposes ``tools.create_goal`` / ``get_goal`` / ``update_goal``
+    against a persisted thread, and records the row in
+    ``$CODEX_HOME/goals_*.sqlite``.  Asking for one gives an audit trail of
+    what the agent believed it still had to achieve — it does not add turns
+    (``codex exec`` never auto-continues an active goal) and it does not
+    replace the status tags below.
+    """
+    return """
+
+## Goal tracking (codex backend only)
+
+If your tool list contains `tools.create_goal`, `tools.get_goal` and
+`tools.update_goal`, use them as the machine-readable record of this phase:
+
+1. Before your first probe, call `tools.create_goal` once with an `objective`
+   that states the completion criterion for *this* candidate, e.g.
+   "produce a non-empty PoC at <path> that reproduces a matching <crash type>
+   3/3 on the clean target".
+2. Keep the goal `active` while you are still working toward it.
+3. When you stop, make `tools.update_goal` reflect reality: `complete` only for
+   a reproduced, matching crash; `blocked` for everything else. A semantic
+   anomaly, an unverified guess, or a wrong-path sanitizer event is never
+   `complete`.
+4. On `blocked`, put the missing precondition and what you already tried in the
+   goal update text, and keep the same content in your iteration records.
+"""
+
+
 def build_dynamic_validation_prompt(
     *,
     candidate: StaticFinding,
@@ -44,6 +75,7 @@ def build_dynamic_validation_prompt(
     symbolic_finalize: bool = False,
     max_iterations: int | None = None,
     phase_timeout_s: float | None = None,
+    goal_tracking: bool = False,
 ) -> str:
     """Reuse detector-specific runtime instructions and narrow them to a finding."""
     base = build_find_prompt(
@@ -73,13 +105,14 @@ def build_dynamic_validation_prompt(
         finalize=symbolic_finalize,
     )
     iteration_section = _iteration_section(max_iterations, safe_candidate_id)
+    goal_section = _goal_tracking_section() if goal_tracking else ""
     result_file_section = (
         _crash_result_file_section(safe_candidate_id) if detector != "logic" else ""
     )
     harness_tail = _harness_final_guard(symbolic_context, symbolic_round)
     budget_phrase = _phase_budget_phrase(phase_timeout_s)
     if detector == "logic":
-        return symbolic_section + base + iteration_section + result_file_section + instrumentation_section + f"""
+        return symbolic_section + base + iteration_section + goal_section + result_file_section + instrumentation_section + f"""
 
 ## Dynamic-validation scope — do not broaden the hunt
 
@@ -147,7 +180,7 @@ be able to distinguish the target's wrong behavior from infrastructure
 failure.
 """ + harness_tail
 
-    return symbolic_section + base + iteration_section + result_file_section + instrumentation_section + f"""
+    return symbolic_section + base + iteration_section + goal_section + result_file_section + instrumentation_section + f"""
 
 ## Dynamic-validation scope — do not broaden the hunt
 

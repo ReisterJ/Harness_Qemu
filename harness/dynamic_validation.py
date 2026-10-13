@@ -17,7 +17,8 @@ from typing import Any, Iterable, Iterator
 from xml.sax.saxutils import escape as xml_escape
 
 from . import docker_ops
-from .agent import AgentResult, parse_xml_tag, run_agent
+from .agent import AgentResult, agent_backend, parse_xml_tag, run_agent
+from .agent_codex import read_goal_state
 from .artifacts import (
     POC_KINDS,
     CrashArtifact,
@@ -188,6 +189,7 @@ async def run_dynamic_validation(
                 symbolic_context=symbolic_context,
                 max_iterations=iteration_limit,
                 phase_timeout_s=phase_timeout_s,
+                goal_tracking=agent_backend() == "codex",
             )
             result, protocol_timings, symbolic_result = await _run_prebuilt_symcc_agent(
                 prompt=prompt,
@@ -223,6 +225,7 @@ async def run_dynamic_validation(
                 symbolic_context=symbolic_context,
                 max_iterations=iteration_limit,
                 phase_timeout_s=phase_timeout_s,
+                goal_tracking=agent_backend() == "codex",
             )
             result = await run_agent(
                 prompt=prompt,
@@ -256,6 +259,9 @@ async def run_dynamic_validation(
         _persist_iteration_records(
             iterations, iteration_errors, instrumentation_result_path
         )
+        # Audit-only: the codex backend persists the agent's own goal row, and
+        # that row is not in the event stream (see agent_codex.read_goal_state).
+        goal_state = _read_codex_goal_state(container)
 
         if provider is not None and instrumentation_prepared is not None:
             collect_started = time.time()
@@ -291,6 +297,8 @@ async def run_dynamic_validation(
                 kwargs["instrumentation"] = instrumentation_result.to_dict()
             if symbolic_result is not None:
                 kwargs["symbolic_execution"] = symbolic_result
+            if goal_state is not None:
+                kwargs["goal"] = goal_state
             kwargs["iterations"] = iterations
             kwargs["iteration_errors"] = iteration_errors
             return DynamicValidationResult(**kwargs)
@@ -2601,6 +2609,21 @@ def _bound_json_value(value):
             for key, item in list(value.items())[:50]
         }
     return str(value)[:2_000]
+
+
+def _read_codex_goal_state(container: str) -> dict | None:
+    """Read the codex agent's persisted goal row; audit only.
+
+    Returns ``None`` for every other backend and on any read failure, so the
+    phase result never depends on it.  See ``agent_codex.read_goal_state`` for
+    why the row is not part of the event stream.
+    """
+    if agent_backend() != "codex":
+        return None
+    try:
+        return read_goal_state(container)
+    except Exception:  # pragma: no cover - defensive: audit must not break a phase
+        return None
 
 
 def _persist_iteration_records(

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+
+import pytest
 from pathlib import Path
 
 from harness.agent import AgentResult
@@ -542,3 +544,111 @@ def test_dynamic_prompt_without_round_budget_states_no_fixed_budget():
     assert "no fixed round budget" in prompt
     assert "at most" not in prompt.split("## Iterative dynamic-validation loop")[1].split("1. ")[0]
     assert "/work/validation/iterations/round-NNN.json" in prompt
+
+
+def test_dynamic_prompt_goal_tracking_is_opt_in():
+    """The goal section is codex-only; the default prompt must not carry it."""
+    default = build_dynamic_validation_prompt(
+        candidate=_finding(),
+        github_url="https://example.test/project",
+        commit="abc",
+        source_root="/src",
+        binary_path="/bin/target",
+    )
+    assert "create_goal" not in default
+
+    codex = build_dynamic_validation_prompt(
+        candidate=_finding(),
+        github_url="https://example.test/project",
+        commit="abc",
+        source_root="/src",
+        binary_path="/bin/target",
+        goal_tracking=True,
+    )
+    assert "tools.create_goal" in codex
+    assert "tools.update_goal" in codex
+    # the completion contract must not soften the crash requirement
+    assert "never\n   `complete`" in codex or "never `complete`" in codex.replace("\n   ", " ")
+    # it is an addition, not a replacement for the round records / status tags
+    assert "/work/validation/iterations/round-NNN.json" in codex
+    assert "<dynamic_status>" in codex
+
+
+def test_read_codex_goal_state_is_skipped_for_other_backends(monkeypatch):
+    """The audit helper must not touch a non-codex phase result."""
+    import harness.dynamic_validation as dv
+
+    monkeypatch.setattr(dv, "agent_backend", lambda: "opencode")
+    monkeypatch.setattr(dv, "read_goal_state", lambda c: pytest.fail("must not read"))
+    assert dv._read_codex_goal_state("c-1") is None
+
+    monkeypatch.setattr(dv, "agent_backend", lambda: "codex")
+    monkeypatch.setattr(dv, "read_goal_state", lambda c: {"objective": "x"})
+    assert dv._read_codex_goal_state("c-1") == {"objective": "x"}
+
+    def boom(_c):
+        raise RuntimeError("db locked")
+
+    monkeypatch.setattr(dv, "read_goal_state", boom)
+    assert dv._read_codex_goal_state("c-1") is None
+
+
+def test_dynamic_validation_records_the_codex_goal_row(monkeypatch):
+    """The phase result carries the persisted goal row for the codex backend."""
+    target = TargetConfig.load(Path(__file__).resolve().parents[1] / "targets" / "libxml2")
+    candidate = _finding()
+    message = """<dynamic_status>reached_no_crash</dynamic_status>
+<candidate_id>candidate_001</candidate_id>
+<reached_functions>parse</reached_functions>
+<reachability_evidence>input reaches parse()</reachability_evidence>
+<reason>captured value changed type but no sanitizer event</reason>"""
+    goal = {
+        "thread_id": "t-1",
+        "objective": "produce a matching ASan PoC",
+        "status": "active",
+        "tokens_used": 900,
+    }
+
+    class FakeSession:
+        container = "fake-container"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(
+        "harness.dynamic_validation.open_runtime_session",
+        lambda *args, **kwargs: FakeSession(),
+    )
+
+    async def fake_agent(**_kwargs):
+        return _fake_agent_result(message)
+
+    monkeypatch.setattr("harness.dynamic_validation.run_agent", fake_agent)
+    monkeypatch.setattr("harness.dynamic_validation.agent_backend", lambda: "codex")
+    monkeypatch.setattr("harness.dynamic_validation.read_goal_state", lambda _c: goal)
+    monkeypatch.setattr(
+        "harness.dynamic_validation.docker_ops.exec_sh",
+        lambda *_args, **_kwargs: (0, "", ""),
+    )
+    monkeypatch.setattr(
+        "harness.dynamic_validation._collect_iteration_records",
+        lambda *_args: ([{
+            "schema_version": 1,
+            "round_id": 1,
+            "candidate_id": "candidate_001",
+            "observations": {"site_reached": True},
+            "decision": "revise",
+        }], []),
+    )
+    outcome, _agent, _timings = asyncio.run(
+        run_dynamic_validation(
+            target, candidate, model="m", max_turns=3, instrumentation="off"
+        )
+    )
+    assert outcome.goal == goal
+    assert outcome.to_dict()["goal"] == goal
+    # an "active" goal next to a negative status is the audit signal we record
+    assert outcome.status == "reached_no_crash"

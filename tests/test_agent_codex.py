@@ -413,3 +413,48 @@ def test_codex_reasoning_flag(monkeypatch):
     monkeypatch.setenv("VULN_PIPELINE_CODEX_REASONING", "xhigh")
     argv = codex_argv("c", "go", model="luna")
     assert "model_reasoning_effort=xhigh" in argv
+
+
+# ── goal-state audit ────────────────────────────────────────────────────────
+
+
+def test_read_goal_state_parses_the_latest_row(monkeypatch):
+    from harness.agent_codex import read_goal_state
+
+    row = {
+        "thread_id": "t-1",
+        "goal_id": "g-1",
+        "objective": "produce a matching ASan PoC",
+        "status": "blocked",
+        "token_budget": None,
+        "tokens_used": 61234,
+        "time_used_seconds": 540,
+        "created_at_ms": 1,
+        "updated_at_ms": 2,
+    }
+    seen: dict[str, str] = {}
+
+    def fake_exec(container, command, timeout=None):
+        seen["container"] = container
+        seen["command"] = command
+        return 0, json.dumps(row) + "\n", ""
+
+    monkeypatch.setattr(docker_ops, "exec_sh", fake_exec)
+    assert read_goal_state("c-1") == row
+    # reads CODEX_HOME explicitly and never mutates the container's own db
+    assert "CODEX_HOME=" in seen["command"]
+    assert "goals_*.sqlite" in seen["command"]
+    assert seen["container"] == "c-1"
+
+
+def test_read_goal_state_is_none_on_missing_or_broken_db(monkeypatch):
+    from harness.agent_codex import read_goal_state
+
+    monkeypatch.setattr(docker_ops, "exec_sh", lambda *a, **k: (0, "", ""))
+    assert read_goal_state("c-1") is None
+
+    monkeypatch.setattr(docker_ops, "exec_sh", lambda *a, **k: (1, "", "boom"))
+    assert read_goal_state("c-1") is None
+
+    monkeypatch.setattr(docker_ops, "exec_sh", lambda *a, **k: (0, "not json\n", ""))
+    assert read_goal_state("c-1") is None

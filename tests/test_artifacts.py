@@ -1,7 +1,13 @@
 # Copyright 2026 Anthropic PBC
 # SPDX-License-Identifier: Apache-2.0
 """Round-trip serialization tests for artifact dataclasses."""
-from harness.artifacts import CrashArtifact, GraderVerdict, LogicArtifact, RunResult
+from harness.artifacts import (
+    CrashArtifact,
+    DynamicValidationResult,
+    GraderVerdict,
+    LogicArtifact,
+    RunResult,
+)
 
 
 def test_crash_artifact_roundtrip():
@@ -139,3 +145,20 @@ def test_run_result_logic_roundtrip():
     restored = RunResult.from_json(orig.to_json())
     assert restored.logic == logic
     assert restored.crash is None
+
+
+def test_dynamic_validation_result_round_trips_the_codex_goal_row():
+    goal = {
+        "thread_id": "t-1",
+        "objective": "produce a matching ASan PoC",
+        "status": "active",
+        "tokens_used": 12,
+    }
+    original = DynamicValidationResult(
+        candidate_id="candidate_001", status="reached_no_crash", goal=goal
+    )
+    restored = DynamicValidationResult.from_dict(original.to_dict())
+    assert restored.goal == goal
+    # absent / malformed values fall back to None instead of raising
+    assert DynamicValidationResult.from_dict({"status": "validated"}).goal is None
+    assert DynamicValidationResult.from_dict({"status": "validated", "goal": "x"}).goal is None

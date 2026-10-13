@@ -44,6 +44,7 @@ import contextlib
 import json
 import os
 import re
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -345,6 +346,62 @@ def ensure_codex_auth(container: str) -> None:
             "or copy auth.json into $CODEX_HOME. "
             f"stderr: {(err or '')[-300:]}"
         )
+
+
+def read_goal_state(container: str) -> dict | None:
+    """Best-effort read of the codex goal row for this thread.
+
+    The codex CLI persists ``create_goal`` / ``update_goal`` rows in
+    ``$CODEX_HOME/goals_*.sqlite``; the ``--json`` event stream does not carry
+    them.  Recorded for audit only — a phase that leaves ``status="active"``
+    while reporting a negative dynamic status stopped short of its own
+    declared completion criterion.
+
+    Read-only and failure-tolerant: any error returns ``None`` so the phase
+    result is unaffected.  The database is copied first because SQLite refuses
+    to open a WAL database read-only in place.
+    """
+    script = r'''
+import glob, json, os, shutil, sqlite3, tempfile
+home = os.environ.get("CODEX_HOME") or "/work/.codex"
+dbs = sorted(glob.glob(os.path.join(home, "goals_*.sqlite")), key=os.path.getmtime)
+if not dbs:
+    raise SystemExit(0)
+tmp = tempfile.mkdtemp(prefix="goalsa")
+copy = os.path.join(tmp, "goals.sqlite")
+shutil.copy(dbs[-1], copy)
+for suffix in ("-wal", "-shm"):
+    if os.path.exists(dbs[-1] + suffix):
+        shutil.copy(dbs[-1] + suffix, copy + suffix)
+con = sqlite3.connect(copy)
+con.row_factory = sqlite3.Row
+try:
+    rows = con.execute(
+        "select thread_id, goal_id, objective, status, token_budget,"
+        " tokens_used, time_used_seconds, created_at_ms, updated_at_ms"
+        " from thread_goals order by updated_at_ms desc limit 1"
+    ).fetchall()
+except sqlite3.Error:
+    raise SystemExit(0)
+if not rows:
+    raise SystemExit(0)
+print(json.dumps(dict(rows[0]), ensure_ascii=False))
+'''
+    rc, out, _err = docker_ops.exec_sh(
+        container,
+        f"CODEX_HOME={shlex.quote(CODEX_HOME)} python3 - <<'GOALEOF'\n{script}GOALEOF",
+        timeout=30,
+    )
+    if rc:
+        return None
+    line = (out or "").strip().splitlines()
+    if not line:
+        return None
+    try:
+        data = json.loads(line[-1])
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) and data.get("objective") is not None else None
 
 
 def prepare_codex(container: str, system_prompt: str | None) -> None:
