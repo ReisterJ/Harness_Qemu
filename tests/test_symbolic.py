@@ -420,3 +420,28 @@ def test_klee_source_archive_preserves_harness_and_skips_vcs(tmp_path):
     assert manifest["status"] == "complete"
     assert (destination / "harness.c").is_file()
     assert not (destination / ".git").exists()
+
+
+def test_observation_markers_include_the_named_target_function_not_its_file():
+    from harness.dynamic_validation import _candidate_observation_markers
+
+    candidate = StaticFinding(
+        candidate_id="candidate_001",
+        bug_class="unknown",
+        location="",
+        static_call_chain="",
+        entry_points="",
+        attacker_controlled_data="",
+        reachability_evidence="",
+        required_conditions="",
+        root_cause="",
+        verification_plan="",
+        confidence=0.5,
+        target_function="mrb_env_unshare",
+        target_file="src/gc.c",
+    )
+    markers = _candidate_observation_markers(candidate, ("mrb_vm_exec",))
+    assert "mrb_env_unshare" in markers
+    assert "mrb_vm_exec" in markers
+    # A bare path is too weak a signal for "the site was reached".
+    assert "src/gc.c" not in markers

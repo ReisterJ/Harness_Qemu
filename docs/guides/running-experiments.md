@@ -169,13 +169,14 @@ canary 有三个预置 bug，正常情况下短时限内就能命中一个——
 | # | 要求 | 不满足会怎样 |
 |---|---|---|
 | 1 | **`commit` 与目标 `config.yaml` 的 `commit` 一致** | CLI 直接拒绝：`static report commit does not match target`（代码里唯一的硬校验之一） |
-| 2 | 目标函数的**函数名写对**：要么写进 `observability_targets[].function`，要么让 `location` 里含 `X in file.c` / `function X` / `X(` | 反馈变 `status: "unmatched"` + `not present in the coverage mapping (inlined, renamed, or wrong name)`，等于没有反馈 |
+| 2 | **`target_function` 写对**（写源码里的真函数名），`target_file` 顺手写上；只有需要额外检查点时才用 `observability_targets` | 反馈变 `status: "unmatched"` + `not present in the coverage mapping (inlined, renamed, or wrong name)`，等于没有反馈 |
 | 3 | **两臂共用同一份文件**，记录 sha256；报告里不得含触发配方、条件顺序、PoC 伪代码 | 等于给某一臂额外提示，结论作废 |
 | 4 | 报告指向**真根因**（人工判断） | 错锚点 + 恒命中反馈会把带反馈的臂带偏（审计 §4.3 的"71 轮同一假设"），该组不能用于快慢结论 |
 
 **解析器是宽容的，别把宽容当合规**：除 `candidate_id` 外字段缺失都不报错（实测
 `from_dict({"candidate_id":"c"})` 返回 `location="unknown"`、`confidence=0`）。
-所以第 2 条不会被任何报错提醒——它只在**反馈内容**里露出来。
+所以第 2 条不会被任何报错提醒——它只在**反馈内容**里露出来：匹配不到时反馈里会多一条
+`reported_file`，方便从反馈反查报告写没写对（写对函数名、文件写错不影响匹配）。
 
 ### 3.1 冻结流程（推荐做法）
 
@@ -204,7 +205,7 @@ sha256sum "$WAVE/static_analysis.json" | tee "$WAVE/static_analysis.sha256"
   "selected_candidate_id": "candidate_001",
   "repository": "https://github.com/...",
   "commit": "<full-sha>",
-  "findings": [ { ... 见 3.2 ... } ]
+  "findings": [ { ... 见 §3.3 ... } ]
 }
 ```
 
@@ -216,16 +217,18 @@ sha256sum "$WAVE/static_analysis.json" | tee "$WAVE/static_analysis.sha256"
 |---|---|---|---|
 | `candidate_id` | ✅ | 稳定标识，如 `candidate_001` | 会用在迭代记录文件名里 |
 | `bug_class` | ✅ | 崩溃类别，如 `heap-use-after-free` | 不知道写 `unknown` |
-| `location` | ✅（缺省 `unknown`） | **函数名 + 文件**，如 `mrb_env_unshare in gc.c` | 这是 agent 的锚点，别只给行号 |
+| `target_function` | ✅✅ | **源码里的真函数名**，如 `mrb_env_unshare` | 反馈锚只用它（见 §3.5）；写错等于没反馈 |
+| `target_file` | ✅ | 该函数所在文件，如 `src/vm.c` | 只做展示与排错；匹配只看函数名 |
+| `location` | ⭕ | 人读的位置描述 | 新报告不必再往里塞函数名（兼容旧报告时才解析） |
 | `root_cause` | ✅ | 一两句机制描述 | 越具体越省 agent 时间；但别写成"补丁说明" |
 | `verification_plan` | ✅ | 怎么验证（入口、观测什么） | 例：用 fuzz 入口构造输入并在 clean ASan 上复现 |
 | `confidence` | ✅ | 0–1 的小数 | 只影响默认选哪条 |
-| `static_call_chain` | ⭕ | 入口 → sink 的调用链 | 缺省空串 |
+| `static_call_chain` | ⭕ | 入口 → sink 的调用链 | 缺省空串；不参与反馈锚 |
 | `entry_points` | ⭕ | 外部可达入口 | 同上 |
 | `attacker_controlled_data` | ⭕ | 哪些字节可控 | |
 | `reachability_evidence` | ⭕ | 静态可达性证据 | 没证据就写"未建立，需动态验证" |
 | `required_conditions` | ⭕ | 触发前置条件 | ⚠️ 写太细 = 给答案，实验里慎用 |
-| `observability_targets` | ⭕ | 期望命中的函数/位点 | 有协议反馈的世代会用它做 focus |
+| `observability_targets` | ⭕ | 额外检查点（函数/位点列表） | 优先级最高，只用在你确实要盯多个位点时 |
 | `related_candidates` | ⭕ | 相关候选 id 列表 | 缺省空 |
 
 *解析器是宽容的*（实测 `from_dict({"candidate_id":"c"})` 不报错）：除 `candidate_id` 外缺失字段
@@ -242,19 +245,26 @@ sha256sum "$WAVE/static_analysis.json" | tee "$WAVE/static_analysis.sha256"
   → 产出 `<dir>/<target>/<ts>/static_analysis.json`（`<dir>` 是该命令的 `--results-dir`），
   然后按 §3.1 冻结到 wave；
 * **外部导入**：把已有线索（CVE 描述、CyberGym 任务描述、你自己读源码得到的函数名）
-  整理成 §3.2/§3.3 的结构。`targets/arvo-38283/static_analysis.json` 是最好的样例——
-  **`location` 留空，把两个真函数写进 `observability_targets`**；
+  整理成 §3.2/§3.3 的结构——**在 `target_function`/`target_file` 里写出真函数名**。
+  `targets/arvo-38283/static_analysis.json` 是最好的样例：主锚点是 `target_function`，
+  额外的协议入口用 `observability_targets` 表达（一个候选要盯多个位点时才需要）；
 * **复用旧波次**：只要**同目标同 commit**，直接指旧波的报告（现在 mruby 那几波都在复用
   `results/experiments/mruby-async-paired-20260923/static_analysis.json`，`commit=2de602b8…`）。
 
 ### 3.5 反馈锚是怎么定的（决定"反馈有没有用"）
 
-反馈块 `coverage.focus` 的目标函数**只来自两处**（`harness/dynamic_validation.py:
+反馈块 `coverage.focus` 的目标函数按**三层优先级**取（`harness/dynamic_validation.py:
 _candidate_focus_functions`）：
 
-1. **`observability_targets[].function`** —— 非空就只用它，`location` 被忽略；
-2. 否则从 **`location`** 这段自由文本里按三条正则抓函数名：
+1. **`observability_targets[].function`** —— 非空就只用它，后面两层被忽略；
+2. **`target_function`**（配 `target_file` 一起带上）—— 报告显式写明的目标函数；
+3. 否则从 **`location`** 这段自由文本里按三条正则抓函数名：
    `X in <file.ext>` / `function X` / `X(`；最多取 4 个。
+
+第 3 层只留给旧报告：`location` 是散文（实测 235 条 finding 里 62 条抓不出函数名，
+例如 `'entry.c:21'`、`'FreeRADIUS protocol decoding code'`），新报告请用第 2 层。
+第 2 层只在**能过函数名合法性检查**时才生效，写坏了（`"parse chunk()"`）会自动落到第 3 层，
+不会把可用的锚点一起丢掉。命中的函数名最多取 4 个（`_COVERAGE_MAX_FOCUS`）。
 
 **`static_call_chain` 完全不参与**——它只作为 prompt 文本给 agent 看，不影响反馈。
 
@@ -262,8 +272,9 @@ _candidate_focus_functions`）：
 
 | 报告 | 派生的 focus |
 |---|---|
-| `location='mrb_env_unshare in gc.c'`、`static_call_chain=''` | `{"name": "mrb_env_unshare"}` → 反馈里 `status:"hit"`，`file`/`line` 由覆盖率构建补全（实为 `/src/mruby/src/vm.c:376`；**报告里写 `gc.c` 不影响匹配**，因为只按函数名匹配） |
-| `location=''`、`observability_targets=[{function:"fr_base16_decode_nstd",…},{function:"fr_tacacs_decode",…}]` | 两个函数都成为检查点 |
+| `target_function='mrb_env_unshare'`、`target_file='gc.c'` | `{"name": "mrb_env_unshare", "file": "gc.c"}` → 反馈里 `status:"hit"`，`file`/`line` 由覆盖率构建补全（实为 `/src/mruby/src/vm.c:376`；**报告里写 `gc.c` 不影响匹配**，因为只按函数名匹配） |
+| `location='mrb_env_unshare in gc.c'`（旧报告，无 target_function） | 同样 `{"name": "mrb_env_unshare"}`——第 3 层兜底 |
+| `observability_targets=[{function:"fr_base16_decode_nstd",…},{function:"fr_tacacs_decode",…}]` | 两个函数都成为检查点 |
 
 匹配规则是「符号名 `==` 目标名，或以 `:目标名` 结尾」，匹配不到就返回
 `status:"unmatched"`。**这就是为什么 §3.0 第 2 条要单独核**：报告能跑通不代表反馈有用。
@@ -405,7 +416,7 @@ PY
 | `poc_path must appear verbatim in reproduction_command` | 重现命令里必须逐字出现 PoC 路径；协议臂写 `run-input <request.json>` 会踩 |
 | 两臂结果"差 11 秒" | 多半是管道延迟，不是真的更快；见 §5.2 第 2 条 |
 | `static report commit does not match target` | 报告 `commit` 与 `config.yaml` 不一致（换过目标版本/复用了别的波次的报告）→ 重做或改用同 commit 的报告 |
-| 反馈里 `status:"unmatched"` + `not present in the coverage mapping` | 报告里的函数名与覆盖率符号不一致（拼错、被内联、写的是宏）→ 按 §3.5 检查 `location`/`observability_targets` |
+| 反馈里 `status:"unmatched"` + `not present in the coverage mapping` | 报告里的函数名与覆盖率符号不一致（拼错、被内联、写的是宏）→ 按 §3.5 检查 `target_function`（旧报告看 `location`/`observability_targets`）；反馈里会附 `reported_file` 便于反查 |
 | 报告点错根因 → 两边都很慢、`hits` 恒为 1 | 这组实验作废（不是"SymCC 慢"的证据），先修报告（§3.0 第 4 条） |
 | 容器起不来 / API 不通 | egress 白名单没放行（§1）；codex 需要 `chatgpt.com` |
 | 同一目标并行 `dynamic` 互相干扰 | 容器名固定；顺序跑或改用 `run --runs N --parallel` |

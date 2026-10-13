@@ -1062,7 +1062,14 @@ def _candidate_observation_markers(
     candidate: StaticFinding, anchors: tuple[str, ...]
 ) -> list[str]:
     values = list(anchors)
-    values.extend([candidate.location, candidate.static_call_chain, candidate.root_cause])
+    # ``target_function`` is a real anchor; ``target_file`` is display-only — a
+    # bare path in a log is too weak a signal to call the target site reached.
+    values.extend([
+        candidate.target_function,
+        candidate.location,
+        candidate.static_call_chain,
+        candidate.root_cause,
+    ])
     markers: list[str] = []
     for value in values:
         for marker in re.findall(r"[A-Za-z_][A-Za-z0-9_.:/-]{3,}", value or ""):
@@ -1298,8 +1305,15 @@ def _candidate_focus_functions(
 ) -> tuple[dict[str, Any], ...]:
     """Checkpoints the static candidate names: the target point to reach.
 
-    Structured ``observability_targets`` win; otherwise the function name is
-    read out of the free-text ``location`` (e.g. "mrb_env_unshare in gc.c").
+    Resolution order — the first tier that yields anything wins:
+
+    1. ``observability_targets`` (structured, possibly several checkpoints);
+    2. ``target_function`` (with the optional ``target_file`` kept for display);
+    3. legacy: a function name parsed out of the free-text ``location``.
+
+    Tier 3 exists only for reports written before the named fields; ``location``
+    is prose ("entry.c:21", "FreeRADIUS protocol decoding code") and a *name* is
+    the only thing `coverage.focus` can resolve against the coverage build.
     """
     focus: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -1326,6 +1340,8 @@ def _candidate_focus_functions(
                 target.get("line"),
                 target.get("why"),
             )
+    if not focus:
+        add(candidate.target_function, candidate.target_file)
     if not focus:
         location = str(candidate.location or "")
         for pattern in _LOCATION_FUNCTION_PATTERNS:
@@ -1383,13 +1399,19 @@ def _focus_coverage(
         ]
         session_hits = session.focus_hits.get(name, 0)
         if not matches:
-            entries.append({
+            unmatched: dict[str, Any] = {
                 "name": name,
                 "status": "unmatched",
                 "hits": 0,
                 "session_hits": session_hits,
                 "note": "not present in the coverage mapping (inlined, renamed, or wrong name)",
-            })
+            }
+            # Echo what the report claimed so a wrong anchor is debuggable from
+            # the feedback alone (the name is what has to match).
+            reported_file = str(item.get("file") or "").strip()
+            if reported_file:
+                unmatched["reported_file"] = reported_file
+            entries.append(unmatched)
             continue
         symbol = max(
             matches, key=lambda candidate: (functions.get(candidate, 0), candidate)

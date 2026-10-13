@@ -123,6 +123,12 @@ class StaticFinding:
     root_cause: str
     verification_plan: str
     confidence: float
+    # The checkpoint the feedback loop anchors on.  Named explicitly because
+    # ``location`` is free prose (``"entry.c:21"``, ``"FreeRADIUS protocol
+    # decoding code"``): a *name* the coverage build can resolve is the only
+    # thing `coverage.focus` can match on.
+    target_function: str = ""
+    target_file: str = ""
     related_candidates: list[str] = field(default_factory=list)
     observability_targets: list[dict[str, Any]] = field(default_factory=list)
 
@@ -168,6 +174,8 @@ class StaticFinding:
             root_cause=str(d.get("root_cause") or ""),
             verification_plan=str(d.get("verification_plan") or ""),
             confidence=confidence,
+            target_function=str(d.get("target_function") or "").strip(),
+            target_file=str(d.get("target_file") or "").strip(),
             related_candidates=[str(x) for x in related],
             observability_targets=observability,
         )

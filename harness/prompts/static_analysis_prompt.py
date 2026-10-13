@@ -75,6 +75,8 @@ Each candidate must contain these keys:
   "candidate_id": "candidate_001",
   "bug_class": "heap-buffer-overflow",
   "location": "src/parser.c:123, function parse_chunk",
+  "target_function": "parse_chunk",
+  "target_file": "src/parser.c",
   "static_call_chain": "external_entry -> parse_file -> parse_chunk -> copy",
   "entry_points": "CLI file input via --input; describe the actual route",
   "attacker_controlled_data": "length field at offset 4 controls ...",
@@ -90,6 +92,14 @@ Each candidate must contain these keys:
   "related_candidates": []
 }}
 ```
+
+`target_function` is the single most important field: name the function that
+contains the suspected operation, as it appears in the source (not a file, not a
+line, not a description). The dynamic phase anchors its per-input feedback on
+that name, and a wrong or missing name makes the feedback unusable. Use
+`target_file` for the file that defines it. Add `observability_targets` only
+when the input must pass through additional named checkpoints (for example a
+protocol entry point before the sink).
 
 The confidence must be a number from 0.0 to 1.0. Do not emit `<poc_path>`,
 `<reproduction_command>`, `<crash_output>`, or any claim that the issue was

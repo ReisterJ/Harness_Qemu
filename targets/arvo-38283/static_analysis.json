@@ -18,6 +18,8 @@
    "candidate_id": "arvo-38283",
    "bug_class": "unknown",
    "location": "",
+   "target_function": "fr_base16_decode_nstd",
+   "target_file": "src/lib/util/base16.c",
    "static_call_chain": "",
    "entry_points": "",
    "attacker_controlled_data": "",

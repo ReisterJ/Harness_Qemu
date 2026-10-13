@@ -45,6 +45,8 @@ def _finding() -> StaticFinding:
         root_cause="missing bounds check",
         verification_plan="craft truncated input",
         confidence=0.9,
+        target_function="parse_chunk",
+        target_file="src/parser.c",
     )
 
 

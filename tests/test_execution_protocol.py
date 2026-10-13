@@ -708,6 +708,85 @@ def test_focus_functions_come_from_observability_targets_or_location():
     ]
 
 
+def test_target_function_anchors_focus_and_wins_over_location():
+    """A report that names target_function/target_file needs no prose parsing."""
+    from harness.dynamic_validation import _candidate_focus_functions
+
+    named = StaticFinding(
+        candidate_id="candidate_001",
+        bug_class="stack-buffer-overflow",
+        location="src/parser.c:118",
+        static_call_chain="",
+        entry_points="",
+        attacker_controlled_data="",
+        reachability_evidence="",
+        required_conditions="",
+        root_cause="",
+        verification_plan="",
+        confidence=0.5,
+        target_function="parse_chunk",
+        target_file="src/parser.c",
+    )
+    assert _candidate_focus_functions(named) == (
+        {"name": "parse_chunk", "file": "src/parser.c"},
+    )
+
+    # observability_targets stay authoritative when both are present
+    both = StaticFinding(
+        candidate_id="candidate_001",
+        bug_class="unknown",
+        location="",
+        static_call_chain="",
+        entry_points="",
+        attacker_controlled_data="",
+        reachability_evidence="",
+        required_conditions="",
+        root_cause="",
+        verification_plan="",
+        confidence=0.5,
+        target_function="parse_chunk",
+        target_file="src/parser.c",
+        observability_targets=[{"function": "decode_header", "file": "src/decoder.c"}],
+    )
+    assert [item["name"] for item in _candidate_focus_functions(both)] == [
+        "decode_header",
+    ]
+
+    # A malformed target_function must not silently drop a usable location.
+    broken = StaticFinding(
+        candidate_id="candidate_001",
+        bug_class="unknown",
+        location="parse_chunk in parser.c",
+        static_call_chain="",
+        entry_points="",
+        attacker_controlled_data="",
+        reachability_evidence="",
+        required_conditions="",
+        root_cause="",
+        verification_plan="",
+        confidence=0.5,
+        target_function="parse chunk()",
+    )
+    assert [item["name"] for item in _candidate_focus_functions(broken)] == [
+        "parse_chunk",
+    ]
+
+
+def test_unmatched_focus_echoes_the_file_the_report_claimed():
+    from harness.dynamic_validation import (
+        ProtocolCoverageSession,
+        _summarize_lcov_coverage,
+    )
+
+    entries = _summarize_lcov_coverage(
+        _lcov(("/src/mruby/src/gc.c", [(1153, 5)], [("sweep_phase", 1, 1140)])),
+        session=ProtocolCoverageSession(),
+        focus=({"name": "mrb_env_unshare", "file": "src/parser.c"},),
+    )["focus"]
+    assert entries[0]["status"] == "unmatched"
+    assert entries[0]["reported_file"] == "src/parser.c"
+
+
 def test_focus_is_reported_in_the_protocol_response(monkeypatch):
     target = _coverage_target()
     lcov = _lcov(
