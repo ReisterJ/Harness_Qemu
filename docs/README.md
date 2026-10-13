@@ -21,9 +21,14 @@
 
 ## Find、验证与结果处理
 
+- [guides/running-experiments.md](guides/running-experiments.md) — **实验手册**：目标目录要放什么、报告每个字段填什么、两臂命令、结果判读口径与常见坑
 - [research/find-phase-split-plan.md](research/find-phase-split-plan.md) — find 阶段静态分析与动态验证拆分方案
 - [research/experimental-target-selection.md](research/experimental-target-selection.md) — C/Rust 和 sanitizer 实验目标选择
 - [research/experiment-audits/curl-socks5-instrumentation-audit.md](research/experiment-audits/curl-socks5-instrumentation-audit.md) — curl SOCKS5 插桩对照实验审计记录
+- [research/experiment-audits/agent-behavior-audit-plan.md](research/experiment-audits/agent-behavior-audit-plan.md) — 全实验日志的 agent 行为审计计划（求解器/协议/反馈/提示/契约/失败组）
+- [research/experiment-audits/agent-behavior-audit-inventory.md](research/experiment-audits/agent-behavior-audit-inventory.md) — 审计对象清单：56 个实验目录 / 288 个 run 的分组、既有结论与陷阱
+- [research/experiment-audits/AUDIT-REPORT.md](research/experiment-audits/AUDIT-REPORT.md) — **审计结论（第四版·校对版）**：一页版结论 + 7 对有效实验的快/慢机制 + 契约与失败组 + 口径陷阱
+- [research/experiment-audits/BEHAVIOR-DEEP-DIVE.md](research/experiment-audits/BEHAVIOR-DEEP-DIVE.md) — 逐事件深挖：两臂的"分析—构造"循环对照（读值梯度 / 条件变更粒度 / 先测量还是先搜索）
 - [research/iterative-dynamic-validation.md](research/iterative-dynamic-validation.md) — 内存与逻辑漏洞通用的动态验证迭代设计
 - [research/triage.md](research/triage.md) — 发现分组、排序和人工分诊
 - [research/patching.md](research/patching.md) — 生成、验证和重新攻击补丁
