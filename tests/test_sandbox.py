@@ -63,6 +63,32 @@ def test_agent_image_cache_tracks_target_image_id(monkeypatch):
     assert builds and 'io.vuln-pipeline.target-image-id="sha256:new"' in builds[0][0]
 
 
+def test_agent_image_layer_fills_in_a_missing_tls_root_store(monkeypatch):
+    """A minimal target image (no ca-certificates) makes every HTTPS call the
+    in-container CLI makes fail certificate verification, so the layer copies
+    the base image's bundle — but only where the target has none."""
+    from harness import agent_image
+
+    builds: list[tuple[str, str]] = []
+    monkeypatch.setattr(agent_image.docker_ops, "image_id", lambda _tag: "sha256:new")
+    monkeypatch.setattr(agent_image.docker_ops, "image_exists", lambda _tag: True)
+    monkeypatch.setattr(agent_image.docker_ops, "image_label", lambda _tag, _label: "sha256:old")
+    monkeypatch.setattr(agent_image, "ensure_base", lambda: agent_image.BASE_TAG)
+    monkeypatch.setattr(
+        agent_image, "build", lambda dockerfile, tag, context=None: builds.append((dockerfile, tag))
+    )
+    monkeypatch.setattr(agent_image.subprocess, "run", lambda *args, **kwargs: None)
+
+    agent_image.ensure("vuln-pipeline-demo:abc")
+    dockerfile = builds[0][0]
+    assert (
+        f"COPY --from={agent_image.BASE_TAG} /etc/ssl/certs/ca-certificates.crt"
+        in dockerfile
+    )
+    # guarded: an image that ships its own store keeps it
+    assert "if [ ! -s /etc/ssl/certs/ca-certificates.crt ]" in dockerfile
+
+
 def test_permission_mode_tracks_runtime(monkeypatch):
     monkeypatch.delenv(sandbox.RUNTIME_ENV, raising=False)
     assert sandbox.permission_mode() == "auto"

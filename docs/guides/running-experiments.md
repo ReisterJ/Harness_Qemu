@@ -419,6 +419,7 @@ PY
 | 反馈里 `status:"unmatched"` + `not present in the coverage mapping` | 报告里的函数名与覆盖率符号不一致（拼错、被内联、写的是宏）→ 按 §3.5 检查 `target_function`（旧报告看 `location`/`observability_targets`）；反馈里会附 `reported_file` 便于反查 |
 | 报告点错根因 → 两边都很慢、`hits` 恒为 1 | 这组实验作废（不是"SymCC 慢"的证据），先修报告（§3.0 第 4 条） |
 | 容器起不来 / API 不通 | egress 白名单没放行（§1）；codex 需要 `chatgpt.com` |
+| 容器里 CLI 报 TLS/证书错误（`workspace routing discovery failed`、`error sending request`） | 目标镜像缺 CA 根证书（精简镜像没装 `ca-certificates`）；agent 层会自动补上基底的 bundle（`harness/agent_image.py`），只在目标镜像没有时才写 |
 | 同一目标并行 `dynamic` 互相干扰 | 容器名固定；顺序跑或改用 `run --runs N --parallel` |
 | 阶段被截断（`agent/model_blocked: phase exceeded Ns`） | 到时限了；这是"未完成"不是"没找到"，统计时单列 |
 

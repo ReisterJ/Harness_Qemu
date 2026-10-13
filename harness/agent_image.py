@@ -28,7 +28,7 @@ from . import docker_ops
 OPENCODE_VERSION = "1.17.18"  # bump alongside the dev-env opencode pin
 CODEX_VERSION = "0.162.1"     # @openai/codex pin for the codex agent backend
 # Bump when the agent-image copy list changes so cached images are rebuilt.
-AGENT_IMAGE_REVISION = "r2"
+AGENT_IMAGE_REVISION = "r3"
 BASE_TAG = f"vuln-pipeline-agent-base:{OPENCODE_VERSION}-codex{CODEX_VERSION}-{AGENT_IMAGE_REVISION}"
 TARGET_ID_LABEL = "io.vuln-pipeline.target-image-id"
 _TAG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._/:-]*$")
@@ -116,6 +116,19 @@ COPY --from={BASE_TAG} /usr/local/lib/node_modules/@openai/codex/node_modules/@o
 COPY --from={BASE_TAG} /usr/bin/git /usr/bin/git
 COPY --from={BASE_TAG} /usr/lib/git-core /usr/lib/git-core
 COPY --from={BASE_TAG} /usr/share/git-core /usr/share/git-core
+# TLS roots: both CLIs speak HTTPS to the model API, and a minimal target
+# image (no ca-certificates package) makes every request fail certificate
+# verification. Fill in the base layer's bundle only where the target image
+# has none, so a target that ships its own CA store keeps it.
+COPY --from={BASE_TAG} /etc/ssl/certs/ca-certificates.crt /usr/local/share/vp-agent-ca-bundle.crt
+RUN if [ ! -s /etc/ssl/certs/ca-certificates.crt ]; then \\
+        mkdir -p /etc/ssl/certs && \\
+        cp /usr/local/share/vp-agent-ca-bundle.crt /etc/ssl/certs/ca-certificates.crt; \\
+    fi; \\
+    if [ ! -s /etc/pki/tls/certs/ca-bundle.crt ]; then \\
+        mkdir -p /etc/pki/tls/certs && \\
+        cp /usr/local/share/vp-agent-ca-bundle.crt /etc/pki/tls/certs/ca-bundle.crt; \\
+    fi
 WORKDIR /work
 """,
         tag,
