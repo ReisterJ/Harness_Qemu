@@ -338,6 +338,42 @@ export VULN_PIPELINE_CODEX_AUTH_FILE="$HOME/.codex/auth.json"
 # 可选：VULN_PIPELINE_CODEX_REASONING=high|xhigh
 ```
 
+#### 让 codex 跑得久（长跑配置）
+
+codex 的会话**没有任何步数上限**：harness 不会因为"轮数够了"结束它，`--phase-timeout`
+只是天花板。一次 codex run 能跑多久由模型自己决定——它认为结论已成立就结束这一轮，
+`codex exec` 随进程退出。实测同一目标、同一预算（7200 s）的
+`codex-mruby-2h-r2` 六连跑：**425 / 3821 / 4672 / 949 / 593 / 1481 s**（其中两个
+3821 s、4672 s 的 run 以 `validated` 结束）；而上一波 `codex-mruby-2h` 三次全是
+105–153 s 就收工。两波之间唯一的提示词差异是 codex-only 的 goal 段（10-13 11:21 加入），
+而 r2 六个 run 谁都没真的创建 goal（`dynamic_validation.json` 里 `goal=null`），
+所以这组对比实质等价：差别在模型的探索意愿，不在 harness。
+
+想要"尽量跑满预算"，按这几条配：
+
+```sh
+# 1) 预算给足（这是天花板，不是目标）
+--phase-timeout 7200          # 省略 = 完全没有总时限；不建议，长跑时留一个上限便于收敛
+# 2) 不要设步数上限（默认就不设；--max-turns 到了会直接杀会话）
+# 3) 模型侧加思考预算（在启动前设，属于实验条件，记录进 comparison.md）
+export VULN_PIPELINE_CODEX_REASONING=high     # 或 xhigh
+# 4) 别让 agent 前台跑裸 python/ruby/node：看门狗 120 s 把它当无界 helper 杀掉，
+#    这会把整个 phase 一起结束。长命令一律 `timeout Ns ...`
+```
+
+看门狗的两个时限（`harness/agent.py:_agent_watchdog`）：**helper 120 s**（无界 helper）、
+**idle**（无任何事件且容器内没有工具进程；动态阶段把 idle 设为与 `--phase-timeout` 同值，
+所以预算给足就等于放宽了它）。`--phase-timeout` 省略时没有总时限，只有看门狗在管。
+
+**harness 不会把"想收工的 codex"拉回来**：早停时模型会按提示词契约给出终态
+（`reached_no_crash` / `false_positive`），harness 照单全收——这是刻意的设计
+（见 `docs/architecture/agent-backends.md` 的 "Premature stops"）。真要让 codex
+把预算跑满，只有两条路，都属于改实验条件：① 把提示词里的收工条件收紧
+（例如"至少 N 轮独立验证才允许给出否定结论"，`dynamic_validation_prompt.py` 的
+Iterative 段）；② 加"收工即 resume 续跑"的显式开关（2026-10-10 曾实现，随
+`8adf79aa5` 以"harness 不得引导 agent"为由移除）。两条都要在
+`comparison.md` 里写明并保证两臂一致。
+
 ### 4.3 多个 run / 并行
 
 * `vuln-pipeline run <target> --runs N --parallel --stream`：find+grade 全流程，适合

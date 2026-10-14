@@ -77,6 +77,18 @@ authenticate through `env_key` skip the login probe.
   re-prompts the agent to keep working, because steering the agent would change
   what the arm measures. The only lever is on the model side, before launch
   (`VULN_PIPELINE_CODEX_REASONING=high|xhigh`).
+  How long a run lasts is therefore the model's choice, and it varies widely
+  across otherwise identical runs: `codex-mruby-2h-r2` (same target, model and
+  7200 s budget; the only prompt delta was the codex-only goal section added
+  minutes before the wave, and none of its six runs actually created a goal)
+  produced 425 / 3821 / 4672 / 949 / 593 / 1481 s, with the two longest runs
+  ending in `validated`; the earlier `codex-mruby-2h` wave stopped at 105–153 s
+  every time. Nothing in the harness caps a long turn — `--phase-timeout` is a
+  ceiling, and leaving it unset removes the overall deadline entirely (the
+  watchdog still bounds unbounded helper processes). A phase that *must* spend
+  the budget needs the stop contract itself changed (the dynamic prompt's "at
+  least one round record" floor) or the resume nudge re-added as an explicit
+  opt-in.
 - **Goal tracking (audit only)** — the CLI exposes `tools.create_goal` /
   `get_goal` / `update_goal` on a persisted thread (the `goals` feature is
   `stable` and on by default; `--ephemeral` would forbid it). With the codex
